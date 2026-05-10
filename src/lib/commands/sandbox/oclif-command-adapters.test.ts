@@ -17,14 +17,14 @@ const mocks = vi.hoisted(() => ({
   showSandboxStatus: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("../../sandbox-runtime-actions", () => ({
+vi.mock("../../actions/sandbox/runtime", () => ({
   connectSandbox: mocks.connectSandbox,
   destroySandbox: mocks.destroySandbox,
   rebuildSandbox: mocks.rebuildSandbox,
   showSandboxStatus: mocks.showSandboxStatus,
 }));
 
-vi.mock("../../policy-channel-actions", () => ({
+vi.mock("../../actions/sandbox/policy-channel", () => ({
   listSandboxChannels: mocks.listSandboxChannels,
   listSandboxPolicies: mocks.listSandboxPolicies,
 }));
@@ -33,7 +33,7 @@ vi.mock("../../sandbox-config", () => ({
   configGet: mocks.configGet,
 }));
 
-vi.mock("../../sandbox-doctor-action", () => ({
+vi.mock("../../actions/sandbox/doctor", () => ({
   runSandboxDoctor: mocks.runSandboxDoctor,
 }));
 
@@ -63,17 +63,53 @@ describe("sandbox oclif command adapters", () => {
   });
 
   it("maps connect and lifecycle flags to typed action options", async () => {
-    await ConnectCliCommand.run(["alpha", "--probe-only"], rootDir);
-    await DestroyCliCommand.run(["alpha", "--yes"], rootDir);
-    await RebuildCliCommand.run(["alpha", "--force", "--verbose"], rootDir);
+    const originalCleanupGatewayEnv = process.env.NEMOCLAW_CLEANUP_GATEWAY;
+    delete process.env.NEMOCLAW_CLEANUP_GATEWAY;
+    try {
+      await ConnectCliCommand.run(["alpha", "--probe-only"], rootDir);
+      await DestroyCliCommand.run(["alpha", "--yes"], rootDir);
+      await RebuildCliCommand.run(["alpha", "--force", "--verbose"], rootDir);
 
-    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", { probeOnly: true });
-    expect(mocks.destroySandbox).toHaveBeenCalledWith("alpha", { force: false, yes: true });
-    expect(mocks.rebuildSandbox).toHaveBeenCalledWith("alpha", {
-      force: true,
-      verbose: true,
-      yes: false,
-    });
+      expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", { probeOnly: true });
+      expect(mocks.destroySandbox).toHaveBeenCalledWith("alpha", { force: false, yes: true });
+      expect(mocks.rebuildSandbox).toHaveBeenCalledWith("alpha", {
+        force: true,
+        verbose: true,
+        yes: false,
+      });
+    } finally {
+      if (originalCleanupGatewayEnv === undefined) {
+        delete process.env.NEMOCLAW_CLEANUP_GATEWAY;
+      } else {
+        process.env.NEMOCLAW_CLEANUP_GATEWAY = originalCleanupGatewayEnv;
+      }
+    }
+  });
+
+  it("threads --cleanup-gateway / --no-cleanup-gateway through destroy (#2166)", async () => {
+    const originalCleanupGatewayEnv = process.env.NEMOCLAW_CLEANUP_GATEWAY;
+    delete process.env.NEMOCLAW_CLEANUP_GATEWAY;
+    try {
+      await DestroyCliCommand.run(["alpha", "--yes", "--cleanup-gateway"], rootDir);
+      expect(mocks.destroySandbox).toHaveBeenLastCalledWith("alpha", {
+        force: false,
+        yes: true,
+        cleanupGateway: true,
+      });
+
+      await DestroyCliCommand.run(["alpha", "--yes", "--no-cleanup-gateway"], rootDir);
+      expect(mocks.destroySandbox).toHaveBeenLastCalledWith("alpha", {
+        force: false,
+        yes: true,
+        cleanupGateway: false,
+      });
+    } finally {
+      if (originalCleanupGatewayEnv === undefined) {
+        delete process.env.NEMOCLAW_CLEANUP_GATEWAY;
+      } else {
+        process.env.NEMOCLAW_CLEANUP_GATEWAY = originalCleanupGatewayEnv;
+      }
+    }
   });
 
   it("maps inspection commands to their action helpers", async () => {

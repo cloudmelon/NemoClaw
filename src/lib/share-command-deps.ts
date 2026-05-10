@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { CLI_NAME } from "./branding";
+import { CLI_NAME } from "./cli/branding";
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "./adapters/openshell/timeouts";
-import { G, R } from "./terminal-style";
+import { G, R } from "./cli/terminal-style";
 
 export interface ShareCommandDeps {
   /** Run `openshell sandbox ssh-config <name>` and return output. */
@@ -25,7 +25,7 @@ export function buildShareCommandDeps(): ShareCommandDeps {
       opts?: { ignoreError?: boolean; timeout?: number },
     ) => { status: number | null; output: string };
   };
-  const { ensureLiveSandboxOrExit } = require("./sandbox-gateway-state-action") as {
+  const { ensureLiveSandboxOrExit } = require("./actions/sandbox/gateway-state") as {
     ensureLiveSandboxOrExit: (sandboxName: string) => Promise<unknown>;
   };
 
