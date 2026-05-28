@@ -10,6 +10,7 @@ import {
   checkPortAvailable,
   getDockerBridgeGatewayIp,
   getMemoryInfo,
+  getNvidiaCdiSpecPath,
   ensureSwap,
   isDockerUnderProvisioned,
   MIN_RECOMMENDED_DOCKER_CPUS,
@@ -20,7 +21,11 @@ import {
   parseDockerStorageDriver,
   parseDockerUsesContainerdSnapshotter,
   planHostRemediation,
+  dnsProbeName,
+  ensureProbeImageCached,
+  isFatalContainerDnsProbeFailure,
   probeContainerDns,
+  probeDockerBridgeContainerStart,
 } from "../../../dist/lib/onboard/preflight";
 
 function requireMemoryInfo(result: ReturnType<typeof getMemoryInfo>) {
@@ -335,6 +340,112 @@ describe("assessHost", () => {
     expect(result.runtime).toBe("podman");
     expect(result.isUnsupportedRuntime).toBe(true);
     expect(result.dockerReachable).toBe(true);
+  });
+
+  // Regression: NemoClaw #2348. `docker info --format '{{json .}}'` emits a
+  // zero-value client-side struct (exit 0, non-empty JSON, ServerVersion: "")
+  // when the daemon is unreachable — for example after `colima stop`. Preflight
+  // used to treat any non-empty output as "daemon reachable".
+  it("reports docker unreachable when daemon is stopped (zero-value JSON with ServerErrors)", () => {
+    const colimaStoppedOutput = JSON.stringify({
+      ID: "",
+      Containers: 0,
+      ServerVersion: "",
+      OperatingSystem: "",
+      ServerErrors: [
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+      ],
+    });
+    const result = assessHost({
+      platform: "darwin",
+      env: {},
+      dockerInfoOutput: colimaStoppedOutput,
+      commandExistsImpl: (name: string) => name === "docker",
+    });
+
+    expect(result.dockerInstalled).toBe(true);
+    expect(result.dockerReachable).toBe(false);
+    expect(result.dockerRunning).toBe(false);
+  });
+
+  it("reports docker unreachable for zero-value JSON even without ServerErrors", () => {
+    // Defensive: older/alternate Docker CLI builds that emit the zero-value
+    // struct without populating ServerErrors should still be treated as
+    // unreachable because empty ServerVersion gives no reachable-daemon signal.
+    const zeroValueOutput = JSON.stringify({
+      ID: "",
+      Containers: 0,
+      ServerVersion: "",
+      OperatingSystem: "",
+    });
+    const result = assessHost({
+      platform: "darwin",
+      env: {},
+      dockerInfoOutput: zeroValueOutput,
+      commandExistsImpl: (name: string) => name === "docker",
+    });
+
+    expect(result.dockerReachable).toBe(false);
+    expect(result.dockerRunning).toBe(false);
+  });
+
+  it("reports docker unreachable when formatted output is valid JSON but not an object", () => {
+    const result = assessHost({
+      platform: "darwin",
+      env: {},
+      dockerInfoOutput: "null",
+      commandExistsImpl: (name: string) => name === "docker",
+    });
+
+    expect(result.dockerReachable).toBe(false);
+    expect(result.dockerRunning).toBe(false);
+  });
+
+  it("falls back to non-empty heuristic for non-JSON output (older CLI / test stubs)", () => {
+    // Preserves backward compatibility for callers injecting plain-text
+    // dockerInfoOutput — real CLI paths emit JSON under `--format`.
+    const result = assessHost({
+      platform: "darwin",
+      env: {},
+      dockerInfoOutput: "Server Version: 27.4.0\nOS: Docker Desktop",
+      commandExistsImpl: (name: string) => name === "docker",
+    });
+
+    expect(result.dockerReachable).toBe(true);
+    expect(result.dockerRunning).toBe(true);
+  });
+
+  it("does not treat plain-text Docker daemon connection errors as reachable", () => {
+    const result = assessHost({
+      platform: "darwin",
+      env: {},
+      dockerInfoOutput:
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+      commandExistsImpl: (name: string) => name === "docker",
+    });
+
+    expect(result.dockerReachable).toBe(false);
+    expect(result.dockerRunning).toBe(false);
+  });
+
+  it("treats podman-docker alias (native podman JSON) as reachable", () => {
+    // When `docker` is an alias for `podman`, `docker info --format '{{json .}}'`
+    // actually runs `podman info`, whose native schema nests a `version.Version`
+    // instead of a top-level ServerVersion.
+    const podmanNative = JSON.stringify({
+      host: { arch: "arm64", os: "linux" },
+      version: { APIVersion: "5.3.1", Version: "5.3.1" },
+      store: { imageStore: {} },
+    });
+    const result = assessHost({
+      platform: "darwin",
+      env: {},
+      dockerInfoOutput: podmanNative,
+      commandExistsImpl: (name: string) => name === "docker",
+    });
+
+    expect(result.dockerReachable).toBe(true);
+    expect(result.dockerRunning).toBe(true);
   });
 
   it("detects linux docker on cgroup v2 without requiring host cgroupns fix", () => {
@@ -723,6 +834,14 @@ describe("assessHost — CDI device-spec gap (#3152)", () => {
   });
 });
 
+describe("getNvidiaCdiSpecPath", () => {
+  it("builds the default NVIDIA CDI spec path from Docker CDI dirs", () => {
+    expect(getNvidiaCdiSpecPath({ dockerCdiSpecDirs: ["/etc/cdi/", "/var/run/cdi"] })).toBe(
+      "/etc/cdi/nvidia.yaml",
+    );
+  });
+});
+
 describe("planHostRemediation", () => {
   it("recommends starting docker when installed but unreachable and service inactive", () => {
     const actions = planHostRemediation({
@@ -748,6 +867,7 @@ describe("planHostRemediation", () => {
       hasNvidiaGpu: false,
       dockerCdiSpecDirs: [],
       cdiNvidiaGpuSpecMissing: false,
+      nvidiaContainerToolkitInstalled: true,
       notes: [],
     });
 
@@ -780,6 +900,7 @@ describe("planHostRemediation", () => {
       hasNvidiaGpu: false,
       dockerCdiSpecDirs: [],
       cdiNvidiaGpuSpecMissing: false,
+      nvidiaContainerToolkitInstalled: true,
       notes: [],
     });
 
@@ -816,6 +937,7 @@ describe("planHostRemediation", () => {
       hasNvidiaGpu: false,
       dockerCdiSpecDirs: [],
       cdiNvidiaGpuSpecMissing: false,
+      nvidiaContainerToolkitInstalled: true,
       notes: [],
     });
 
@@ -850,6 +972,7 @@ describe("planHostRemediation", () => {
       hasNvidiaGpu: false,
       dockerCdiSpecDirs: [],
       cdiNvidiaGpuSpecMissing: false,
+      nvidiaContainerToolkitInstalled: true,
       notes: [],
     });
 
@@ -881,6 +1004,7 @@ describe("planHostRemediation", () => {
       hasNvidiaGpu: false,
       dockerCdiSpecDirs: [],
       cdiNvidiaGpuSpecMissing: false,
+      nvidiaContainerToolkitInstalled: true,
       notes: [],
     });
 
@@ -911,6 +1035,7 @@ describe("planHostRemediation", () => {
       hasNvidiaGpu: true,
       dockerCdiSpecDirs: ["/etc/cdi", "/var/run/cdi"],
       cdiNvidiaGpuSpecMissing: true,
+      nvidiaContainerToolkitInstalled: true,
       notes: [],
     });
 
@@ -920,12 +1045,107 @@ describe("planHostRemediation", () => {
     expect(action).toBeTruthy();
     expect(action?.kind).toBe("sudo");
     expect(action?.blocking).toBe(true);
-    expect(action?.commands[0]).toBe(
+    expect(action?.commands[0]).toBe("sudo mkdir -p /etc/cdi");
+    expect(action?.commands[1]).toBe(
       "sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
     );
-    expect(action?.commands[1]).toContain("nvidia-ctk cdi list");
-    expect(action?.commands[2]).toContain("nemoclaw onboard");
+    expect(action?.commands[2]).toContain("nvidia-ctk cdi list");
+    expect(action?.commands[3]).toContain("nemoclaw onboard");
     expect(action?.reason).toContain("nvidia.com/gpu");
+  });
+
+  it("emits an install_nvidia_container_toolkit action with apt bootstrap when nvidia-ctk is missing on apt hosts", () => {
+    const actions = planHostRemediation({
+      platform: "linux",
+      isWsl: false,
+      runtime: "docker",
+      packageManager: "apt",
+      systemctlAvailable: true,
+      dockerServiceActive: true,
+      dockerServiceEnabled: true,
+      dockerInstalled: true,
+      dockerRunning: true,
+      dockerReachable: true,
+      nodeInstalled: true,
+      openshellInstalled: true,
+      dockerCgroupVersion: "v2",
+      dockerDefaultCgroupnsMode: "unknown",
+      isContainerRuntimeUnderProvisioned: false,
+      hasNestedOverlayConflict: false,
+      requiresHostCgroupnsFix: false,
+      isUnsupportedRuntime: false,
+      isHeadlessLikely: false,
+      hasNvidiaGpu: true,
+      dockerCdiSpecDirs: ["/etc/cdi", "/var/run/cdi"],
+      cdiNvidiaGpuSpecMissing: true,
+      nvidiaContainerToolkitInstalled: false,
+      notes: [],
+    });
+
+    expect(actions.find((entry) => entry.id === "generate_nvidia_cdi_spec")).toBeUndefined();
+    const action = actions.find((entry) => entry.id === "install_nvidia_container_toolkit");
+    expect(action).toBeTruthy();
+    expect(action?.kind).toBe("sudo");
+    expect(action?.blocking).toBe(true);
+    expect(action?.title).toContain("Install NVIDIA Container Toolkit");
+    expect(action?.reason).toContain("nvidia-container-toolkit");
+    expect(action?.commands.some((c) => c.includes("nvidia-container-toolkit-keyring.gpg"))).toBe(
+      true,
+    );
+    expect(action?.commands.some((c) => c === "sudo apt-get install -y nvidia-container-toolkit")).toBe(
+      true,
+    );
+    expect(
+      action?.commands.some((c) => c.startsWith("sudo nvidia-ctk cdi generate --output=")),
+    ).toBe(true);
+    const ctkInstallIndex =
+      action?.commands.findIndex((c) => c === "sudo apt-get install -y nvidia-container-toolkit") ??
+      -1;
+    const ctkGenerateIndex =
+      action?.commands.findIndex((c) => c.startsWith("sudo nvidia-ctk cdi generate --output=")) ??
+      -1;
+    expect(ctkInstallIndex).toBeGreaterThanOrEqual(0);
+    expect(ctkGenerateIndex).toBeGreaterThan(ctkInstallIndex);
+  });
+
+  it("emits an install_nvidia_container_toolkit action with a docs pointer when nvidia-ctk is missing on unknown package managers", () => {
+    const actions = planHostRemediation({
+      platform: "linux",
+      isWsl: false,
+      runtime: "docker",
+      packageManager: "unknown",
+      systemctlAvailable: true,
+      dockerServiceActive: true,
+      dockerServiceEnabled: true,
+      dockerInstalled: true,
+      dockerRunning: true,
+      dockerReachable: true,
+      nodeInstalled: true,
+      openshellInstalled: true,
+      dockerCgroupVersion: "v2",
+      dockerDefaultCgroupnsMode: "unknown",
+      isContainerRuntimeUnderProvisioned: false,
+      hasNestedOverlayConflict: false,
+      requiresHostCgroupnsFix: false,
+      isUnsupportedRuntime: false,
+      isHeadlessLikely: false,
+      hasNvidiaGpu: true,
+      dockerCdiSpecDirs: ["/etc/cdi", "/var/run/cdi"],
+      cdiNvidiaGpuSpecMissing: true,
+      nvidiaContainerToolkitInstalled: false,
+      notes: [],
+    });
+
+    const action = actions.find((entry) => entry.id === "install_nvidia_container_toolkit");
+    expect(action).toBeTruthy();
+    expect(
+      action?.commands.some((c) =>
+        c.includes("docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide"),
+      ),
+    ).toBe(true);
+    expect(
+      action?.commands.some((c) => c.startsWith("sudo nvidia-ctk cdi generate --output=")),
+    ).toBe(true);
   });
 });
 
@@ -1060,16 +1280,51 @@ describe("probeContainerDns", () => {
     expect(result.reason).toBe("image_pull_failed");
   });
 
-  it("flags resolution_failed for NXDOMAIN-style failures (resolver OK, name unknown)", () => {
+  it("returns ok on NXDOMAIN — resolver reachable, name does not resolve (#3630)", () => {
+    // The default probe queries a random `.invalid` subdomain (RFC 6761),
+    // which any compliant resolver answers with NXDOMAIN. NXDOMAIN proves
+    // the resolver was reached even though the name doesn't resolve, which
+    // is the only invariant we need to prove DNS works. Crucially, this
+    // path does NOT depend on a real A record (e.g., `registry.npmjs.org`)
+    // being reachable from the container, so a Docker-embedded-DNS cache
+    // hit cannot mask a host-side egress block. See #3630.
     const result = probeContainerDns({
       outputOverride:
         "Server:\t\t1.1.1.1\n" +
         "Address:\t1.1.1.1:53\n" +
         "\n" +
-        "** server can't find registry.npmjs.org: NXDOMAIN\n",
+        "** server can't find nemoclaw-dns-probe-abc123def456.invalid: NXDOMAIN\n",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.reason).toBeUndefined();
+  });
+
+  it("flags resolution_failed for malformed responses with neither Address nor NXDOMAIN", () => {
+    // Resolver answered with something we don't recognize (e.g., SERVFAIL,
+    // unexpected format). Surface as resolution_failed rather than masking
+    // it as success.
+    const result = probeContainerDns({
+      outputOverride:
+        "Server:\t\t1.1.1.1\n" +
+        "Address:\t1.1.1.1:53\n" +
+        "\n" +
+        ";; reply from unexpected source: 8.8.8.8#53, expected 1.1.1.1#53\n",
     });
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("resolution_failed");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
+  });
+
+  it("downgrades unrelated docker output (no resolver evidence) from fatal resolution_failed to inconclusive error (#3630 CodeRabbit)", () => {
+    // No "Server:" header — nslookup never produced a resolver response.
+    // The output is some docker-side message unrelated to DNS, so we
+    // must not abort onboarding with the systemd-resolved remediation.
+    const result = probeContainerDns({
+      outputOverride: "docker: random unrelated diagnostic output that mentions nothing DNS related\n",
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("error");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(false);
   });
 
   it("flags no_output when docker run returns empty", () => {
@@ -1090,6 +1345,144 @@ describe("probeContainerDns", () => {
     expect(result.reason).toBe("no_output");
   });
 
+  it("flags timeout when the docker DNS probe is killed by the spawn timeout (#3630)", () => {
+    const result = probeContainerDns({
+      executionOverride: {
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        error: "spawnSync sh ETIMEDOUT",
+        errorCode: "ETIMEDOUT",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("timeout");
+    expect(result.timedOut).toBe(true);
+    expect(result.details).toContain("timed out");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
+  });
+
+  it("flags killed when the docker DNS probe exits from a signal without timing out", () => {
+    const result = probeContainerDns({
+      executionOverride: {
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        signal: "SIGKILL",
+        timedOut: false,
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("killed");
+    expect(result.signal).toBe("SIGKILL");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
+  });
+
+  it("keeps generic no_output nonfatal when there is no timeout, signal, or nonzero exit metadata", () => {
+    const result = probeContainerDns({
+      executionOverride: {
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("no_output");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(false);
+  });
+
+  it("treats docker registry DNS failures during image pull as fatal", () => {
+    const result = probeContainerDns({
+      outputOverride:
+        'docker: Error response from daemon: Head "https://registry-1.docker.io/v2/library/busybox/manifests/latest": dial tcp: lookup registry-1.docker.io: no such host.\n',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("image_pull_failed");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
+  });
+
+  it("does not make authorization-only image pull failures fatal DNS failures", () => {
+    const result = probeContainerDns({
+      outputOverride:
+        "docker: Error response from daemon: pull access denied for busybox, repository does not exist.\n",
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("image_pull_failed");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(false);
+  });
+
+  it("does not classify a successful cold-pull as image_pull_failed when followed by servers_unreachable nslookup", () => {
+    const coldPull =
+      "Unable to find image 'busybox:latest' locally\n" +
+      "latest: Pulling from library/busybox\n" +
+      "Status: Downloaded newer image for busybox:latest\n" +
+      "Server:\t\t10.0.0.1\n" +
+      "Address:\t10.0.0.1:53\n" +
+      ";; connection timed out; no servers could be reached\n";
+    const result = probeContainerDns({ outputOverride: coldPull });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("servers_unreachable");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
+  });
+
+  it("reports a slow registry pre-pull timeout as nonfatal image_pull_failed, not a fatal probe timeout", () => {
+    const result = probeContainerDns({
+      ensureImageCachedOverride: {
+        ok: false,
+        reason: "pull_timeout",
+        details: "docker pull timed out after 60s",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("image_pull_failed");
+    expect(result.timedOut).toBe(true);
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(false);
+  });
+
+  it("treats a pre-pull DNS-failure as fatal image_pull_failed via the registry-DNS signature", () => {
+    const result = probeContainerDns({
+      ensureImageCachedOverride: {
+        ok: false,
+        reason: "pull_failed",
+        details:
+          'docker: Error response from daemon: Head "https://registry-1.docker.io/v2/library/busybox/manifests/latest": dial tcp: lookup registry-1.docker.io: no such host.',
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("image_pull_failed");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
+  });
+
+  it("classifies a wedged Docker daemon (inspect_unavailable) as fatal docker_daemon_unreachable (#3630 codex review)", () => {
+    const result = probeContainerDns({
+      ensureImageCachedOverride: {
+        ok: false,
+        reason: "inspect_unavailable",
+        details: "docker image inspect did not complete",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("docker_daemon_unreachable");
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
+  });
+
+  it("does not treat a registry TCP timeout (i/o timeout on :443) as a fatal DNS failure (#3630 codex review)", () => {
+    // dial tcp <ip>:443 errors are TCP connectivity, NOT DNS — must not
+    // be routed to UDP:53/systemd-resolved remediation.
+    const result = probeContainerDns({
+      outputOverride:
+        'docker: Error response from daemon: Head "https://registry-1.docker.io/v2/library/busybox/manifests/latest": dial tcp 3.94.224.37:443: i/o timeout.\n',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("image_pull_failed");
+    // Inconclusive — not a DNS resolution failure.
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(false);
+  });
+
   it("captures the spawned command for runCapture override", () => {
     const captured: string[][] = [];
     const result = probeContainerDns({
@@ -1105,9 +1498,45 @@ describe("probeContainerDns", () => {
     expect(captured[0].slice(0, 2)).toEqual(["sh", "-c"]);
     const script = captured[0][2];
     expect(script).toContain("docker run --rm");
-    expect(script).toContain("busybox:latest");
-    expect(script).toContain("registry.npmjs.org");
+    // Image must be pinned to an immutable digest so nslookup output
+    // parsing cannot drift (#3630 CodeRabbit).
+    expect(script).toMatch(/busybox@sha256:[0-9a-f]{64}/);
+    // Probe queries a random `.invalid` subdomain (#3630), not a real
+    // domain — cache-bypass guarantee. Stable prefix is asserted instead.
+    expect(script).toMatch(/nslookup nemoclaw-dns-probe-[0-9a-f]+\.invalid /);
     expect(script).toContain("2>&1");
+  });
+
+  it("skips real-docker pre-pull when runCaptureImpl or runProbeImpl is injected (hermetic test isolation)", () => {
+    // If pre-pull leaks through to real Docker, on a clean CI worker the
+    // probe would short-circuit with image_pull_failed before reaching
+    // the injected runner. Assert that the injected runner is actually
+    // called and that the probe's success/failure tracks it.
+    let runCaptureCalled = false;
+    const r1 = probeContainerDns({
+      runCaptureImpl: () => {
+        runCaptureCalled = true;
+        return BUSYBOX_SUCCESS;
+      },
+    });
+    expect(runCaptureCalled).toBe(true);
+    expect(r1.ok).toBe(true);
+
+    let runProbeCalled = false;
+    const r2 = probeContainerDns({
+      runProbeImpl: () => {
+        runProbeCalled = true;
+        return {
+          stdout: BUSYBOX_SUCCESS,
+          stderr: "",
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+        };
+      },
+    });
+    expect(runProbeCalled).toBe(true);
+    expect(r2.ok).toBe(true);
   });
 
   it("allows the command to be overridden", () => {
@@ -1122,6 +1551,56 @@ describe("probeContainerDns", () => {
     expect(seen).toEqual(["echo", "OVERRIDDEN"]);
   });
 
+  it("uses a random .invalid probe per call to bypass Docker embedded DNS cache (#3630)", () => {
+    // Before #3630 the probe queried `registry.npmjs.org`, whose answer
+    // Docker's embedded DNS resolver could serve from cache even when
+    // host-side egress to UDP/TCP port 53 was fully blocked. The fix
+    // is a random subdomain of the RFC 6761 reserved `.invalid` TLD so
+    // the query is never cached anywhere and always exercises real
+    // upstream DNS reachability.
+    const name1 = dnsProbeName();
+    const name2 = dnsProbeName();
+    expect(name1).toMatch(/^nemoclaw-dns-probe-[0-9a-f]{16}\.invalid$/);
+    expect(name2).toMatch(/^nemoclaw-dns-probe-[0-9a-f]{16}\.invalid$/);
+    expect(name1).not.toBe(name2);
+  });
+
+  it("honors a pinned probeName override for stable test assertions", () => {
+    let seenScript = "";
+    probeContainerDns({
+      probeName: "pinned-test.invalid",
+      runCaptureImpl: (command) => {
+        seenScript = command[2] ?? "";
+        return "Server:\t1.1.1.1\nAddress:\t1.1.1.1:53\n** server can't find pinned-test.invalid: NXDOMAIN\n";
+      },
+    });
+    expect(seenScript).toContain("nslookup pinned-test.invalid");
+  });
+
+  it("rejects shell metacharacters in probeName to prevent sh -c injection (#3630 CodeRabbit)", () => {
+    const injections = [
+      "x; touch /tmp/pwned",
+      "x && touch /tmp/pwned",
+      "x`whoami`",
+      "x$(whoami)",
+      "x|whoami",
+      "x\nwhoami",
+      "x \"; rm -rf /\"",
+    ];
+    for (const probeName of injections) {
+      expect(() => probeContainerDns({ probeName })).toThrow(/probeName must be a plain DNS name/);
+    }
+  });
+
+  it("accepts plain DNS labels (RFC 1035 chars only) as probeName", () => {
+    expect(() =>
+      probeContainerDns({
+        probeName: "nemoclaw-dns-probe-abc123.invalid",
+        runCaptureImpl: () => "Server:\t1.1.1.1\nAddress:\t1.1.1.1:53\n** server can't find x: NXDOMAIN\n",
+      }),
+    ).not.toThrow();
+  });
+
   it("treats thrown runCapture errors as error reason", () => {
     const result = probeContainerDns({
       runCaptureImpl: () => {
@@ -1131,6 +1610,10 @@ describe("probeContainerDns", () => {
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("error");
     expect(result.details).toContain("docker daemon unreachable");
+    // Generic `error` is inconclusive — the probe never proved DNS is
+    // broken, so we must not abort onboarding. Daemon-specific outages
+    // route through docker_daemon_unreachable instead.
+    expect(isFatalContainerDnsProbeFailure(result)).toBe(false);
   });
 
   it("truncates long failure details to the last 400 bytes", () => {
@@ -1171,6 +1654,297 @@ describe("probeContainerDns", () => {
     const script = captured[2] ?? "";
     expect(script).not.toMatch(/^\s*timeout\b/);
     expect(script).not.toMatch(/^\s*gtimeout\b/);
+  });
+});
+
+describe("probeDockerBridgeContainerStart", () => {
+  it("passes when a bridge container exits successfully with no output", () => {
+    const result = probeDockerBridgeContainerStart({
+      executionOverride: {
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+      },
+    });
+    expect(result).toEqual({ ok: true, exitCode: 0, signal: null, timedOut: false });
+  });
+
+  it("flags Jetson-style veth operation-not-supported failures (#3508)", () => {
+    const result = probeDockerBridgeContainerStart({
+      executionOverride: {
+        stdout: "",
+        stderr:
+          "docker: Error response from daemon: failed to add the host <=> sandbox veth pair interfaces: operation not supported.\n",
+        exitCode: 125,
+        signal: null,
+        timedOut: false,
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("veth_unsupported");
+    expect(result.details).toContain("operation not supported");
+    expect(result.exitCode).toBe(125);
+  });
+
+  it("does not misclassify unrelated 'veth' mentions as fatal veth_unsupported (#3630 CodeRabbit)", () => {
+    // Output references "veth" in passing — without the bridge-create
+    // signature, it must stay on the generic-error path, not the fatal
+    // Jetson remediation path.
+    const result = probeDockerBridgeContainerStart({
+      executionOverride: {
+        stdout: "",
+        stderr: "Created veth veth1234@if4: <BROADCAST,MULTICAST,UP,LOWER_UP>\n",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).not.toBe("veth_unsupported");
+  });
+
+  it("does not misclassify generic 'operation not supported' errors as veth_unsupported (#3630 CodeRabbit)", () => {
+    // Generic OS-level "operation not supported" (e.g., from a cgroup
+    // mount or unrelated syscall) must not be promoted to fatal veth.
+    const result = probeDockerBridgeContainerStart({
+      executionOverride: {
+        stdout: "",
+        stderr: "docker: Error: mount: operation not supported.\n",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).not.toBe("veth_unsupported");
+  });
+
+  it("flags bridge container kill-by-signal (no timeout) as reason 'killed' (#3630 CodeRabbit)", () => {
+    const result = probeDockerBridgeContainerStart({
+      executionOverride: {
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        signal: "SIGKILL",
+        timedOut: false,
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("killed");
+    expect(result.signal).toBe("SIGKILL");
+    expect(result.timedOut).toBe(false);
+  });
+
+  it("flags bridge container start timeouts with execution metadata", () => {
+    const result = probeDockerBridgeContainerStart({
+      executionOverride: {
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        error: "spawnSync docker ETIMEDOUT",
+        errorCode: "ETIMEDOUT",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("timeout");
+    expect(result.timedOut).toBe(true);
+    expect(result.details).toContain("timed out");
+  });
+
+  it("runs a minimal docker bridge command with a spawn timeout", () => {
+    let captured: readonly string[] = [];
+    let seenOpts: { timeout?: number } | undefined;
+    const result = probeDockerBridgeContainerStart({
+      runProbeImpl: (command, opts) => {
+        captured = command;
+        seenOpts = opts;
+        return { stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false };
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(captured.slice(0, 6)).toEqual([
+      "docker",
+      "run",
+      "--rm",
+      "--pull=missing",
+      "--network",
+      "bridge",
+    ]);
+    // Image pinned to an immutable digest (#3630 CodeRabbit).
+    expect(captured[6]).toMatch(/^busybox@sha256:[0-9a-f]{64}$/);
+    expect(captured[7]).toBe("true");
+    expect(seenOpts?.timeout).toBe(20_000);
+  });
+
+  it("reports image_pull_failed (not bridge timeout) when the busybox pre-pull times out (#3630 codex review)", () => {
+    const result = probeDockerBridgeContainerStart({
+      ensureImageCachedOverride: {
+        ok: false,
+        reason: "pull_timeout",
+        details: "docker pull timed out after 60s",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("image_pull_failed");
+    expect(result.timedOut).toBe(true);
+    expect(result.details).toContain("timed out");
+  });
+
+  it("skips real-docker pre-pull when runProbeImpl is injected (hermetic test isolation)", () => {
+    let probeCalled = false;
+    const result = probeDockerBridgeContainerStart({
+      runProbeImpl: (_command) => {
+        probeCalled = true;
+        return { stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false };
+      },
+    });
+    expect(probeCalled).toBe(true);
+    expect(result.ok).toBe(true);
+  });
+
+  it("reports a wedged Docker daemon (inspect_unavailable) as fatal docker_daemon_unreachable (#3630 codex review)", () => {
+    const result = probeDockerBridgeContainerStart({
+      ensureImageCachedOverride: {
+        ok: false,
+        reason: "inspect_unavailable",
+        details: "docker image inspect did not complete",
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("docker_daemon_unreachable");
+    expect(result.details).toContain("inspect");
+  });
+});
+
+describe("ensureProbeImageCached", () => {
+  it("returns ok when docker image inspect exits 0", () => {
+    const result = ensureProbeImageCached("busybox:latest", {
+      inspectProbeImpl: () => ({
+        stdout: "[]",
+        stderr: "",
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+      }),
+      pullProbeImpl: () => {
+        throw new Error("pull should not run when inspect succeeds");
+      },
+    });
+    expect(result.ok).toBe(true);
+    expect(result.alreadyCached).toBe(true);
+  });
+
+  it("classifies an inspect spawn timeout (ETIMEDOUT) as inspect_unavailable without falling through to pull (#3630 CodeRabbit)", () => {
+    const result = ensureProbeImageCached("busybox:latest", {
+      inspectProbeImpl: () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        error: "spawnSync docker ETIMEDOUT",
+        errorCode: "ETIMEDOUT",
+      }),
+      pullProbeImpl: () => {
+        throw new Error("pull should not run when inspect times out");
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("inspect_unavailable");
+  });
+
+  it("classifies 'Cannot connect to the Docker daemon' inspect stderr as inspect_unavailable (#3630 codex review)", () => {
+    const result = ensureProbeImageCached("busybox:latest", {
+      inspectProbeImpl: () => ({
+        stdout: "",
+        stderr:
+          "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+      }),
+      pullProbeImpl: () => {
+        throw new Error("pull should not run when daemon is unreachable");
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("inspect_unavailable");
+    expect(result.details).toContain("Cannot connect to the Docker daemon");
+  });
+
+  it("falls back to docker pull when inspect exits 1 without daemon-down signature", () => {
+    let pullCalled = false;
+    const result = ensureProbeImageCached("busybox:latest", {
+      inspectProbeImpl: () => ({
+        stdout: "",
+        stderr: "Error: No such image: busybox:latest",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+      }),
+      pullProbeImpl: () => {
+        pullCalled = true;
+        return {
+          stdout: "Status: Downloaded newer image for busybox:latest",
+          stderr: "",
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+        };
+      },
+    });
+    expect(pullCalled).toBe(true);
+    expect(result.ok).toBe(true);
+    expect(result.alreadyCached).toBe(false);
+  });
+
+  it("classifies a pull-time daemon outage as inspect_unavailable (not pull_failed)", () => {
+    const result = ensureProbeImageCached("busybox:latest", {
+      inspectProbeImpl: () => ({
+        stdout: "",
+        stderr: "Error: No such image",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+      }),
+      pullProbeImpl: () => ({
+        stdout: "",
+        stderr:
+          "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("inspect_unavailable");
+  });
+
+  it("classifies a pull timeout as pull_timeout (inconclusive, not docker outage)", () => {
+    const result = ensureProbeImageCached("busybox:latest", {
+      inspectProbeImpl: () => ({
+        stdout: "",
+        stderr: "No such image",
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+      }),
+      pullProbeImpl: () => ({
+        stdout: "",
+        stderr: "",
+        exitCode: null,
+        signal: "SIGTERM",
+        timedOut: true,
+        error: "spawnSync docker ETIMEDOUT",
+        errorCode: "ETIMEDOUT",
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("pull_timeout");
   });
 });
 

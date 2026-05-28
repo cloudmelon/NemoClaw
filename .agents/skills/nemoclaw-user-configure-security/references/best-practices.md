@@ -1,19 +1,12 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Security Best Practices
+# NemoClaw Security Best Practices: Controls, Risks, and Posture Profiles
 
 NemoClaw ships with deny-by-default security controls across four layers: network, filesystem, process, and inference.
 You can tune every control, but each change shifts the risk profile.
 This page documents every configurable knob, its default, what it protects, the concrete risk of relaxing it, and a recommendation for common use cases.
 
 For background on how the layers fit together, refer to How It Works (use the `nemoclaw-user-overview` skill).
-
-<!-- TODO: uncomment after the OpenShell docs are published
-:::{seealso}
-OpenShell enforces the platform-level mechanisms that NemoClaw configures, including network namespace isolation, seccomp filters, SSRF protection, TLS termination, and gateway authentication.
-For the full platform-level controls reference, see [OpenShell Security Best Practices](https://docs.nvidia.com/openshell/latest/security/best-practices.html).
-:::
--->
 
 ## Protection Layers at a Glance
 
@@ -72,43 +65,16 @@ flowchart TB
     style GW fill:#2a2a2a,stroke:#76b900,stroke-width:2px,color:#fff
 ```
 
-:::{list-table}
-:header-rows: 1
-:widths: 20 30 20 30
-
-* - Layer
-  - What it protects
-  - Enforcement point
-  - Changeable at runtime
-
-* - Network
-  - Unauthorized outbound connections and data exfiltration.
-  - OpenShell gateway
-  - Yes. Use `openshell policy set` or operator approval.
-
-* - Filesystem
-  - System binary tampering, credential theft, config manipulation.
-  - Landlock LSM + container mounts
-  - Landlock layout: no. Requires sandbox re-creation. Config lockdown posture: yes, with host-side shields commands.
-
-* - Process
-  - Privilege escalation, fork bombs, syscall abuse.
-  - Container runtime (Docker/K8s `securityContext`)
-  - No. Requires sandbox re-creation.
-
-* - Inference
-  - Credential exposure, unauthorized model access, cost overruns.
-  - OpenShell gateway
-  - Yes. Use `nemoclaw inference set`.
-
-:::
+| Layer | What it protects | Enforcement point | Changeable at runtime |
+| --- | --- | --- | --- |
+| Network | Unauthorized outbound connections and data exfiltration. | OpenShell gateway | Yes. Use `openshell policy set` or operator approval. |
+| Filesystem | System binary tampering, credential theft, config manipulation. | Landlock LSM + container mounts | Landlock layout: no. Requires sandbox re-creation. Use host-side NemoClaw commands for durable config changes. |
+| Process | Privilege escalation, fork bombs, syscall abuse. | Container runtime (Docker/K8s `securityContext`) | No. Requires sandbox re-creation. |
+| Inference | Credential exposure, unauthorized model access, cost overruns. | OpenShell gateway | Yes. Use `nemoclaw inference set`. |
 
 ## Network Controls
 
 NemoClaw controls which hosts, ports, and HTTP methods the sandbox can reach, and lets operators approve or deny requests in real time.
-
-<!-- OpenShell provides additional network enforcement mechanisms not covered here, including network namespace isolation, SSRF protection, TLS auto-detection and termination, and audit-vs-enforce modes.
-See the [Network Controls](https://docs.nvidia.com/openshell/latest/security/best-practices.html#network-controls) section of the OpenShell Security Best Practices. -->
 
 ### Deny-by-Default Egress
 
@@ -176,7 +142,7 @@ NemoClaw ships preset policy files in `nemoclaw-blueprint/policies/presets/` for
 | Preset | What it enables | Key risk |
 |---|---|---|
 | `brave` | Brave Search API. | Agent can issue search queries. |
-| `brew` | Homebrew (Linuxbrew) package manager. | Allows installing arbitrary Homebrew packages, which may contain malicious code. |
+| `brew` | Homebrew (Linuxbrew) package manager. The sandbox base image includes the `brew` binary; this preset opens network egress to GitHub and the Homebrew formulae index so `brew install` can fetch bottles. | Allows installing arbitrary Homebrew packages, which may contain malicious code. |
 | `discord` | Discord REST API, WebSocket gateway, CDN. | CDN endpoint (`cdn.discordapp.com`) allows GET to any path. WebSocket uses `access: full` (no inspection). |
 | `github` | GitHub and GitHub REST API. | Gives agent read/write access to repositories and issues via `git`. |
 | `huggingface` | Hugging Face Hub (download-only) and inference router. | Allows downloading arbitrary models and datasets. POST is restricted to the inference router only. |
@@ -194,9 +160,6 @@ NemoClaw ships preset policy files in `nemoclaw-blueprint/policies/presets/` for
 
 NemoClaw restricts which paths the agent can read and write, protecting system binaries, configuration files, and gateway credentials.
 
-<!-- OpenShell covers additional filesystem enforcement details, including `hard_requirement` compatibility mode for Landlock and policy path validation rules.
-See the [Filesystem Controls](https://docs.nvidia.com/openshell/latest/security/best-practices.html#filesystem-controls) section of the OpenShell Security Best Practices. -->
-
 ### Read-Only System Paths
 
 The container mounts system directories read-only to prevent the agent from modifying binaries, libraries, or configuration files.
@@ -211,7 +174,7 @@ The container mounts system directories read-only to prevent the agent from modi
 ### Agent Config Directory
 
 The `/sandbox/.openclaw` directory contains the OpenClaw gateway configuration (model routing, CORS settings, channel config).
-The current entrypoint reads the gateway auth token from OpenClaw config when present, exports it as `OPENCLAW_GATEWAY_TOKEN`, and writes it to `/tmp/nemoclaw-proxy-env.sh` so interactive sandbox sessions can reach the gateway through the static `/sandbox/.bashrc` and `/sandbox/.profile` source shims.
+The current entrypoint reads the gateway auth token from OpenClaw config when present, exports it as `OPENCLAW_GATEWAY_TOKEN`, and writes it to `/tmp/nemoclaw-proxy-env.sh` so interactive sandbox sessions can reach the gateway through system-wide shell hooks.
 In root mode, the gateway process still runs as the separate `gateway` user, but the token is intentionally available to sandbox shells for local gateway access.
 
 Writable agent state such as plugins, skills, hooks, and workspace metadata lives directly under `/sandbox/.openclaw`.
@@ -219,13 +182,13 @@ Writable agent state such as plugins, skills, hooks, and workspace metadata live
 By default, this directory starts writable so the agent can manage its own config, install skills, and write to standard home-directory paths natively.
 For sensitive workloads, use a reviewed host-side immutability workflow after initial setup so config and writable state entry points cannot be changed by the sandbox user.
 
-- **DAC permissions (default).** The sandbox user owns `/sandbox/.openclaw` with mode `700` and `openclaw.json` with mode `600`, so the agent can read and write config directly.
+- **DAC permissions (default).** The sandbox user owns `/sandbox/.openclaw` with mode `2770` (setgid `sandbox:sandbox`) and `openclaw.json` with mode `660`, so the agent and its group can read and write config directly. A reviewed host-side immutability workflow should compare the intended ownership and mode with the live sandbox filesystem before treating the config tree as locked.
 - **Config integrity hash.** The image includes a SHA256 hash of `openclaw.json`. In the default mutable state, `.config-hash` is sandbox-owned and is not a tamper-proof trust anchor, so startup does not fail closed on that hash. When the hash is root-owned and read-only, startup enforces it and refuses to start if the hash does not match.
 - **Gateway token environment.** The gateway exports `OPENCLAW_GATEWAY_TOKEN` and writes it to `/tmp/nemoclaw-proxy-env.sh` for interactive sandbox sessions. Keep this in mind when deciding whether a workload should run with mutable config or an immutable config posture.
 
 | Aspect | Detail |
 |---|---|
-| Default | The sandbox keeps `/sandbox/.openclaw` writable (`700 sandbox:sandbox`), sets `openclaw.json` to `600 sandbox:sandbox`, lets the agent manage state directly, and has the gateway place `OPENCLAW_GATEWAY_TOKEN` in `/tmp/nemoclaw-proxy-env.sh` for interactive shells. |
+| Default | The sandbox keeps `/sandbox/.openclaw` writable (`2770 sandbox:sandbox`), sets `openclaw.json` to `660 sandbox:sandbox`, lets the agent manage state directly, and has the gateway place `OPENCLAW_GATEWAY_TOKEN` in `/tmp/nemoclaw-proxy-env.sh` for interactive shells. |
 | What you can change | Apply a reviewed host-side immutability workflow to lock config and state directories with DAC permissions and the immutable flag where available. |
 | Risk of default | A writable `.openclaw` directory lets the agent modify its own gateway config: disabling CORS or redirecting inference to an attacker-controlled endpoint. |
 | Recommendation | For always-on assistants handling sensitive workloads, lock config after initial setup. For development workflows, the writable default is appropriate. |
@@ -255,9 +218,6 @@ Landlock is a Linux Security Module that enforces filesystem access rules at the
 ## Process Controls
 
 NemoClaw limits the capabilities, user privileges, and resource quotas available to processes inside the sandbox.
-
-<!-- OpenShell enforces additional process-level controls not covered here, including seccomp BPF socket domain filters and a specific enforcement application order (namespace entry, privilege drop, Landlock, seccomp).
-See the [Process Controls](https://docs.nvidia.com/openshell/latest/security/best-practices.html#process-controls) section of the OpenShell Security Best Practices. -->
 
 ### Capability Drops
 
@@ -388,6 +348,17 @@ Device authentication requires each connecting device to go through a pairing fl
 | Risk if relaxed | Disabling device auth allows any device on the network to connect to the gateway without proving identity. This is dangerous when combined with LAN-bind changes or cloudflared tunnels in remote deployments, resulting in an unauthenticated, publicly reachable dashboard. |
 | Recommendation | Keep device auth enabled (the default). Only disable it for headless or development environments where no untrusted devices can reach the gateway. |
 
+### Gateway Bind Address
+
+NemoClaw binds the OpenShell gateway to loopback by default.
+
+| Aspect | Detail |
+|---|---|
+| Default | `NEMOCLAW_GATEWAY_BIND_ADDRESS=127.0.0.1`. |
+| What you can change | Set `NEMOCLAW_GATEWAY_BIND_ADDRESS=0.0.0.0` before onboarding to listen on all IPv4 interfaces. |
+| Risk if relaxed | Other hosts on the network may be able to reach the OpenShell gateway. |
+| Recommendation | Keep the loopback default unless the gateway must be reachable from another host. |
+
 ### Insecure Auth Derivation
 
 The `allowInsecureAuth` setting controls whether the gateway permits non-HTTPS authentication.
@@ -467,13 +438,13 @@ Different inference providers have different trust and cost profiles.
 
 ### Experimental Providers
 
-The `NEMOCLAW_EXPERIMENTAL=1` environment variable gates local NVIDIA NIM and local vLLM.
+The `NEMOCLAW_EXPERIMENTAL=1` environment variable gates local NVIDIA NIM and generic Linux managed vLLM install/start. DGX Spark and DGX Station managed vLLM entries are offered by default, and an already-running vLLM server on `localhost:8000` is offered in the menu without a flag, because selecting either is an explicit user action.
 
 | Aspect | Detail |
 |---|---|
-| Default | Disabled. The onboarding wizard does not show these providers. |
-| What you can change | Set `NEMOCLAW_EXPERIMENTAL=1` before running `nemoclaw onboard`. |
-| Risk if relaxed | NemoClaw has not fully validated these providers. NIM requires a NIM-capable GPU. vLLM must already be running on `localhost:8000`. Misconfiguration can cause failed inference or unexpected behavior. |
+| Default | Local NVIDIA NIM and generic Linux managed vLLM install/start are hidden. DGX Spark and DGX Station managed vLLM entries, plus already-running vLLM on `localhost:8000`, are offered when detected. |
+| What you can change | Set `NEMOCLAW_EXPERIMENTAL=1` before running `nemoclaw onboard` to surface Local NIM and generic Linux managed vLLM. To request only the managed vLLM path non-interactively, set `NEMOCLAW_PROVIDER=install-vllm`. |
+| Risk if selected | NemoClaw has not fully validated these providers. NIM requires a NIM-capable GPU. The managed vLLM path pulls a container image and starts it on a supported NVIDIA GPU host. Misconfiguration can cause failed inference or unexpected behavior. |
 | Recommendation | Use experimental providers only for evaluation. Do not rely on them for always-on assistants. |
 
 ## Posture Profiles
@@ -538,4 +509,3 @@ The following patterns weaken security without providing meaningful benefit.
 - Sandbox Hardening (use the `nemoclaw-user-deploy-remote` skill) for container-level security measures.
 - Inference Options (use the `nemoclaw-user-configure-inference` skill) for provider configuration details.
 - How It Works (use the `nemoclaw-user-overview` skill) for the protection layer architecture.
-<!-- - OpenShell [Security Best Practices](https://docs.nvidia.com/openshell/latest/security/best-practices.html) for the platform-level controls reference, including network namespace isolation, seccomp filters, SSRF protection, TLS termination, and gateway authentication. -->

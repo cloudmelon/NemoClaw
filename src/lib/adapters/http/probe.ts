@@ -1,26 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+  type SpawnSyncOptionsWithStringEncoding,
+  type SpawnSyncReturns,
+  spawnSync,
+} from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
-  spawnSync,
-  type SpawnSyncOptionsWithStringEncoding,
-  type SpawnSyncReturns,
-} from "node:child_process";
-
+import { isErrnoException } from "../../core/errno";
+import { compactText } from "../../core/url-utils";
 import type { ProbeResult } from "../../onboard/types";
 import { ROOT } from "../../state/paths";
-import { compactText } from "../../core/url-utils";
-
-import { isErrnoException } from "../../core/errno";
+import { addTraceEvent, withTraceSpan } from "../../trace";
 
 export type CurlProbeResult = ProbeResult;
 
 export interface CurlProbeOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  replaceEnv?: boolean;
   timeoutMs?: number;
   spawnSyncImpl?: (
     command: string,
@@ -67,6 +67,37 @@ function cleanupTempDir(filePath: string, expectedPrefix: string): void {
 
 export function getCurlTimingArgs(): string[] {
   return ["--connect-timeout", "10", "--max-time", "60"];
+}
+
+function sanitizeCurlUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    for (const key of [...url.searchParams.keys()]) {
+      url.searchParams.set(key, "<REDACTED>");
+    }
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return value.replace(/(Bearer\s+)\S+/gi, "$1<REDACTED>");
+  }
+}
+
+function getCurlProbeTraceAttributes(argv: string[], opts: CurlProbeOptions): Record<string, unknown> {
+  const url = argv.at(-1) || "";
+  const methodIndex = argv.findIndex((arg) => arg === "-X" || arg === "--request");
+  const method =
+    methodIndex >= 0 && argv[methodIndex + 1] ? argv[methodIndex + 1].toUpperCase() : "POST";
+  return {
+    "http.url": sanitizeCurlUrl(String(url)),
+    "http.request.method": method,
+    "process.timeout_ms": opts.timeoutMs ?? 30_000,
+  };
+}
+
+function emitCurlResultTraceEvent(attributes: Record<string, unknown>): void {
+  addTraceEvent("curl_result", attributes);
 }
 
 export function summarizeCurlFailure(curlStatus = 0, stderr = "", body = ""): string {
@@ -131,6 +162,12 @@ export function summarizeProbeFailure(body = "", status = 0, curlStatus = 0, std
 }
 
 export function runCurlProbe(argv: string[], opts: CurlProbeOptions = {}): CurlProbeResult {
+  return withTraceSpan("nemoclaw.inference.curl_probe", getCurlProbeTraceAttributes(argv, opts), () =>
+    runCurlProbeImpl(argv, opts),
+  );
+}
+
+function runCurlProbeImpl(argv: string[], opts: CurlProbeOptions = {}): CurlProbeResult {
   const bodyFile = secureTempFile("nemoclaw-curl-probe", ".json");
   try {
     const args = [...argv];
@@ -143,10 +180,7 @@ export function runCurlProbe(argv: string[], opts: CurlProbeOptions = {}): CurlP
         cwd: opts.cwd ?? ROOT,
         encoding: "utf8",
         timeout: opts.timeoutMs ?? 30_000,
-        env: {
-          ...process.env,
-          ...opts.env,
-        },
+        env: opts.replaceEnv ? (opts.env ?? {}) : { ...process.env, ...opts.env },
       },
     );
     const body = fs.existsSync(bodyFile) ? fs.readFileSync(bodyFile, "utf8") : "";
@@ -158,7 +192,7 @@ export function runCurlProbe(argv: string[], opts: CurlProbeOptions = {}): CurlP
       const errorMessage = compactText(
         `${result.error.message || String(result.error)} ${String(result.stderr || "")}`,
       );
-      return {
+      const failure = {
         ok: false,
         httpStatus: 0,
         curlStatus: errorCode,
@@ -166,9 +200,11 @@ export function runCurlProbe(argv: string[], opts: CurlProbeOptions = {}): CurlP
         stderr: errorMessage,
         message: summarizeProbeFailure(body, 0, errorCode, errorMessage),
       };
+      emitCurlResultTraceEvent({ ok: false, http_status: 0, curl_status: errorCode });
+      return failure;
     }
     const status = Number(String(result.stdout || "").trim());
-    return {
+    const probeResult = {
       ok: result.status === 0 && status >= 200 && status < 300,
       httpStatus: Number.isFinite(status) ? status : 0,
       curlStatus: result.status || 0,
@@ -181,9 +217,15 @@ export function runCurlProbe(argv: string[], opts: CurlProbeOptions = {}): CurlP
         String(result.stderr || ""),
       ),
     };
+    emitCurlResultTraceEvent({
+      ok: probeResult.ok,
+      http_status: probeResult.httpStatus,
+      curl_status: probeResult.curlStatus,
+    });
+    return probeResult;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    return {
+    const probeResult = {
       ok: false,
       httpStatus: 0,
       curlStatus:
@@ -195,6 +237,8 @@ export function runCurlProbe(argv: string[], opts: CurlProbeOptions = {}): CurlP
         detail,
       ),
     };
+    emitCurlResultTraceEvent({ ok: false, http_status: 0, curl_status: probeResult.curlStatus });
+    return probeResult;
   } finally {
     cleanupTempDir(bodyFile, "nemoclaw-curl-probe");
   }
@@ -220,6 +264,17 @@ function hasChatCompletionsStreamingData(body: string): boolean {
 }
 
 export function runChatCompletionsStreamingProbe(
+  argv: string[],
+  opts: CurlProbeOptions = {},
+): CurlProbeResult {
+  return withTraceSpan(
+    "nemoclaw.inference.curl_streaming_probe",
+    getCurlProbeTraceAttributes(argv, opts),
+    () => runChatCompletionsStreamingProbeImpl(argv, opts),
+  );
+}
+
+function runChatCompletionsStreamingProbeImpl(
   argv: string[],
   opts: CurlProbeOptions = {},
 ): CurlProbeResult {
@@ -251,6 +306,7 @@ export function runChatCompletionsStreamingProbe(
       const errorMessage = compactText(
         `${result.error.message || String(result.error)} ${String(result.stderr || "")}`,
       );
+      emitCurlResultTraceEvent({ ok: false, http_status: 0, curl_status: errorCode });
       return {
         ok: false,
         httpStatus: 0,
@@ -266,6 +322,7 @@ export function runChatCompletionsStreamingProbe(
     const hasStreamingData = hasChatCompletionsStreamingData(body);
     const httpOk = Number.isFinite(status) && status >= 200 && status < 300;
     if (httpOk && hasStreamingData && (curlStatus === 0 || curlStatus === 28)) {
+      emitCurlResultTraceEvent({ ok: true, http_status: status, curl_status: curlStatus });
       return {
         ok: true,
         httpStatus: status,
@@ -280,6 +337,11 @@ export function runChatCompletionsStreamingProbe(
       httpOk && !hasStreamingData
         ? `HTTP ${status}: chat completions stream did not return SSE data`
         : summarizeProbeFailure(body, status || 0, curlStatus, String(result.stderr || ""));
+    emitCurlResultTraceEvent({
+      ok: false,
+      http_status: Number.isFinite(status) ? status : 0,
+      curl_status: curlStatus,
+    });
     return {
       ok: false,
       httpStatus: Number.isFinite(status) ? status : 0,
@@ -290,17 +352,16 @@ export function runChatCompletionsStreamingProbe(
     };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    const curlStatus =
+      typeof error === "object" && error && "status" in error ? Number(error.status) || 1 : 1;
+    emitCurlResultTraceEvent({ ok: false, http_status: 0, curl_status: curlStatus });
     return {
       ok: false,
       httpStatus: 0,
-      curlStatus:
-        typeof error === "object" && error && "status" in error ? Number(error.status) || 1 : 1,
+      curlStatus,
       body: "",
       stderr: detail,
-      message: summarizeCurlFailure(
-        typeof error === "object" && error && "status" in error ? Number(error.status) || 1 : 1,
-        detail,
-      ),
+      message: summarizeCurlFailure(curlStatus, detail),
     };
   } finally {
     cleanupTempDir(bodyFile, "nemoclaw-chat-streaming-probe");
@@ -328,6 +389,17 @@ export function runStreamingEventProbe(
   argv: string[],
   opts: CurlProbeOptions = {},
 ): StreamingProbeResult {
+  return withTraceSpan(
+    "nemoclaw.inference.curl_streaming_event_probe",
+    getCurlProbeTraceAttributes(argv, opts),
+    () => runStreamingEventProbeImpl(argv, opts),
+  );
+}
+
+function runStreamingEventProbeImpl(
+  argv: string[],
+  opts: CurlProbeOptions = {},
+): StreamingProbeResult {
   const bodyFile = secureTempFile("nemoclaw-streaming-probe", ".sse");
   try {
     const args = [...argv];
@@ -351,6 +423,11 @@ export function runStreamingEventProbe(
       const detail = result.error
         ? String(result.error.message || result.error)
         : String(result.stderr || "");
+      emitCurlResultTraceEvent({
+        ok: false,
+        missing_events_count: REQUIRED_STREAMING_EVENTS.length,
+        curl_status: result.status ?? 1,
+      });
       return {
         ok: false,
         missingEvents: REQUIRED_STREAMING_EVENTS,
@@ -370,6 +447,11 @@ export function runStreamingEventProbe(
 
     const missing = REQUIRED_STREAMING_EVENTS.filter((e) => !eventTypes.has(e));
     if (missing.length > 0) {
+      emitCurlResultTraceEvent({
+        ok: false,
+        missing_events_count: missing.length,
+        curl_status: result.status ?? 0,
+      });
       return {
         ok: false,
         missingEvents: missing,
@@ -379,9 +461,17 @@ export function runStreamingEventProbe(
       };
     }
 
+    emitCurlResultTraceEvent({ ok: true, missing_events_count: 0, curl_status: result.status ?? 0 });
     return { ok: true, missingEvents: [], message: "" };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    const curlStatus =
+      typeof error === "object" && error && "status" in error ? Number(error.status) || 1 : 1;
+    emitCurlResultTraceEvent({
+      ok: false,
+      missing_events_count: REQUIRED_STREAMING_EVENTS.length,
+      curl_status: curlStatus,
+    });
     return {
       ok: false,
       missingEvents: REQUIRED_STREAMING_EVENTS,

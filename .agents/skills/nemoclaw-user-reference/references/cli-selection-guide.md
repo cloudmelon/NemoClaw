@@ -79,12 +79,6 @@ Use `openshell` when the docs explicitly call for a live OpenShell gateway opera
   $ openshell term
   ```
 
-- Inspect the live gateway inference route:
-
-  ```console
-  $ openshell inference get -g nemoclaw
-  ```
-
 - Manage dashboard or service port forwards:
 
   ```console
@@ -97,7 +91,8 @@ Use `openshell` when the docs explicitly call for a live OpenShell gateway opera
   ```console
   $ openshell sandbox list
   $ openshell sandbox get <sandbox-name>
-  $ openshell logs <sandbox-name> --tail
+  $ openshell logs <sandbox-name> -n 20
+  $ openshell doctor check
   ```
 
 - Run one-off commands or move files without starting a NemoClaw chat session:
@@ -150,7 +145,8 @@ $ openshell sandbox exec -n my-assistant -- cat /tmp/gateway.log
 Use `nemoclaw <name> status` and `nemoclaw <name> logs` first.
 They combine NemoClaw registry data, OpenShell state, OpenClaw process health, inference health, policy details, and messaging-channel warnings.
 
-Use `openshell sandbox list`, `openshell sandbox get`, or `openshell logs` when debugging lower-level OpenShell behavior.
+Use `openshell sandbox list`, `openshell sandbox get`, `openshell logs <name> -n 20`, or `openshell doctor check` when debugging lower-level OpenShell behavior.
+When using `openshell logs` directly, `-n <lines>` controls the line count; use `--tail` only when you want live OpenShell log streaming.
 
 ### Approve Blocked Network Requests
 
@@ -161,9 +157,10 @@ Approved endpoints are session-scoped unless you also add them to the policy thr
 
 ### Change Models or Providers
 
-Use the NemoClaw command for model or provider switches so the OpenShell route and the running agent config stay consistent:
+Use the NemoClaw commands for model or provider inspection and switches so the OpenShell route and the running agent config stay consistent:
 
 ```console
+$ nemoclaw inference get
 $ nemoclaw inference set --provider nvidia-prod --model nvidia/nemotron-3-super-120b-a12b
 ```
 
@@ -201,7 +198,7 @@ Use `openshell sandbox upload` and `openshell sandbox download` for manual file 
 
 ## Related Topics
 
-- Commands (use the `nemoclaw-user-reference` skill) for the full NemoClaw command reference.
+- [Commands](commands.md) for the full NemoClaw command reference.
 - Manage Sandbox Lifecycle (use the `nemoclaw-user-manage-sandboxes` skill) for day-two operations.
 - Switch Inference Models (use the `nemoclaw-user-configure-inference` skill) for inference route examples.
 - Customize the Network Policy (use the `nemoclaw-user-manage-policy` skill) for persistent network access changes.

@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -13,7 +11,21 @@ import {
   validateGitRef,
 } from "../tools/e2e-advisor/dispatch.mts";
 
-const ROOT = path.resolve(import.meta.dirname, "..");
+const NIGHTLY_E2E_WORKFLOW_FIXTURE = `
+jobs:
+  network-policy-e2e:
+    if: github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(format(',{0},', inputs.jobs), ',network-policy-e2e,')
+    steps: []
+  cloud-e2e:
+    if: github.event_name != 'workflow_dispatch' || inputs.jobs == '' || contains(format(',{0},', inputs.jobs), ',cloud-e2e,')
+    steps: []
+  report-to-pr:
+    steps: []
+  notify-on-failure:
+    steps: []
+  scorecard:
+    steps: []
+`;
 
 function pullRequest(authorAssociation = "MEMBER", overrides = {}) {
   return {
@@ -32,6 +44,10 @@ function pullRequest(authorAssociation = "MEMBER", overrides = {}) {
   };
 }
 
+function nightlyWorkflowText(): string {
+  return NIGHTLY_E2E_WORKFLOW_FIXTURE;
+}
+
 function advisorResult(job = "network-policy-e2e") {
   return {
     confidence: "high",
@@ -48,28 +64,17 @@ function advisorResult(job = "network-policy-e2e") {
 
 describe("E2E advisor auto-dispatch planning", () => {
   it("derives dispatchable jobs from nightly-e2e selective-dispatch predicates", () => {
-    const workflowText = fs.readFileSync(
-      path.join(ROOT, ".github/workflows/nightly-e2e.yaml"),
-      "utf8",
-    );
-    const jobs = extractDispatchableJobs(workflowText);
+    const jobs = extractDispatchableJobs(nightlyWorkflowText());
 
     expect(jobs).toContain("network-policy-e2e");
     expect(jobs).toContain("cloud-e2e");
     expect(jobs).not.toContain("report-to-pr");
     expect(jobs).not.toContain("notify-on-failure");
     expect(jobs).not.toContain("scorecard");
-
-    for (const job of jobs) {
-      expect(workflowText).toContain(`contains(format(',{0},', inputs.jobs), ',${job},')`);
-    }
   });
 
   it("plans a trusted main-workflow dispatch for NVIDIA org member PRs", () => {
-    const workflowText = fs.readFileSync(
-      path.join(ROOT, ".github/workflows/nightly-e2e.yaml"),
-      "utf8",
-    );
+    const workflowText = nightlyWorkflowText();
     const plan = planAutoDispatch({
       result: advisorResult(),
       workflowText,
@@ -77,6 +82,8 @@ describe("E2E advisor auto-dispatch planning", () => {
       env: {
         GITHUB_EVENT_NAME: "pull_request",
         GITHUB_REPOSITORY: "NVIDIA/NemoClaw",
+        GITHUB_RUN_ID: "456789",
+        GITHUB_RUN_ATTEMPT: "2",
       },
     });
 
@@ -86,14 +93,37 @@ describe("E2E advisor auto-dispatch planning", () => {
       jobs: "network-policy-e2e",
       target_ref: "abc123def456",
       pr_number: "123",
+      advisor_dispatch_id: "advisor-123-456789-2",
     });
+    expect(plan.advisorDispatchId).toBe("advisor-123-456789-2");
+  });
+
+  it("dispatches all required jobs without applying the retired max-jobs cap", () => {
+    const workflowText = nightlyWorkflowText();
+    const plan = planAutoDispatch({
+      result: {
+        confidence: "high",
+        requiredTests: [
+          { id: "network-policy-e2e", workflow: "nightly-e2e.yaml" },
+          { id: "cloud-e2e", workflow: "nightly-e2e.yaml" },
+        ],
+      },
+      workflowText,
+      event: pullRequest("MEMBER"),
+      env: {
+        GITHUB_EVENT_NAME: "pull_request",
+        GITHUB_REPOSITORY: "NVIDIA/NemoClaw",
+        E2E_ADVISOR_AUTO_DISPATCH_MAX_JOBS: "1",
+      },
+    });
+
+    expect(plan.status).toBe("ready");
+    expect(plan.jobs).toEqual(["network-policy-e2e", "cloud-e2e"]);
+    expect(plan.inputs?.jobs).toBe("network-policy-e2e,cloud-e2e");
   });
 
   it("plans dispatch for allowlisted authors whose private org membership appears as contributor", () => {
-    const workflowText = fs.readFileSync(
-      path.join(ROOT, ".github/workflows/nightly-e2e.yaml"),
-      "utf8",
-    );
+    const workflowText = nightlyWorkflowText();
     const plan = planAutoDispatch({
       result: advisorResult(),
       workflowText,
@@ -111,10 +141,7 @@ describe("E2E advisor auto-dispatch planning", () => {
   });
 
   it("skips PRs that are not authored by org members, owners, or allowlisted authors", () => {
-    const workflowText = fs.readFileSync(
-      path.join(ROOT, ".github/workflows/nightly-e2e.yaml"),
-      "utf8",
-    );
+    const workflowText = nightlyWorkflowText();
     const plan = planAutoDispatch({
       result: advisorResult(),
       workflowText,
@@ -132,10 +159,7 @@ describe("E2E advisor auto-dispatch planning", () => {
   });
 
   it("skips draft PRs", () => {
-    const workflowText = fs.readFileSync(
-      path.join(ROOT, ".github/workflows/nightly-e2e.yaml"),
-      "utf8",
-    );
+    const workflowText = nightlyWorkflowText();
     const plan = planAutoDispatch({
       result: advisorResult(),
       workflowText,
@@ -151,10 +175,7 @@ describe("E2E advisor auto-dispatch planning", () => {
   });
 
   it("ignores recommendations that are not dispatchable in the target workflow", () => {
-    const workflowText = fs.readFileSync(
-      path.join(ROOT, ".github/workflows/nightly-e2e.yaml"),
-      "utf8",
-    );
+    const workflowText = nightlyWorkflowText();
     const plan = planAutoDispatch({
       result: advisorResult("not-a-real-e2e-job"),
       workflowText,
@@ -187,11 +208,13 @@ describe("E2E advisor auto-dispatch planning", () => {
         jobs: "network-policy-e2e,cloud_e2e",
         target_ref: "abc123def456",
         pr_number: "123",
+        advisor_dispatch_id: "advisor-123-456789",
       }),
     ).toEqual({
       jobs: "network-policy-e2e,cloud_e2e",
       target_ref: "abc123def456",
       pr_number: "123",
+      advisor_dispatch_id: "advisor-123-456789",
     });
   });
 
@@ -237,6 +260,12 @@ describe("E2E advisor auto-dispatch planning", () => {
       jobs: "network-policy-e2e",
       target_ref: "abc123def456",
       pr_number: "123abc",
+    },
+    {
+      jobs: "network-policy-e2e",
+      target_ref: "abc123def456",
+      pr_number: "123",
+      advisor_dispatch_id: "advisor/123",
     },
   ])("rejects unsafe dispatch inputs %#", (inputs) => {
     expect(() => validateDispatchInputs(inputs)).toThrow(/Refusing to dispatch unsafe/);

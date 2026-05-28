@@ -5,9 +5,13 @@
 // Inference endpoint probes — validate that a provider's API responds
 // before committing the onboard wizard to a model selection.
 
-const { normalizeCredentialValue } = require("../credentials/store");
+const { getCredential, normalizeCredentialValue, resolveProviderCredential } = require("../credentials/store");
 const { isWsl } = require("../platform");
 const httpProbe = require("../adapters/http/probe");
+const {
+  getHostDockerInternalProbeFailure,
+  isHijackedDockerInternalUrl,
+} = require("./onboard-host-docker-internal");
 const {
   isNvcfFunctionNotFoundForAccount,
   nvcfFunctionNotFoundMessage,
@@ -20,6 +24,7 @@ const {
   runChatCompletionsStreamingProbe,
   runStreamingEventProbe,
 } = httpProbe;
+const trace = require("../trace");
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -28,7 +33,7 @@ const {
 // so host-side validation cannot prove reachability for that URL. For ordinary
 // verification we still skip these endpoints, but strict tool-call validation
 // must fail closed unless the host is probeable from the onboard process.
-const SANDBOX_INTERNAL_HOSTS = ["host.openshell.internal", "host.docker.internal"];
+const SANDBOX_INTERNAL_HOSTS = ["host.openshell.internal"];
 
 function isSandboxInternalUrl(url) {
   try {
@@ -228,16 +233,37 @@ function isCurlTimeout(result) {
 }
 
 function executeProbeWithHttpRetry(probe) {
-  let result = probe.execute();
-  for (const delayMs of HTTP_PROBE_RETRY_DELAYS_MS) {
-    if (!shouldRetryHttpProbe(result)) break;
-    console.log(
-      `  ${probe.name} validation returned HTTP ${result.httpStatus}; retrying in ${Math.round(delayMs / 1000)}s...`,
-    );
-    sleepSync(delayMs);
-    result = probe.execute();
-  }
-  return result;
+  return trace.withTraceSpan(
+    "nemoclaw.inference.validation_probe",
+    { probe_name: probe.name, api: probe.api || null },
+    () => {
+      let attempt = 1;
+      let result = probe.execute();
+      trace.addTraceEvent("probe_result", {
+        attempt,
+        ok: result.ok,
+        http_status: result.httpStatus,
+        curl_status: result.curlStatus,
+      });
+      for (const delayMs of HTTP_PROBE_RETRY_DELAYS_MS) {
+        if (!shouldRetryHttpProbe(result)) break;
+        console.log(
+          `  ${probe.name} validation returned HTTP ${result.httpStatus}; retrying in ${Math.round(delayMs / 1000)}s...`,
+        );
+        trace.addTraceEvent("probe_retry_sleep", { delay_ms: delayMs, http_status: result.httpStatus });
+        sleepSync(delayMs);
+        attempt += 1;
+        result = probe.execute();
+        trace.addTraceEvent("probe_result", {
+          attempt,
+          ok: result.ok,
+          http_status: result.httpStatus,
+          curl_status: result.curlStatus,
+        });
+      }
+      return result;
+    },
+  );
 }
 
 // ── Responses API probe ──────────────────────────────────────────
@@ -484,6 +510,10 @@ function runChatCompletionsProbe({ authHeader, model, url, isWsl: isWslOverride 
 }
 
 function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
+  if (isHijackedDockerInternalUrl(endpointUrl) && options.allowHostDockerInternal !== true) {
+    return getHostDockerInternalProbeFailure();
+  }
+
   if (isSandboxInternalUrl(endpointUrl)) {
     const { hostname } = new URL(String(endpointUrl));
     if (options.requireChatCompletionsToolCalling !== true) {
@@ -494,21 +524,19 @@ function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
         note: `${hostname} only resolves inside the sandbox — validation skipped. If the endpoint is unreachable at runtime, re-run onboard with a routable URL.`,
       };
     }
-    if (hostname !== "host.docker.internal") {
-      return {
-        ok: false,
-        message: `${hostname} only resolves inside the sandbox and cannot be validated for required structured Chat Completions tool calls from the host. Use a routable endpoint URL and retry onboard.`,
-        failures: [
-          {
-            name: "Chat Completions API with tool calling",
-            httpStatus: 0,
-            curlStatus: 0,
-            message: "sandbox-internal endpoint cannot be strictly validated from host",
-            body: "",
-          },
-        ],
-      };
-    }
+    return {
+      ok: false,
+      message: `${hostname} only resolves inside the sandbox and cannot be validated for required structured Chat Completions tool calls from the host. Use a routable endpoint URL and retry onboard.`,
+      failures: [
+        {
+          name: "Chat Completions API with tool calling",
+          httpStatus: 0,
+          curlStatus: 0,
+          message: "sandbox-internal endpoint cannot be strictly validated from host",
+          body: "",
+        },
+      ],
+    };
   }
 
   const useQueryParam = options.authMode === "query-param";
@@ -787,6 +815,7 @@ function probeAnthropicEndpoint(endpointUrl, model, apiKey) {
 
 module.exports = {
   isSandboxInternalUrl,
+  isHijackedDockerInternalUrl,
   parseJsonObject,
   hasResponsesToolCall,
   hasChatCompletionsToolCall,
@@ -804,3 +833,44 @@ module.exports = {
   probeAnthropicEndpoint,
   RETRIABLE_HTTP_PROBE_STATUSES,
 };
+
+function shouldSmokeOpenAiLikeOnboardRoute(provider) {
+  const { REMOTE_PROVIDER_CONFIG } = require("../onboard/providers");
+  if (provider === "nvidia-nim" || provider === "nvidia-router") return true;
+  return Object.values(REMOTE_PROVIDER_CONFIG).some(
+    (entry) => entry.providerName === provider && entry.providerType === "openai",
+  );
+}
+
+function verifyOnboardInferenceSmoke(options) {
+  if (!options.forceOpenAiLike && !shouldSmokeOpenAiLikeOnboardRoute(options.provider)) return;
+  if (process.env.VITEST === "true") return;
+
+  const endpointUrl = options.endpointUrl || require("./config").INFERENCE_ROUTE_URL;
+  const credentialEnv = options.credentialEnv || null;
+  const apiKey = credentialEnv
+    ? resolveProviderCredential(credentialEnv) || getCredential(credentialEnv) || ""
+    : "";
+  const probe = probeOpenAiLikeEndpoint(endpointUrl, options.model, apiKey, {
+    authMode: getProbeAuthMode(options.provider),
+    skipResponsesProbe: true,
+  });
+
+  if (probe.ok) {
+    console.log(`  ✓ Inference smoke passed: ${options.provider} / ${options.model}`);
+    return;
+  }
+
+  const { compactText } = require("../core/url-utils");
+  const { redact } = require("../runner");
+  console.error("  Onboard inference smoke check failed.");
+  console.error(`  Provider: ${options.provider}`);
+  console.error(`  Model: ${options.model}`);
+  console.error(`  API base: ${endpointUrl}`);
+  if (credentialEnv) console.error("  Credential env: configured");
+  console.error(`  Upstream error: ${compactText(redact(probe.message || "unknown inference failure"))}`);
+  process.exit(1);
+}
+
+module.exports.shouldSmokeOpenAiLikeOnboardRoute = shouldSmokeOpenAiLikeOnboardRoute;
+module.exports.verifyOnboardInferenceSmoke = verifyOnboardInferenceSmoke;

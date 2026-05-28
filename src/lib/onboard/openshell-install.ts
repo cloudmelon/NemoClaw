@@ -91,7 +91,6 @@ export type OpenShellInstallDeps = {
   ) => boolean;
   resolveOpenShellGatewayBinary: () => string | null;
   resolveOpenShellSandboxBinary: () => string | null;
-  resolveOpenShellVmDriverBinary: () => string | null;
   isOpenshellInstalled: () => boolean;
   installOpenshell: () => OpenShellInstallResult;
   getInstalledOpenshellVersion: (versionOutput?: string | null) => string | null;
@@ -116,7 +115,6 @@ export function areRequiredDockerDriverBinariesPresent(
     | "isLinuxDockerDriverGatewayEnabled"
     | "resolveOpenShellGatewayBinary"
     | "resolveOpenShellSandboxBinary"
-    | "resolveOpenShellVmDriverBinary"
   >,
   platform: NodeJS.Platform = process.platform,
   binaries: DockerDriverBinaryOverrides = {},
@@ -129,12 +127,8 @@ export function areRequiredDockerDriverBinariesPresent(
   const sandboxBinary = Object.prototype.hasOwnProperty.call(binaries, "sandboxBin")
     ? binaries.sandboxBin
     : deps.resolveOpenShellSandboxBinary();
-  const vmDriverBinary = Object.prototype.hasOwnProperty.call(binaries, "vmDriverBin")
-    ? binaries.vmDriverBin
-    : deps.resolveOpenShellVmDriverBinary();
   if (!gatewayBinary) return false;
   if (platform === "linux" && !sandboxBinary) return false;
-  if (platform === "darwin" && !vmDriverBinary) return false;
   return true;
 }
 
@@ -165,7 +159,7 @@ export function ensureOpenshellForOnboard(deps: OpenShellInstallDeps): OpenShell
         deps.exit(1);
       }
     } else {
-      const minOpenshellVersion = deps.getBlueprintMinOpenshellVersion() ?? "0.0.39";
+      const minOpenshellVersion = deps.getBlueprintMinOpenshellVersion() ?? "0.0.44";
       const currentVersionOutput = deps.runCaptureOpenshell(["--version"], { ignoreError: true });
       const needsDevChannel =
         deps.isLinuxDockerDriverGatewayEnabled(platform, arch) &&
@@ -182,12 +176,7 @@ export function ensureOpenshellForOnboard(deps: OpenShellInstallDeps): OpenShell
         if (needsDevChannel) {
           deps.log("  OpenShell Docker-driver onboarding requires the dev channel. Upgrading...");
         } else if (needsDockerDriverBinaries) {
-          const required =
-            platform === "linux"
-              ? "gateway and sandbox"
-              : platform === "darwin"
-                ? "gateway and VM driver"
-                : "gateway";
+          const required = platform === "linux" ? "gateway and sandbox" : "gateway";
           deps.log(
             `  OpenShell standalone gateway onboarding requires the ${required} binaries. Reinstalling...`,
           );

@@ -88,12 +88,14 @@ To opt in to `/v1/responses` for a backend you have verified end to end, set
 $ NEMOCLAW_PREFERRED_API=openai-responses nemoclaw onboard
 ```
 
-> **Note:** `NEMOCLAW_INFERENCE_API_OVERRIDE` patches the config at container startup but
-> does not update the Dockerfile ARG baked into the image.
-> If you recreate the sandbox without the override env var, the image reverts to
-> the original API path.
-> A fresh `nemoclaw onboard` is the reliable fix because it updates both the
-> session and the baked image.
+**Note:**
+
+`NEMOCLAW_INFERENCE_API_OVERRIDE` patches the config at container startup but
+does not update the Dockerfile ARG baked into the image.
+If you recreate the sandbox without the override env var, the image reverts to
+the original API path.
+A fresh `nemoclaw onboard` is the reliable fix because it updates both the
+session and the baked image.
 
 ## Cross-Provider Switching
 
@@ -121,6 +123,7 @@ To change these values, set the corresponding environment variables before runni
 | `NEMOCLAW_AGENT_HEARTBEAT_EVERY` | Go-style duration (`30m`, `1h`, `0m` to disable) | `unset` (OpenClaw default) |
 
 Invalid values are ignored, and the default bakes into the image.
+For Local Ollama, onboarding loads the selected model first and uses Ollama's reported runtime context length when `NEMOCLAW_CONTEXT_WINDOW` is unset.
 Use `NEMOCLAW_INFERENCE_INPUTS=text,image` only for a model that accepts image input through the selected provider.
 
 ```console
@@ -161,17 +164,27 @@ $ nemoclaw onboard --resume --recreate-sandbox
 
 ## Verify the Active Model
 
-Run the inference command to confirm the live gateway route:
+Use `nemoclaw inference get` to print the provider and model the gateway is currently routing to.
+Run it before `nemoclaw inference set` to confirm the starting state, or after a switch to verify the new route.
 
 ```console
 $ nemoclaw inference get
+Provider: nvidia-prod
+Model:    nvidia/nemotron-3-super-120b-a12b
 ```
 
-Add `--json` for machine-readable output:
+Pass `--json` for machine-readable output.
 
 ```console
 $ nemoclaw inference get --json
+{
+  "provider": "nvidia-prod",
+  "model": "nvidia/nemotron-3-super-120b-a12b"
+}
 ```
+
+The command exits non-zero with `OpenShell inference route is not configured.` when the gateway has no registered inference route.
+Run `nemoclaw onboard` to configure one.
 
 Run the status command when you also need sandbox, service, and messaging health:
 
@@ -191,4 +204,4 @@ The status output includes the active provider, model, and endpoint with the res
 
 ## Related Topics
 
-- Inference Options (use the `nemoclaw-user-configure-inference` skill) for the full list of providers available during onboarding.
+- [Inference Options](inference-options.md) for the full list of providers available during onboarding.

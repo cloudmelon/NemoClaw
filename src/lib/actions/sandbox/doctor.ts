@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import * as agentRuntime from "../../agent/runtime";
 import { CLI_DISPLAY_NAME, CLI_NAME } from "../../cli/branding";
-import { isErrnoException } from "../../core/errno";
 import { recoverNamedGatewayRuntime } from "../../gateway-runtime-action";
+import { readCloudflaredState } from "../../tunnel/services";
 import { probeProviderHealth, type ProviderHealthStatus } from "../../inference/health";
 import { probeSandboxInferenceGatewayHealth } from "./process-recovery";
 import { parseGatewayInference } from "../../inference/config";
@@ -26,18 +27,25 @@ import * as shields from "../../shields";
 import { buildStatusCommandDeps } from "../../status-command-deps";
 import { B, D, G, R, RD, YW } from "../../cli/terminal-style";
 
-const agentRuntime = require("../../../../bin/lib/agent-runtime");
-
 const NEMOCLAW_GATEWAY_NAME = "nemoclaw";
 
 type DoctorStatus = "ok" | "warn" | "fail" | "info";
 
-type DoctorCheck = {
+export type DoctorCheck = {
   group: string;
   label: string;
   status: DoctorStatus;
   detail: string;
   hint?: string;
+};
+
+export type DoctorReport = {
+  schemaVersion: 1;
+  sandbox: string;
+  status: DoctorStatus;
+  failed: number;
+  warnings: number;
+  checks: DoctorCheck[];
 };
 
 type CommandCapture = {
@@ -118,37 +126,39 @@ function doctorStatusLabel(status: DoctorStatus): string {
   }
 }
 
-function renderDoctorReport(sandboxName: string, checks: DoctorCheck[], asJson: boolean): number {
+function buildDoctorReport(sandboxName: string, checks: DoctorCheck[]): DoctorReport {
   const summary = doctorSummary(checks);
+  return {
+    schemaVersion: 1,
+    sandbox: sandboxName,
+    status: summary.status,
+    failed: summary.failed,
+    warnings: summary.warned,
+    checks,
+  };
+}
+
+function doctorReportExitCode(report: DoctorReport): number {
+  return report.failed > 0 ? 1 : 0;
+}
+
+function renderDoctorReport(report: DoctorReport, asJson: boolean): number {
   if (asJson) {
-    console.log(
-      JSON.stringify(
-        {
-          schemaVersion: 1,
-          sandbox: sandboxName,
-          status: summary.status,
-          failed: summary.failed,
-          warnings: summary.warned,
-          checks,
-        },
-        null,
-        2,
-      ),
-    );
-    return summary.failed > 0 ? 1 : 0;
+    console.log(JSON.stringify(report, null, 2));
+    return doctorReportExitCode(report);
   }
 
   console.log("");
-  console.log(`  ${B}${CLI_DISPLAY_NAME} doctor:${R} ${sandboxName}`);
+  console.log(`  ${B}${CLI_DISPLAY_NAME} doctor:${R} ${report.sandbox}`);
   const groupOrder = ["Host", "Gateway", "Sandbox", "Inference", "Messaging", "Local services"];
   const orderedGroups = [
     ...groupOrder,
-    ...checks
+    ...report.checks
       .map((check) => check.group)
       .filter((group, index, all) => !groupOrder.includes(group) && all.indexOf(group) === index),
   ];
   for (const group of orderedGroups) {
-    const groupChecks = checks.filter((check) => check.group === group);
+    const groupChecks = report.checks.filter((check) => check.group === group);
     if (groupChecks.length === 0) continue;
     console.log("");
     console.log(`  ${G}${group}:${R}`);
@@ -161,17 +171,17 @@ function renderDoctorReport(sandboxName: string, checks: DoctorCheck[], asJson: 
   }
 
   console.log("");
-  if (summary.status === "ok") {
+  if (report.status === "ok") {
     console.log(`  Summary: ${G}healthy${R}`);
-  } else if (summary.status === "warn") {
-    console.log(`  Summary: ${YW}healthy with ${summary.warned} warning(s)${R}`);
+  } else if (report.status === "warn") {
+    console.log(`  Summary: ${YW}healthy with ${report.warnings} warning(s)${R}`);
   } else {
     console.log(
-      `  Summary: ${RD}attention needed${R} (${summary.failed} failed, ${summary.warned} warning(s))`,
+      `  Summary: ${RD}attention needed${R} (${report.failed} failed, ${report.warnings} warning(s))`,
     );
   }
   console.log("");
-  return summary.failed > 0 ? 1 : 0;
+  return doctorReportExitCode(report);
 }
 
 function dockerInspectGateway(containerName: string): DoctorCheck[] {
@@ -259,7 +269,7 @@ function stoppedCloudflaredCheck(): DoctorCheck {
     label: "cloudflared",
     status: "info",
     detail: "stopped",
-    hint: `start when needed with \`${CLI_NAME} tunnel start\``,
+    hint: `no cloudflared process; run \`${CLI_NAME} tunnel start\` to start it`,
   };
 }
 
@@ -269,7 +279,7 @@ function staleCloudflaredPidFileCheck(): DoctorCheck {
     label: "cloudflared",
     status: "warn",
     detail: "stale PID file",
-    hint: `run \`${CLI_NAME} tunnel stop\` and start it again if you need a public tunnel`,
+    hint: `no cloudflared process (stored PID is invalid); run \`${CLI_NAME} tunnel start\` to restart it`,
   };
 }
 
@@ -279,81 +289,26 @@ function staleCloudflaredPidCheck(pid: number): DoctorCheck {
     label: "cloudflared",
     status: "warn",
     detail: `stale PID ${pid}`,
-    hint: `run \`${CLI_NAME} tunnel stop\` to clean up the service state`,
+    hint: `no cloudflared process (PID ${pid} is dead or not cloudflared); run \`${CLI_NAME} tunnel start\` to restart it`,
   };
 }
 
-function readCloudflaredPidFile(pidFile: string): string | null {
-  try {
-    return fs.readFileSync(pidFile, "utf-8").trim();
-  } catch (error) {
-    if (isErrnoException(error) && error.code === "ENOENT") {
-      return null;
-    }
-    throw error;
-  }
-}
-
-function commandLineNamesCloudflared(commandLine: string): boolean {
-  return commandLine
-    .split(/\0|\s+/)
-    .filter(Boolean)
-    .some((token) => path.basename(token) === "cloudflared");
-}
-
-function readProcessCommandLine(pid: number): string | null {
-  if (process.platform === "win32") {
-    return null;
-  }
-  try {
-    return fs.readFileSync(`/proc/${pid}/cmdline`, "utf-8");
-  } catch {
-    try {
-      return execFileSync("ps", ["-p", String(pid), "-o", "comm=", "-o", "args="], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 1000,
-      });
-    } catch {
-      return null;
-    }
-  }
-}
-
-function isCloudflaredProcess(pid: number): boolean {
-  const commandLine = readProcessCommandLine(pid);
-  if (commandLine === null) {
-    return false;
-  }
-  return commandLineNamesCloudflared(commandLine);
-}
-
 function cloudflaredDoctorCheck(sandboxName: string): DoctorCheck {
-  const pidFile = path.join(`/tmp/nemoclaw-services-${sandboxName}`, "cloudflared.pid");
-  if (!fs.existsSync(pidFile)) {
-    return stoppedCloudflaredCheck();
-  }
-  const rawPid = readCloudflaredPidFile(pidFile);
-  if (rawPid === null) {
-    return stoppedCloudflaredCheck();
-  }
-  const pid = Number(rawPid);
-  if (!Number.isFinite(pid) || pid <= 0) {
-    return staleCloudflaredPidFileCheck();
-  }
-  try {
-    process.kill(pid, 0);
-    if (!isCloudflaredProcess(pid)) {
-      return staleCloudflaredPidCheck(pid);
-    }
-    return {
-      group: "Local services",
-      label: "cloudflared",
-      status: "ok",
-      detail: `running (PID ${pid})`,
-    };
-  } catch {
-    return staleCloudflaredPidCheck(pid);
+  const state = readCloudflaredState(path.join("/tmp", `nemoclaw-services-${sandboxName}`));
+  switch (state.kind) {
+    case "stopped":
+      return stoppedCloudflaredCheck();
+    case "stale-pid-file":
+      return staleCloudflaredPidFileCheck();
+    case "stale-pid-process":
+      return staleCloudflaredPidCheck(state.pid);
+    case "running":
+      return {
+        group: "Local services",
+        label: "cloudflared",
+        status: "ok",
+        detail: `running (PID ${state.pid})`,
+      };
   }
 }
 
@@ -446,8 +401,16 @@ function messagingDoctorCheck(sandboxName: string, sb: SandboxEntry): DoctorChec
   };
 }
 
+type RunSandboxDoctorOptions = {
+  quietJson?: boolean;
+};
+
 // eslint-disable-next-line complexity
-export async function runSandboxDoctor(sandboxName: string, args: string[] = []): Promise<void> {
+export async function runSandboxDoctor(
+  sandboxName: string,
+  args: string[] = [],
+  options: RunSandboxDoctorOptions = {},
+): Promise<DoctorReport | undefined> {
   const asJson = args.includes("--json");
   const helpRequested = args.includes("--help") || args.includes("-h");
   const unknown = args.filter((arg) => !["--json", "--help", "-h"].includes(arg));
@@ -648,15 +611,25 @@ export async function runSandboxDoctor(sandboxName: string, args: string[] = [])
       });
     }
 
-    const shieldsDown = shields.isShieldsDown(sandboxName, true);
+    const shieldsPosture = shields.getShieldsPosture(sandboxName, true);
+    const shieldsStatus: DoctorStatus =
+      shieldsPosture.mode === "locked"
+        ? "ok"
+        : shieldsPosture.mode === "temporarily_unlocked" || shieldsPosture.mode === "error"
+          ? "warn"
+          : "info";
+    const shieldsHint =
+      shieldsPosture.mode === "mutable_default"
+        ? `run \`${CLI_NAME} ${sandboxName} shields up\` to opt into lockdown`
+        : shieldsPosture.mode === "locked"
+          ? undefined
+          : `run \`${CLI_NAME} ${sandboxName} shields status\` for details`;
     checks.push({
       group: "Sandbox",
       label: "Shields",
-      status: shieldsDown ? "warn" : "ok",
-      detail: shieldsDown ? "down" : "up",
-      hint: shieldsDown
-        ? `run \`${CLI_NAME} ${sandboxName} shields status\` for details`
-        : undefined,
+      status: shieldsStatus,
+      detail: shieldsPosture.detail,
+      hint: shieldsHint,
     });
     checks.push(messagingDoctorCheck(sandboxName, sb));
   }
@@ -664,6 +637,10 @@ export async function runSandboxDoctor(sandboxName: string, args: string[] = [])
   checks.push(ollamaDoctorCheck(currentProvider));
   checks.push(cloudflaredDoctorCheck(sandboxName));
 
-  const exitCode = renderDoctorReport(sandboxName, checks, asJson);
+  const report = buildDoctorReport(sandboxName, checks);
+  if (asJson && options.quietJson) return report;
+
+  const exitCode = renderDoctorReport(report, asJson);
   if (exitCode !== 0) process.exit(exitCode);
+  return undefined;
 }

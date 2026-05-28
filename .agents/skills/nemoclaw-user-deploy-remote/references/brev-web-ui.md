@@ -5,8 +5,10 @@
 Use the Brev web UI to launch a hosted NemoClaw sandbox from your browser.
 This flow provisions a remote VM, configures inference, starts OpenClaw inside an OpenShell sandbox, and opens the OpenClaw dashboard.
 
-> **Note:** Use this guide when you want to try NemoClaw without installing the CLI or using a local GPU.
-> If you want to manage the remote host from a terminal, see Deploy to a Remote GPU Instance (use the `nemoclaw-user-deploy-remote` skill).
+**Note:**
+
+Use this guide when you want to try NemoClaw without installing the CLI or using a local GPU.
+If you want to manage the remote host from a terminal, see [Deploy to a Remote GPU Instance](../SKILL.md).
 
 ## What This Flow Creates
 
@@ -63,10 +65,12 @@ Use the NVIDIA Cloud provider shown on this screen.
 2. Paste your `nvapi-` API key.
 3. Click **Create Agent**.
 
-> **Note:** The **Show Other Providers** dropdown appears below the **NVIDIA Cloud** card and can be easy to miss.
-> Click it to expand the provider list.
-> The expanded list includes **OpenAI**, **Anthropic**, and **Google Gemini**.
-> For these providers, get the API key from the provider's own console before you create the agent.
+**Note:**
+
+The **Show Other Providers** dropdown appears below the **NVIDIA Cloud** card and can be easy to miss.
+Click it to expand the provider list.
+The expanded list includes **OpenAI**, **Anthropic**, and **Google Gemini**.
+For these providers, get the API key from the provider's own console before you create the agent.
 
 ### Setup
 
@@ -90,10 +94,12 @@ Provider: NVIDIA Cloud
 
 Click **Chat With Agent** to open the OpenClaw dashboard.
 
-:> **Note:** The dashboard might initially show a **Pairing required** warning.
-> This means the gateway is still completing pairing in the background.
-> Wait for about a few minutes for pairing to finish automatically. Refresh the dashboard to see if the warning is resolved and the connection is established.
-> If pairing does not finish, go to the **Overview** page in the OpenClaw UI, find the **Gateway Access** panel, and click **Connect**.:
+**Note:**
+
+The dashboard might initially show a **Pairing required** warning.
+This means the gateway is still completing pairing in the background.
+Wait for about a few minutes for pairing to finish automatically. Refresh the dashboard to see if the warning is resolved and the connection is established.
+If pairing does not finish, go to the **Overview** page in the OpenClaw UI, find the **Gateway Access** panel, and click **Connect**.
 
 ## Start a Chat
 
@@ -145,5 +151,5 @@ After your agent is running, explore these related tasks:
 - Set Up Messaging Channels (use the `nemoclaw-user-manage-sandboxes` skill) to learn how to connect Telegram, Slack, or Discord.
 - Switch Inference Providers (use the `nemoclaw-user-configure-inference` skill) to learn how to change the model provider after setup.
 - Monitor Sandbox Activity (use the `nemoclaw-user-monitor-sandbox` skill) to learn how to inspect sandbox health and logs.
-- Deploy to a Remote GPU Instance (use the `nemoclaw-user-deploy-remote` skill) to learn how to deploy NemoClaw to a remote GPU instance using the CLI.
+- [Deploy to a Remote GPU Instance](../SKILL.md) to learn how to deploy NemoClaw to a remote GPU instance using the CLI.
 - Troubleshooting (use the `nemoclaw-user-reference` skill) to learn how to fix common setup and runtime issues.

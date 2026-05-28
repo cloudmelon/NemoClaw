@@ -212,7 +212,7 @@ describe("inventory commands", () => {
       log: (message = "") => lines.push(message),
     });
 
-    // Default sandbox reflects live gateway state, with an onboarded drift note.
+    // Default sandbox reflects live gateway state, with an explicit drift note.
     expect(lines).toContain(
       "      agent: openclaw  model: live-model  provider: live-provider  sandbox GPU  policies: none",
     );
@@ -221,7 +221,7 @@ describe("inventory commands", () => {
       "      agent: openclaw  model: configured-alpha  provider: configured-provider  sandbox GPU  policies: none",
     );
     expect(lines).toContain(
-      "      (onboarded: model=configured-alpha, provider=configured-provider)",
+      "      (live OpenShell gateway differs from onboarded: model=configured-alpha, provider=configured-provider)",
     );
     // Non-default sandbox keeps its stored config — the gateway only applies
     // to whichever sandbox is currently connected.
@@ -306,7 +306,9 @@ describe("inventory commands", () => {
     expect(lines).toContain(
       "      agent: openclaw  model: live-model  provider: configured-provider  sandbox GPU  policies: none",
     );
-    expect(lines).toContain("      (onboarded: model=configured-alpha)");
+    expect(lines).toContain(
+      "      (live OpenShell gateway differs from onboarded: model=configured-alpha)",
+    );
   });
 
   it("annotates only the provider field when the live gateway provider drifts", async () => {
@@ -333,7 +335,9 @@ describe("inventory commands", () => {
     expect(lines).toContain(
       "      agent: openclaw  model: configured-alpha  provider: live-provider  sandbox GPU  policies: none",
     );
-    expect(lines).toContain("      (onboarded: provider=configured-provider)");
+    expect(lines).toContain(
+      "      (live OpenShell gateway differs from onboarded: provider=configured-provider)",
+    );
   });
 
   it("flags messaging bridge as degraded when checkMessagingBridgeHealth reports conflicts", () => {
@@ -584,6 +588,116 @@ describe("inventory commands", () => {
 
     expect(lines).toContain("    alpha * (minimaxai/minimax-m2.7)");
     expect(lines).toContain("      (onboarded: unknown)");
+  });
+
+  // #2604: bare `nemoclaw status` previously only showed the model in parens
+  // and didn't label provider or connection state. Users had to run the
+  // per-sandbox `nemoclaw <name> status` to see those fields.
+  it("emits an Inference line with provider / model under each sandbox row (#2604)", () => {
+    const lines: string[] = [];
+    showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [
+          {
+            name: "alpha",
+            model: "nvidia/nemotron-3-super-120b-a12b",
+            provider: "nvidia-prod",
+          },
+          { name: "beta", model: "qwen2.5:7b", provider: "ollama-local" },
+        ],
+        defaultSandbox: "alpha",
+      }),
+      getLiveInference: () => null,
+      showServiceStatus: vi.fn(),
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(lines).toContain("      Inference: nvidia-prod / nvidia/nemotron-3-super-120b-a12b");
+    expect(lines).toContain("      Inference: ollama-local / qwen2.5:7b");
+  });
+
+  it("prefers live gateway provider for the default sandbox in the Inference line (#2604)", () => {
+    const lines: string[] = [];
+    showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [
+          { name: "alpha", model: "stored-model", provider: "stored-provider" },
+        ],
+        defaultSandbox: "alpha",
+      }),
+      getLiveInference: () => ({ provider: "live-provider", model: "live-model" }),
+      showServiceStatus: vi.fn(),
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(lines).toContain("      Inference: live-provider / live-model");
+  });
+
+  it("emits a Connected line per sandbox when getActiveSessionCount is provided (#2604)", () => {
+    const lines: string[] = [];
+    showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [
+          { name: "alpha", model: "m" },
+          { name: "beta", model: "m" },
+        ],
+        defaultSandbox: "alpha",
+      }),
+      getLiveInference: () => null,
+      getActiveSessionCount: (name) => (name === "alpha" ? 2 : 0),
+      showServiceStatus: vi.fn(),
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(lines).toContain("      Connected: yes (2 sessions)");
+    expect(lines).toContain("      Connected: no");
+  });
+
+  it("renders `1 session` (singular) when the active count is exactly one (#2604)", () => {
+    const lines: string[] = [];
+    showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [{ name: "alpha", model: "m" }],
+        defaultSandbox: "alpha",
+      }),
+      getLiveInference: () => null,
+      getActiveSessionCount: () => 1,
+      showServiceStatus: vi.fn(),
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(lines).toContain("      Connected: yes (1 session)");
+  });
+
+  it("omits the Connected line when getActiveSessionCount returns null (probe unavailable)", () => {
+    const lines: string[] = [];
+    showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [{ name: "alpha", model: "m" }],
+        defaultSandbox: "alpha",
+      }),
+      getLiveInference: () => null,
+      getActiveSessionCount: () => null,
+      showServiceStatus: vi.fn(),
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(lines.some((l) => l.includes("Connected:"))).toBe(false);
+  });
+
+  it("omits the Connected line when the dep is not wired", () => {
+    const lines: string[] = [];
+    showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [{ name: "alpha", model: "m" }],
+        defaultSandbox: "alpha",
+      }),
+      getLiveInference: () => null,
+      showServiceStatus: vi.fn(),
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(lines.some((l) => l.includes("Connected:"))).toBe(false);
   });
 
   it("emits a gateway-down diagnostic and sets process.exitCode when the gateway is unhealthy (#3386)", () => {

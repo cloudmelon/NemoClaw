@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import { flushTrace, resetTraceForTests, TRACE_FILE_ENV, type TraceArtifact } from "../../trace";
 import {
   getCurlTimingArgs,
   runChatCompletionsStreamingProbe,
@@ -14,6 +16,19 @@ import {
   summarizeProbeError,
   summarizeProbeFailure,
 } from "./probe";
+
+function withTraceFile<T>(fn: (traceFile: string) => T): T {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-probe-trace-test-"));
+  const traceFile = path.join(tmpDir, "trace.json");
+  process.env[TRACE_FILE_ENV] = traceFile;
+  resetTraceForTests();
+  return fn(traceFile);
+}
+
+afterEach(() => {
+  delete process.env[TRACE_FILE_ENV];
+  resetTraceForTests();
+});
 
 describe("http-probe helpers", () => {
   it("returns explicit curl timeouts", () => {
@@ -27,6 +42,8 @@ describe("http-probe helpers", () => {
     expect(summarizeCurlFailure(7, "", " connection refused ")).toBe(
       "curl failed (exit 7): connection refused",
     );
+    expect(summarizeCurlFailure(28, "", "")).toBe("curl failed (exit 28)");
+    expect(summarizeCurlFailure(0, "", "")).toBe("curl failed (exit 0)");
   });
 
   it("summarizes JSON and text HTTP probe failures", () => {
@@ -36,6 +53,14 @@ describe("http-probe helpers", () => {
     ).toBe('HTTP 401: {"reason":"bad key","retry":false}');
     expect(summarizeProbeError(" plain  text   body ", 500)).toBe("HTTP 500: plain text body");
     expect(summarizeProbeFailure("", 0, 28, "timeout")).toBe("curl failed (exit 28): timeout");
+    expect(summarizeProbeFailure("body", 500, 7, "Connection refused")).toBe(
+      "curl failed (exit 7): Connection refused",
+    );
+    expect(summarizeProbeFailure("Not Found", 404, 0, "")).toBe("HTTP 404: Not Found");
+    expect(summarizeProbeFailure("", 0, 0, "")).toBe("HTTP 0 with no response body");
+    expect(summarizeProbeFailure("  Service  Unavailable  ", 503, 0, "")).toBe(
+      "HTTP 503: Service Unavailable",
+    );
   });
 
   it("captures successful curl output and cleans up the temp file", () => {
@@ -146,6 +171,27 @@ describe("runChatCompletionsStreamingProbe", () => {
 
     expect(result.ok).toBe(false);
     expect(result.message).toContain("did not return SSE data");
+  });
+
+  it("records curl_result metadata for chat streaming probes", () => {
+    withTraceFile((traceFile) => {
+      const result = runChatCompletionsStreamingProbe(
+        ["-sS", "--max-time", "120", "https://example.test/v1/chat/completions"],
+        { spawnSyncImpl: mockStreaming("", 28, "200") },
+      );
+
+      expect(result.ok).toBe(false);
+      flushTrace();
+      const artifact = JSON.parse(fs.readFileSync(traceFile, "utf8")) as TraceArtifact;
+      const span = artifact.resource_spans[0].scope_spans[0].spans.find(
+        (entry) => entry.name === "nemoclaw.inference.curl_streaming_probe",
+      );
+      expect(span?.events[0].attributes).toMatchObject({
+        ok: false,
+        http_status: 200,
+        curl_status: 28,
+      });
+    });
   });
 });
 
@@ -296,5 +342,26 @@ describe("runStreamingEventProbe", () => {
     expect(outputPath).not.toBe("");
     expect(fs.existsSync(outputPath)).toBe(false);
     expect(fs.existsSync(path.dirname(outputPath))).toBe(false);
+  });
+
+  it("records curl_result metadata for responses streaming probes", () => {
+    withTraceFile((traceFile) => {
+      const result = runStreamingEventProbe(
+        ["-sS", "--max-time", "15", "https://example.test/v1/responses"],
+        { spawnSyncImpl: mockStreaming("event: response.created\ndata: {}\n") },
+      );
+
+      expect(result.ok).toBe(false);
+      flushTrace();
+      const artifact = JSON.parse(fs.readFileSync(traceFile, "utf8")) as TraceArtifact;
+      const span = artifact.resource_spans[0].scope_spans[0].spans.find(
+        (entry) => entry.name === "nemoclaw.inference.curl_streaming_event_probe",
+      );
+      expect(span?.events[0].attributes).toMatchObject({
+        ok: false,
+        missing_events_count: 1,
+        curl_status: 0,
+      });
+    });
   });
 });

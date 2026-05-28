@@ -21,6 +21,22 @@ function createBuildContextDir(tmpDir: string = os.tmpdir()): string {
   return fs.mkdtempSync(path.join(tmpDir, "nemoclaw-build-"));
 }
 
+function normalizeReadModesForDockerCopy(rootDir: string): void {
+  const stat = fs.lstatSync(rootDir);
+  if (stat.isDirectory()) {
+    fs.chmodSync(rootDir, (stat.mode & 0o777) | 0o555);
+    for (const entry of fs.readdirSync(rootDir)) {
+      normalizeReadModesForDockerCopy(path.join(rootDir, entry));
+    }
+    return;
+  }
+
+  if (stat.isFile()) {
+    const mode = stat.mode & 0o777;
+    fs.chmodSync(rootDir, mode | 0o444 | (mode & 0o111 ? 0o111 : 0));
+  }
+}
+
 function stageLegacySandboxBuildContext(
   rootDir: string,
   tmpDir: string = os.tmpdir(),
@@ -31,8 +47,10 @@ function stageLegacySandboxBuildContext(
   fs.cpSync(path.join(rootDir, "nemoclaw-blueprint"), path.join(buildCtx, "nemoclaw-blueprint"), {
     recursive: true,
   });
+  normalizeReadModesForDockerCopy(path.join(buildCtx, "nemoclaw-blueprint"));
   fs.cpSync(path.join(rootDir, "scripts"), path.join(buildCtx, "scripts"), { recursive: true });
   fs.rmSync(path.join(buildCtx, "nemoclaw", "node_modules"), { recursive: true, force: true });
+  normalizeReadModesForDockerCopy(path.join(buildCtx, "nemoclaw"));
 
   return {
     buildCtx,
@@ -66,6 +84,7 @@ function stageOptimizedSandboxBuildContext(
   fs.cpSync(path.join(sourceNemoclawDir, "src"), path.join(stagedNemoclawDir, "src"), {
     recursive: true,
   });
+  normalizeReadModesForDockerCopy(stagedNemoclawDir);
 
   fs.mkdirSync(stagedBlueprintDir, { recursive: true });
   fs.copyFileSync(
@@ -92,6 +111,7 @@ function stageOptimizedSandboxBuildContext(
       recursive: true,
     },
   );
+  normalizeReadModesForDockerCopy(stagedBlueprintDir);
 
   fs.mkdirSync(stagedScriptsDir, { recursive: true });
   fs.copyFileSync(
@@ -113,11 +133,24 @@ function stageOptimizedSandboxBuildContext(
     path.join(rootDir, "scripts", "generate-openclaw-config.py"),
     path.join(stagedScriptsDir, "generate-openclaw-config.py"),
   );
-  // Dockerfile Patch 4 helper — must be present in the build context because
-  // the Dockerfile COPYs it before the patching RUN step (#2689).
   fs.copyFileSync(
-    path.join(rootDir, "scripts", "rcf_patch.py"),
-    path.join(stagedScriptsDir, "rcf_patch.py"),
+    path.join(rootDir, "scripts", "openclaw-build-messaging-plugins.py"),
+    path.join(stagedScriptsDir, "openclaw-build-messaging-plugins.py"),
+  );
+  // WeChat-account seed for the @tencent-weixin/openclaw-weixin plugin —
+  // runs at image build time when WeChat is enabled to skip the upstream
+  // plugin's in-sandbox QR login.
+  fs.copyFileSync(
+    path.join(rootDir, "scripts", "seed-wechat-accounts.py"),
+    path.join(stagedScriptsDir, "seed-wechat-accounts.py"),
+  );
+  fs.copyFileSync(
+    path.join(rootDir, "scripts", "patch-openclaw-tool-catalog.js"),
+    path.join(stagedScriptsDir, "patch-openclaw-tool-catalog.js"),
+  );
+  fs.copyFileSync(
+    path.join(rootDir, "scripts", "patch-openclaw-chat-send.js"),
+    path.join(stagedScriptsDir, "patch-openclaw-chat-send.js"),
   );
 
   return { buildCtx, stagedDockerfile };
@@ -153,6 +186,7 @@ function collectBuildContextStats(
 
 export {
   collectBuildContextStats,
+  normalizeReadModesForDockerCopy,
   stageLegacySandboxBuildContext,
   stageOptimizedSandboxBuildContext,
 };
