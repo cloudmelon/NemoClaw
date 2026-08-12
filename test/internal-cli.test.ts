@@ -25,13 +25,19 @@ describe("internal oclif namespace", () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("Internal: configure sandbox DNS proxy");
-    expect(result.stdout).toContain("nemoclaw internal dns setup-proxy <gateway-name> <sandbox-name>");
+    expect(result.stdout).toContain(
+      "nemoclaw internal dns setup-proxy <gateway-name> <sandbox-name>",
+    );
   });
 
   it("exposes uninstall plan commands through oclif routing", () => {
-    const result = spawnSync(process.execPath, [CLI, "internal", "uninstall", "run-plan", "--help"], {
-      encoding: "utf-8",
-    });
+    const result = spawnSync(
+      process.execPath,
+      [CLI, "internal", "uninstall", "run-plan", "--help"],
+      {
+        encoding: "utf-8",
+      },
+    );
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("NemoClaw Uninstaller");
@@ -41,9 +47,13 @@ describe("internal oclif namespace", () => {
   });
 
   it("exposes the dev npm-link shim command through oclif routing", () => {
-    const result = spawnSync(process.execPath, [CLI, "internal", "dev", "npm-link-or-shim", "--help"], {
-      encoding: "utf-8",
-    });
+    const result = spawnSync(
+      process.execPath,
+      [CLI, "internal", "dev", "npm-link-or-shim", "--help"],
+      {
+        encoding: "utf-8",
+      },
+    );
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("Internal: link the checkout CLI or create a dev shim");
@@ -72,7 +82,7 @@ describe("internal oclif namespace", () => {
         "--provider",
         "cloud",
         "--node-version",
-        "v22.16.0",
+        "v22.19.0",
         "--npm-version",
         "10.0.0",
       ],
@@ -103,8 +113,39 @@ describe("internal oclif namespace", () => {
     expect(JSON.parse(ref.stdout)).toEqual({ installRef: "v2.0.0" });
     expect(env.status).toBe(0);
     expect(JSON.parse(env.stdout)).toMatchObject({
-      installRef: "latest",
+      installRef: "lkg",
       provider: { normalized: "nim-local", raw: "nim", valid: true },
     });
+  });
+
+  it("fails the experimental voice gateway gate before parsing credential flags (#8378)", () => {
+    const env = { ...process.env };
+    delete env.NEMOCLAW_EXPERIMENTAL_VOICE_GATEWAY;
+
+    const result = spawnSync(process.execPath, [CLI, "internal", "voice-gateway", "serve"], {
+      encoding: "utf-8",
+      env,
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Experimental voice gateway is disabled");
+    expect(result.stderr).not.toContain("Missing required flag");
+  });
+
+  it("ships hidden help for the feature-gated voice gateway command (#8378)", () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI, "internal", "voice-gateway", "serve", "--help"],
+      {
+        encoding: "utf-8",
+        env: { ...process.env, NEMOCLAW_EXPERIMENTAL_VOICE_GATEWAY: "1" },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Internal: serve the experimental voice gateway");
+    expect(result.stdout).toContain("--deployment-credential-file");
+    expect(result.stdout).toContain("--openclaw-credential-file");
+    expect(result.stdout).toContain("--runtime-identity");
   });
 });

@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { NemoClawCommand } from "../../../lib/cli/nemoclaw-oclif-command";
-
-import * as shields from "../../../lib/shields/index";
 import { sandboxNameArg } from "../../../lib/sandbox/command-support";
+import * as shields from "../../../lib/shields/index";
 
 export default class ShieldsStatusCommand extends NemoClawCommand {
   static id = "sandbox:shields:status";
@@ -14,8 +13,7 @@ export default class ShieldsStatusCommand extends NemoClawCommand {
   static description = "Show current sandbox shields state.";
   static usage = ["<name>"];
   static args = { sandboxName: sandboxNameArg };
-  static flags = {
-  };
+  static flags = {};
 
   public async run(): Promise<void> {
     const { args } = await this.parse(ShieldsStatusCommand);

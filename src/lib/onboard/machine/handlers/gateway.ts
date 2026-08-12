@@ -5,7 +5,16 @@ import type { NvidiaPlatform } from "../../../inference/nim";
 import type { GatewayReuseState } from "../../../state/gateway";
 import type { Session } from "../../../state/onboard-session";
 import type { GatewayContainerState } from "../../gateway-container-running";
+import {
+  describeGatewayOwner,
+  evaluateGatewayAttachment,
+  type GatewayAttachmentProbe,
+  type GatewayOwner,
+  GatewayOwnershipError,
+  isExternallySupervised,
+} from "../../gateway-ownership";
 import { withGatewayTrace } from "../../tracing";
+import { advanceTo, type OnboardStateTransitionResult } from "../result";
 
 export interface GatewayStateOptions<Gpu> {
   resume: boolean;
@@ -17,7 +26,16 @@ export interface GatewayStateOptions<Gpu> {
   recordedSandboxName: string | null;
   requestedSandboxName: string | null;
   recreateSandbox: boolean;
+  requiresBindMounts?: boolean;
   deps: {
+    /**
+     * The single declared lifecycle authority for this run (#6576). Resolved
+     * before any effect so an externally supervised gateway is attached to
+     * rather than started, replaced, or destroyed.
+     */
+    resolveGatewayOwner(): GatewayOwner;
+    probeGatewayAttachment(owner: GatewayOwner): Promise<GatewayAttachmentProbe>;
+    attachGateway(owner: GatewayOwner, expectedProbe: GatewayAttachmentProbe): Promise<void>;
     refreshDockerDriverGatewayReuseState(state: GatewayReuseState): Promise<GatewayReuseState>;
     gatewayCliSupportsLifecycleCommands(): boolean;
     verifyGatewayContainerRunning(gatewayName: string): GatewayContainerState;
@@ -51,12 +69,11 @@ export interface GatewayStateOptions<Gpu> {
     isLinuxDockerDriverGatewayEnabled(): boolean;
     retireLegacyGatewayForDockerDriverUpgrade(): void;
     destroyGatewayRuntimeForGpuReuse(): boolean;
-    skippedStepMessage(
-      stepName: string,
-      detail?: string | null,
-      reason?: "resume" | "reuse",
-    ): void;
-    recordStateSkipped(state: "gateway", metadata?: Record<string, unknown> | null): Promise<Session>;
+    skippedStepMessage(stepName: string, detail?: string | null, reason?: "resume" | "reuse"): void;
+    recordStateSkipped(
+      state: "gateway",
+      metadata?: Record<string, unknown> | null,
+    ): Promise<Session>;
     note(message: string): void;
     startRecordedStep(stepName: string): Promise<void>;
     startGateway(gpu: Gpu, options: { gpuPassthrough: boolean }): Promise<void>;
@@ -68,9 +85,18 @@ export interface GatewayStateOptions<Gpu> {
 export interface GatewayStateResult {
   gatewayReuseState: GatewayReuseState;
   session: Session | null;
+  stateResult: OnboardStateTransitionResult;
 }
 
-export async function handleGatewayState<Gpu>({
+export async function handleGatewayState<Gpu>(
+  options: GatewayStateOptions<Gpu>,
+): Promise<GatewayStateResult> {
+  return withGatewayTrace(options.initialGatewayReuseState, options.gpuPassthrough, () =>
+    handleGatewayStatePhase(options),
+  );
+}
+
+async function handleGatewayStatePhase<Gpu>({
   resume,
   session,
   initialGatewayReuseState,
@@ -80,8 +106,25 @@ export async function handleGatewayState<Gpu>({
   recordedSandboxName,
   requestedSandboxName,
   recreateSandbox,
+  requiresBindMounts = false,
   deps,
 }: GatewayStateOptions<Gpu>): Promise<GatewayStateResult> {
+  // Establish the lifecycle authority before anything in this phase can touch
+  // the gateway. Resume takes the same path as a fresh run: a recorded
+  // "complete" gateway step is not evidence that the declared owner still holds
+  // the port.
+  const owner = deps.resolveGatewayOwner();
+  if (isExternallySupervised(owner)) {
+    if (requiresBindMounts) {
+      throw new GatewayOwnershipError(
+        "capability_unsupported",
+        "Read-only host mounts require a NemoClaw-managed Docker-driver gateway; the declared external gateway lifecycle cannot be reconfigured safely.",
+        owner,
+      );
+    }
+    return attachToExternallySupervisedGateway(owner, deps);
+  }
+
   let gatewayReuseState = await deps.refreshDockerDriverGatewayReuseState(initialGatewayReuseState);
   const supportsLifecycleCommands = deps.gatewayCliSupportsLifecycleCommands();
 
@@ -106,7 +149,9 @@ export async function handleGatewayState<Gpu>({
       );
       const recovered = await deps.recoverGatewayRuntime();
       if (recovered) {
-        console.log("  ✓ Gateway recovered without removing volumes; existing sandbox PVC preserved.");
+        console.log(
+          "  ✓ Gateway recovered without removing volumes; existing sandbox PVC preserved.",
+        );
         checkImageDrift = true;
       } else {
         console.log(
@@ -172,14 +217,17 @@ export async function handleGatewayState<Gpu>({
     hostGpuPlatform: (gpu as { platform?: NvidiaPlatform } | null)?.platform ?? null,
     recreateSandbox,
     confirmedDockerDriverGateway:
-      deps.isLinuxDockerDriverGatewayEnabled() && gatewayReuseState === "healthy" && !supportsLifecycleCommands,
+      deps.isLinuxDockerDriverGatewayEnabled() &&
+      gatewayReuseState === "healthy" &&
+      !supportsLifecycleCommands,
     stopDashboardForwards: deps.stopAllDashboardForwards,
     retireLegacyGatewayForDockerDriverUpgrade: deps.retireLegacyGatewayForDockerDriverUpgrade,
     destroyGatewayRuntimeForGpuReuse: deps.destroyGatewayRuntimeForGpuReuse,
   });
 
   const canReuseHealthyGateway = gatewayReuseState === "healthy";
-  const resumeGateway = resume && session?.steps?.gateway?.status === "complete" && canReuseHealthyGateway;
+  const resumeGateway =
+    resume && session?.steps?.gateway?.status === "complete" && canReuseHealthyGateway;
   if (resumeGateway) {
     deps.skippedStepMessage("gateway", "running");
     await deps.recordStateSkipped("gateway", { reason: "resume", reuseState: gatewayReuseState });
@@ -192,9 +240,13 @@ export async function handleGatewayState<Gpu>({
   } else {
     if (resume && session?.steps?.gateway?.status === "complete") {
       if (gatewayReuseState === "active-unnamed") {
-        deps.note("  [resume] Gateway is active but named metadata is missing; recreating it safely.");
+        deps.note(
+          "  [resume] Gateway is active but named metadata is missing; recreating it safely.",
+        );
       } else if (gatewayReuseState === "foreign-active") {
-        deps.note("  [resume] A different OpenShell gateway is active; NemoClaw will not reuse it.");
+        deps.note(
+          "  [resume] A different OpenShell gateway is active; NemoClaw will not reuse it.",
+        );
       } else if (gatewayReuseState === "stale") {
         deps.note("  [resume] Recorded gateway is unhealthy; recreating it.");
       } else {
@@ -202,16 +254,68 @@ export async function handleGatewayState<Gpu>({
       }
     }
     await deps.startRecordedStep("gateway");
-    if (deps.isLinuxDockerDriverGatewayEnabled() && gatewayReuseState !== "missing") {
+    if (
+      deps.isLinuxDockerDriverGatewayEnabled() &&
+      gatewayReuseState !== "missing" &&
+      gatewayReuseState !== "foreign-active"
+    ) {
       deps.note("  Replacing legacy OpenShell gateway metadata with Docker-driver gateway.");
       deps.retireLegacyGatewayForDockerDriverUpgrade();
       gatewayReuseState = "missing";
+    } else if (gatewayReuseState === "foreign-active") {
+      gatewayReuseState = "missing";
     }
-    await withGatewayTrace(gatewayReuseState, gpuPassthrough, () =>
-      deps.startGateway(gpu, { gpuPassthrough }),
-    );
+    await deps.startGateway(gpu, { gpuPassthrough });
     session = await deps.recordStepComplete("gateway");
   }
 
-  return { gatewayReuseState, session };
+  return {
+    gatewayReuseState,
+    session,
+    stateResult: advanceTo("provider_selection", {
+      metadata: { state: "gateway", gatewayReuseState, gatewayOwner: describeGatewayOwner(owner) },
+    }),
+  };
+}
+
+/**
+ * Externally supervised gateways are attached to, never managed. This path runs
+ * no destructive effect: it validates the declared owner still holds the port
+ * and fails closed otherwise, so an unknown listener, a mismatched identity, or
+ * multiple owners is reported before any provider, policy, sandbox, or registry
+ * mutation can run.
+ */
+async function attachToExternallySupervisedGateway<Gpu>(
+  owner: GatewayOwner,
+  deps: GatewayStateOptions<Gpu>["deps"],
+): Promise<GatewayStateResult> {
+  const supervisor = owner.supervisor?.serviceName ?? "an external supervisor";
+  const probe = await deps.probeGatewayAttachment(owner);
+  const attachment = evaluateGatewayAttachment(owner, probe);
+  if (!attachment.ok) {
+    throw new GatewayOwnershipError(attachment.code, attachment.message, owner);
+  }
+  await deps.attachGateway(owner, probe);
+
+  deps.skippedStepMessage("gateway", `supervised by ${supervisor}`, "reuse");
+  deps.note(`  Attached to externally supervised OpenShell gateway (${supervisor}).`);
+  await deps.recordStateSkipped("gateway", {
+    reason: "external-supervision",
+    gatewayOwner: describeGatewayOwner(owner),
+  });
+
+  return {
+    // No NemoClaw-owned gateway runtime exists to reuse or recreate; the
+    // supervisor owns it, and downstream reuse decisions must not treat this as
+    // a gateway NemoClaw may recycle.
+    gatewayReuseState: "healthy",
+    session: await deps.recordStepComplete("gateway"),
+    stateResult: advanceTo("provider_selection", {
+      metadata: {
+        state: "gateway",
+        gatewayReuseState: "healthy",
+        gatewayOwner: describeGatewayOwner(owner),
+      },
+    }),
+  };
 }

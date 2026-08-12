@@ -1,15 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build and push the sandbox base image to GHCR.
+# Build and push sandbox base images, then publish validated managed images.
 #
 # Triggers:
-#   - Push to main when Dockerfile.base or the blueprint minimum version changes
+#   - Push to main when a base- or managed-image input changes
 #   - Manual dispatch for ad-hoc rebuilds
 #
-# The base image contains the expensive, rarely-changing layers (apt, gosu,
-# user setup, openclaw CLI). The production Dockerfile layers PR-specific
-# code on top via: FROM ghcr.io/nvidia/nemoclaw/sandbox-base:<tag>
+# Base images contain the expensive, rarely-changing layers. Complete image
+# publication consumes exact base digests from the same trusted workflow run.
 
 name: Images / Base Images
 
@@ -19,10 +18,63 @@ on:
     tags:
       - "v*"
     paths:
+      # Re-run when this workflow gains or changes a publisher so the new path
+      # takes effect immediately after merge instead of waiting for another tag.
+      - ".github/workflows/base-image.yaml"
+      - ".github/workflows/managed-images.yaml"
+      - "test/e2e/live/managed-image-activation-e2e.test.ts"
+      - "test/e2e/live/managed-image-activation-e2e-helpers.ts"
+      - ".github/actions/ci-reviewed-npm-audit/**"
+      - ".github/actions/build-base-image-platform/**"
+      - ".github/actions/publish-base-image-manifest/**"
+      - ".dockerignore"
+      # Complete managed-image inputs. Keep these reviewed families synchronized
+      # with tools/e2e/base-image-publication.mts.
+      - "Dockerfile"
+      - "agents/**"
+      - "nemoclaw/**"
+      - "nemoclaw-blueprint/**"
+      - "scripts/**"
+      - "test/e2e/live/managed-image-activation-e2e*.ts"
+      - "src/lib/actions/sandbox/openshell-child-visible-credentials.v*.json"
+      - "src/lib/core/json-types.ts"
+      - "src/lib/core/ports.ts"
+      - "src/lib/messaging/**"
+      - "src/lib/onboard/managed-bootstrap/envelope.ts"
+      - "src/lib/onboard/managed-startup/**"
+      - "src/lib/security/credential-hash.ts"
+      - "src/lib/state/paths.ts"
+      - "src/lib/state/state-root.ts"
+      - "src/lib/tool-disclosure.ts"
+      - "tools/mcp-tool-discovery-runtime/**"
+      - "tsconfig.runtime-preloads.json"
       - "Dockerfile.base"
+      - "agents/openclaw/openclaw-runtime/package.json"
+      - "agents/openclaw/openclaw-runtime/package-lock.json"
+      - "scripts/lib/reviewed-npm-archive.mts"
       - "agents/hermes/Dockerfile.base"
+      - "agents/hermes/security-dependencies.patch"
+      - "agents/hermes/whatsapp-proxy.patch"
+      - "agents/langchain-deepagents-code/Dockerfile.base"
+      - "agents/langchain-deepagents-code/manifest.yaml"
+      - "agents/langchain-deepagents-code/requirements.lock"
+      - "agents/openclaw/mcporter-runtime/package.json"
+      - "agents/openclaw/mcporter-runtime/package-lock.json"
+      - "ci/npm-audit-exceptions.json"
+      - "ci/reviewed-npm-audit.json"
       # Dockerfile.base validates min_openclaw_version from this file at build time.
       - "nemoclaw-blueprint/blueprint.yaml"
+      - "scripts/lib/openclaw-npm-remediation.mts"
+      - "scripts/lib/reviewed-npm-audit.mts"
+      - "scripts/security/build-native-security-packages.sh"
+      - "scripts/security/build-perl-security-packages.sh"
+      - "scripts/security/patches/libssh2-1.11.1-cve-2026.patch"
+      - "scripts/security/patches/python3.13-htmlparser-cve-2026-15308.patch"
+      - "scripts/patch-bundled-npm-brace-expansion.mts"
+      - "scripts/lib/patch-bundled-npm-ip-address.mts"
+      - "scripts/patch-bundled-npm-tar.mts"
+      - "scripts/upgrade-bundled-npm.mts"
+      - "scripts/lib/sandbox-rlimits.sh"
   workflow_dispatch:
     inputs:
       openclaw_version:
@@ -35,106 +87,264 @@ permissions:
   packages: write
 
 concurrency:
-  group: base-image
-  cancel-in-progress: true
+  group: base-image-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: nvidia/nemoclaw/sandbox-base
 
 jobs:
-  build-and-push:
+  reviewed-npm-audit:
     if: github.repository == 'NVIDIA/NemoClaw'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up QEMU (arm64 emulation)
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - name: Audit reviewed production npm graphs
+        uses: ./.github/actions/ci-reviewed-npm-audit
+        with:
+          target-root: ${{ github.workspace }}
+          report-dir: artifacts/reviewed-npm-audit
+
+  # The complete Perl suite approaches the image-job timeout under QEMU arm64 emulation.
+  # Build OpenClaw on native runners and publish only immutable per-platform digests here.
+  # The dependent manifest job updates user-facing tags atomically.
+  build-openclaw-platforms:
+    name: Build OpenClaw base image (${{ matrix.arch }})
+    if: github.repository == 'NVIDIA/NemoClaw'
+    needs:
+      - reviewed-npm-audit
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: openclaw
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            dockerfile: Dockerfile.base
+            image: nvidia/nemoclaw/sandbox-base
+          - agent: openclaw
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            dockerfile: Dockerfile.base
+            image: nvidia/nemoclaw/sandbox-base
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and publish platform digest
+        uses: ./.github/actions/build-base-image-platform
+        with:
+          agent: ${{ matrix.agent }}
+          arch: ${{ matrix.arch }}
+          platform: ${{ matrix.platform }}
+          dockerfile: ${{ matrix.dockerfile }}
+          image: ${{ matrix.image }}
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        env:
-          DOCKER_METADATA_SHORT_SHA_LENGTH: 8
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          openclaw-version: ${{ inputs.openclaw_version }}
+          metadata-tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=tag
             type=sha,prefix=,format=short
 
-      - name: Validate OpenClaw version input
-        if: inputs.openclaw_version != ''
-        run: echo "${{ inputs.openclaw_version }}" | grep -qxE '[0-9]+(\.[0-9]+)*'
 
-      - name: Build and push
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+  # The complete Perl suite approaches the image-job timeout under QEMU arm64 emulation.
+  # Build each sibling image on native architecture runners and publish only immutable platform digests.
+  # Each manifest job updates its image tags after both platform builds pass.
+  build-hermes-platforms:
+    name: Build ${{ matrix.display_name }} base image (${{ matrix.arch }})
+    if: github.repository == 'NVIDIA/NemoClaw'
+    needs:
+      - reviewed-npm-audit
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: hermes
+            display_name: Hermes
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            dockerfile: agents/hermes/Dockerfile.base
+            image: nvidia/nemoclaw/hermes-sandbox-base
+          - agent: hermes
+            display_name: Hermes
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            dockerfile: agents/hermes/Dockerfile.base
+            image: nvidia/nemoclaw/hermes-sandbox-base
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          context: .
-          file: Dockerfile.base
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            ${{ inputs.openclaw_version && format('OPENCLAW_VERSION={0}', inputs.openclaw_version) || '' }}
+          persist-credentials: false
+
+      - name: Build and publish platform digest
+        uses: ./.github/actions/build-base-image-platform
+        with:
+          agent: ${{ matrix.agent }}
+          arch: ${{ matrix.arch }}
+          platform: ${{ matrix.platform }}
+          dockerfile: ${{ matrix.dockerfile }}
+          image: ${{ matrix.image }}
+          registry: ${{ env.REGISTRY }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+
+  build-dcode-platforms:
+    name: Build ${{ matrix.display_name }} base image (${{ matrix.arch }})
+    if: github.repository == 'NVIDIA/NemoClaw'
+    needs:
+      - reviewed-npm-audit
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: langchain-deepagents-code
+            display_name: Deep Agents Code
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            dockerfile: agents/langchain-deepagents-code/Dockerfile.base
+            image: nvidia/nemoclaw/langchain-deepagents-code-sandbox-base
+          - agent: langchain-deepagents-code
+            display_name: Deep Agents Code
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            dockerfile: agents/langchain-deepagents-code/Dockerfile.base
+            image: nvidia/nemoclaw/langchain-deepagents-code-sandbox-base
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and publish platform digest
+        uses: ./.github/actions/build-base-image-platform
+        with:
+          agent: ${{ matrix.agent }}
+          arch: ${{ matrix.arch }}
+          platform: ${{ matrix.platform }}
+          dockerfile: ${{ matrix.dockerfile }}
+          image: ${{ matrix.image }}
+          registry: ${{ env.REGISTRY }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+
 
   build-and-push-hermes:
+    name: Build and push Hermes base image
     if: github.repository == 'NVIDIA/NemoClaw'
+    needs:
+      - build-hermes-platforms
+      - reviewed-npm-audit
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Set up QEMU (arm64 emulation)
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - name: Publish validated multi-platform manifest
+        uses: ./.github/actions/publish-base-image-manifest
+        with:
+          agent: hermes
+          display-name: Hermes
+          image: nvidia/nemoclaw/hermes-sandbox-base
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        env:
-          DOCKER_METADATA_SHORT_SHA_LENGTH: 8
-        with:
-          images: ${{ env.REGISTRY }}/nvidia/nemoclaw/hermes-sandbox-base
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=ref,event=tag
-            type=sha,prefix=,format=short
 
-      - name: Build and push
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+  build-and-push-dcode:
+    name: Build and push Deep Agents Code base image
+    if: github.repository == 'NVIDIA/NemoClaw'
+    needs:
+      - build-dcode-platforms
+      - reviewed-npm-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          context: .
-          file: agents/hermes/Dockerfile.base
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          persist-credentials: false
+
+      - name: Publish validated multi-platform manifest
+        uses: ./.github/actions/publish-base-image-manifest
+        with:
+          agent: langchain-deepagents-code
+          display-name: Deep Agents Code
+          image: nvidia/nemoclaw/langchain-deepagents-code-sandbox-base
+          registry: ${{ env.REGISTRY }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # Preserve the established required-check name while making tag publication
+  # contingent on both native platform builds succeeding.
+  build-and-push-openclaw:
+    name: Build and push OpenClaw base image
+    if: github.repository == 'NVIDIA/NemoClaw'
+    needs:
+      - build-openclaw-platforms
+      - reviewed-npm-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Publish validated multi-platform manifest
+        uses: ./.github/actions/publish-base-image-manifest
+        with:
+          agent: openclaw
+          display-name: OpenClaw
+          image: nvidia/nemoclaw/sandbox-base
+          registry: ${{ env.REGISTRY }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+
+  # Consume the three exact base-image contracts in this run. The reusable
+  # publisher promotes no mutable cohort alias until every agent and platform
+  # has passed its immutable-digest validation.
+  publish-managed-images:
+    name: Publish complete managed images
+    if: >-
+      github.repository == 'NVIDIA/NemoClaw' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) &&
+      (github.event_name != 'workflow_dispatch' || inputs.openclaw_version == '')
+    needs:
+      - build-and-push-hermes
+      - build-and-push-dcode
+      - build-and-push-openclaw
+      - reviewed-npm-audit
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/managed-images.yaml

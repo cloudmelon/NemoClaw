@@ -2,17 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { StdioOptions } from "node:child_process";
-
-import { spawnSync } from "node:child_process";
-import childProcess from "node:child_process";
+import childProcess, { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { redact, runCapture } from "../dist/lib/runner";
+import { redact, runCapture } from "../src/lib/runner";
 
-const runnerPath = path.join(import.meta.dirname, "..", "dist", "lib", "runner.js");
+const runnerPath = path.join(import.meta.dirname, "..", "src", "lib", "runner.ts");
+const platformPath = path.join(import.meta.dirname, "..", "src", "lib", "platform.ts");
+const PINNED_OPEN_SHELL_SHA256 = {
+  cliDarwinArm64: "9daaccdb9e30e220d56dd6d6bf4bd00ccca8ae4ad2845f5f0d9b9da3eb8ee881",
+  cliLinuxArm64: "b553d3bfc08e9354b990a10fb8abd976e039afeec2d3947f8a112018be40d296",
+  cliLinuxX64: "7d49ab2a5ff0b826bd2bdca5e0244010f832dfc6901c808ea8c8467004c26913",
+  gatewayDarwinArm64: "0f9e195b7cde57f4c2080df95159c5e7e72b0248306abc242ae00a3bb6f07f14",
+  gatewayLinuxArm64: "ac842ccc2ab8b5682f7479d71532cc650839250a8a41dbfae2b871cbbdfd3279",
+  gatewayLinuxX64: "eaeb094ccf7dcb1fe00c7e926e6aa9aaaefb89ecbef8343720628b0fd2d84654",
+  sandboxLinuxArm64: "c39b7ba3cf212b88712a00d2a0e3d28e2c1e0e9f47a9a6ca818a8f06ed2140aa",
+  sandboxLinuxX64: "953b90eaa7d2fc1bb7bdf38eb0ada6fad7902b13f9f895ca20b89caeac483a9e",
+};
 
 type SpawnCallOptions = {
   stdio?: StdioOptions;
@@ -45,6 +54,16 @@ function requireCall(calls: SpawnCall[], index: number): SpawnCall {
   return call;
 }
 
+function withoutDockerAuthorityProbe(calls: SpawnCall[]): SpawnCall[] {
+  return calls.filter(
+    ([command, args]) =>
+      command !== "docker" ||
+      args?.[0] !== "version" ||
+      args?.[1] !== "--format" ||
+      args?.[2] !== "{{json .}}",
+  );
+}
+
 describe("runner helpers", () => {
   it("does not let child commands consume installer stdin", () => {
     const script = `
@@ -70,7 +89,11 @@ describe("runner helpers", () => {
     const calls: SpawnCall[] = [];
     const originalSpawnSync = childProcess.spawnSync;
     // @ts-expect-error — intentional partial mock for testing
-    childProcess.spawnSync = captureSpawnCall(calls, { status: 0, stdout: "", stderr: "" });
+    childProcess.spawnSync = captureSpawnCall(calls, {
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
 
     try {
       delete require.cache[require.resolve(runnerPath)];
@@ -82,9 +105,10 @@ describe("runner helpers", () => {
       delete require.cache[require.resolve(runnerPath)];
     }
 
-    expect(calls).toHaveLength(2);
-    const firstCall = requireCall(calls, 0);
-    const secondCall = requireCall(calls, 1);
+    const runnerCalls = withoutDockerAuthorityProbe(calls);
+    expect(runnerCalls).toHaveLength(2);
+    const firstCall = requireCall(runnerCalls, 0);
+    const secondCall = requireCall(runnerCalls, 1);
     expect(firstCall[2]?.stdio).toEqual(["ignore", "pipe", "pipe"]);
     expect(secondCall[2]?.stdio).toEqual(["inherit", "pipe", "pipe"]);
   });
@@ -92,7 +116,11 @@ describe("runner helpers", () => {
     const calls: SpawnCall[] = [];
     const originalSpawnSync = childProcess.spawnSync;
     // @ts-expect-error — intentional partial mock for testing
-    childProcess.spawnSync = captureSpawnCall(calls, { status: 0, stdout: "", stderr: "" });
+    childProcess.spawnSync = captureSpawnCall(calls, {
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
 
     try {
       delete require.cache[require.resolve(runnerPath)];
@@ -103,8 +131,9 @@ describe("runner helpers", () => {
       delete require.cache[require.resolve(runnerPath)];
     }
 
-    expect(calls).toHaveLength(1);
-    const firstCall = requireCall(calls, 0);
+    const runnerCalls = withoutDockerAuthorityProbe(calls);
+    expect(runnerCalls).toHaveLength(1);
+    const firstCall = requireCall(runnerCalls, 0);
     expect(firstCall[0]).toBe("bash");
     expect(firstCall[1]).toEqual(["/tmp/setup.sh", "safe;name", "$(id)"]);
     expect(firstCall[2]?.shell).toBe(false);
@@ -146,6 +175,141 @@ describe("runner helpers", () => {
 });
 
 describe("runner env merging", () => {
+  it("clears a named context when initialization selects a socket fallback (#8816)", () => {
+    const platform = require(platformPath);
+    const detectDockerHostSpy = vi.spyOn(platform, "detectDockerHost").mockReturnValue({
+      dockerHost: "unix:///selected-fallback.sock",
+      source: "socket",
+      socketPath: "/selected-fallback.sock",
+    });
+    let initializedContext: string | undefined;
+    let initializedHost: string | undefined;
+
+    try {
+      vi.stubEnv("DOCKER_CONTEXT", "unreachable-context");
+      vi.stubEnv("DOCKER_HOST", undefined);
+      delete require.cache[require.resolve(runnerPath)];
+      require(runnerPath);
+      initializedContext = process.env.DOCKER_CONTEXT;
+      initializedHost = process.env.DOCKER_HOST;
+    } finally {
+      detectDockerHostSpy.mockRestore();
+      vi.unstubAllEnvs();
+      delete require.cache[require.resolve(runnerPath)];
+    }
+
+    expect(initializedHost).toBe("unix:///selected-fallback.sock");
+    expect(initializedContext).toBeUndefined();
+  });
+
+  it("keeps a named context when initialization uses an explicit Docker host (#8816)", () => {
+    const platform = require(platformPath);
+    const detectDockerHostSpy = vi.spyOn(platform, "detectDockerHost").mockReturnValue({
+      dockerHost: "unix:///explicit.sock",
+      source: "env",
+      socketPath: null,
+    });
+    let initializedContext: string | undefined;
+    let initializedHost: string | undefined;
+
+    try {
+      vi.stubEnv("DOCKER_CONTEXT", "ambient-context");
+      vi.stubEnv("DOCKER_HOST", "unix:///explicit.sock");
+      delete require.cache[require.resolve(runnerPath)];
+      require(runnerPath);
+      initializedContext = process.env.DOCKER_CONTEXT;
+      initializedHost = process.env.DOCKER_HOST;
+    } finally {
+      detectDockerHostSpy.mockRestore();
+      vi.unstubAllEnvs();
+      delete require.cache[require.resolve(runnerPath)];
+    }
+
+    expect(initializedHost).toBe("unix:///explicit.sock");
+    expect(initializedContext).toBe("ambient-context");
+  });
+
+  it("preserves Docker context and config only for Docker subprocesses (#8816)", () => {
+    const calls: SpawnCall[] = [];
+    const originalSpawnSync = childProcess.spawnSync;
+    // @ts-expect-error — intentional partial mock for testing
+    childProcess.spawnSync = captureSpawnCall(calls, {
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
+
+    try {
+      vi.stubEnv("DOCKER_CONTEXT", "healthy-context");
+      vi.stubEnv("DOCKER_CONFIG", "/tmp/docker-config");
+      vi.stubEnv("DOCKER_HOST", undefined);
+      vi.stubEnv("NVIDIA_INFERENCE_API_KEY", "test-secret-must-not-cross-runner-boundary");
+      delete require.cache[require.resolve(runnerPath)];
+      const { run } = require(runnerPath);
+      run(["docker", "ps"]);
+      run(["echo", "test"]);
+      vi.stubEnv("DOCKER_CONTEXT", undefined);
+      run(["docker", "info"]);
+    } finally {
+      vi.unstubAllEnvs();
+      childProcess.spawnSync = originalSpawnSync;
+      delete require.cache[require.resolve(runnerPath)];
+    }
+
+    const runnerCalls = withoutDockerAuthorityProbe(calls);
+    expect(runnerCalls).toHaveLength(3);
+    const dockerEnv = requireCall(runnerCalls, 0)[2]?.env;
+    const nonDockerEnv = requireCall(runnerCalls, 1)[2]?.env;
+    const configSelectedDockerEnv = requireCall(runnerCalls, 2)[2]?.env;
+    expect(dockerEnv?.DOCKER_CONTEXT).toBe("healthy-context");
+    expect(dockerEnv?.DOCKER_CONFIG).toBe("/tmp/docker-config");
+    expect(dockerEnv?.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
+    expect(nonDockerEnv?.DOCKER_CONTEXT).toBeUndefined();
+    expect(nonDockerEnv?.DOCKER_CONFIG).toBeUndefined();
+    expect(nonDockerEnv?.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
+    expect(configSelectedDockerEnv?.DOCKER_CONTEXT).toBeUndefined();
+    expect(configSelectedDockerEnv?.DOCKER_CONFIG).toBe("/tmp/docker-config");
+  });
+
+  it("keeps Docker host precedence over an ambient Docker context (#8816)", () => {
+    const calls: SpawnCall[] = [];
+    const originalSpawnSync = childProcess.spawnSync;
+    // @ts-expect-error — intentional partial mock for testing
+    childProcess.spawnSync = captureSpawnCall(calls, {
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
+
+    try {
+      vi.stubEnv("DOCKER_CONTEXT", "ambient-context");
+      vi.stubEnv("DOCKER_CONFIG", "/tmp/ambient-docker-config");
+      vi.stubEnv("DOCKER_HOST", undefined);
+      delete require.cache[require.resolve(runnerPath)];
+      const { run } = require(runnerPath);
+      run(["docker", "ps"], { env: { DOCKER_HOST: "unix:///explicit.sock" } });
+      vi.stubEnv("DOCKER_HOST", "unix:///selected-fallback.sock");
+      run(["docker", "ps"]);
+    } finally {
+      vi.unstubAllEnvs();
+      childProcess.spawnSync = originalSpawnSync;
+      delete require.cache[require.resolve(runnerPath)];
+    }
+
+    const runnerCalls = withoutDockerAuthorityProbe(calls);
+    expect(runnerCalls).toHaveLength(2);
+    expect(requireCall(runnerCalls, 0)[2]?.env).toMatchObject({
+      DOCKER_HOST: "unix:///explicit.sock",
+    });
+    expect(requireCall(runnerCalls, 0)[2]?.env?.DOCKER_CONTEXT).toBeUndefined();
+    expect(requireCall(runnerCalls, 0)[2]?.env?.DOCKER_CONFIG).toBeUndefined();
+    expect(requireCall(runnerCalls, 1)[2]?.env).toMatchObject({
+      DOCKER_HOST: "unix:///selected-fallback.sock",
+    });
+    expect(requireCall(runnerCalls, 1)[2]?.env?.DOCKER_CONTEXT).toBeUndefined();
+    expect(requireCall(runnerCalls, 1)[2]?.env?.DOCKER_CONFIG).toBeUndefined();
+  });
+
   it("preserves process env when opts.env is provided to runCapture", () => {
     const originalGateway = process.env.OPENSHELL_GATEWAY;
     process.env.OPENSHELL_GATEWAY = "nemoclaw";
@@ -153,10 +317,10 @@ describe("runner env merging", () => {
       const output = runCapture(
         ["sh", "-c", 'printf "%s %s" "$OPENSHELL_GATEWAY" "$OPENAI_API_KEY"'],
         {
-          env: { OPENAI_API_KEY: "sk-test-secret" },
+          env: { OPENAI_API_KEY: "sk-TEST-NOT-A-REAL-SECRET" },
         },
       );
-      expect(output).toBe("nemoclaw sk-test-secret");
+      expect(output).toBe("nemoclaw sk-TEST-NOT-A-REAL-SECRET");
     } finally {
       if (originalGateway === undefined) {
         delete process.env.OPENSHELL_GATEWAY;
@@ -171,14 +335,20 @@ describe("runner env merging", () => {
     const originalSpawnSync = childProcess.spawnSync;
     const originalPath = process.env.PATH;
     // @ts-expect-error — intentional partial mock for testing
-    childProcess.spawnSync = captureSpawnCall(calls, { status: 0, stdout: "", stderr: "" });
+    childProcess.spawnSync = captureSpawnCall(calls, {
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
 
     try {
       delete require.cache[require.resolve(runnerPath)];
       const { run } = require(runnerPath);
       process.env.PATH = "/usr/local/bin:/usr/bin";
       run(["echo", "test"], {
-        env: { OPENSHELL_CLUSTER_IMAGE: "ghcr.io/nvidia/openshell/cluster:0.0.12" },
+        env: {
+          OPENSHELL_CLUSTER_IMAGE: "ghcr.io/nvidia/openshell/cluster:0.0.12",
+        },
       });
     } finally {
       if (originalPath === undefined) {
@@ -190,8 +360,9 @@ describe("runner env merging", () => {
       delete require.cache[require.resolve(runnerPath)];
     }
 
-    expect(calls).toHaveLength(1);
-    const firstCall = requireCall(calls, 0);
+    const runnerCalls = withoutDockerAuthorityProbe(calls);
+    expect(runnerCalls).toHaveLength(1);
+    const firstCall = requireCall(runnerCalls, 0);
     expect(firstCall[2]?.env?.OPENSHELL_CLUSTER_IMAGE).toBe(
       "ghcr.io/nvidia/openshell/cluster:0.0.12",
     );
@@ -203,14 +374,20 @@ describe("runner env merging", () => {
     const originalSpawnSync = childProcess.spawnSync;
     const originalPath = process.env.PATH;
     // @ts-expect-error — intentional partial mock for testing
-    childProcess.spawnSync = captureSpawnCall(calls, { status: 0, stdout: "", stderr: "" });
+    childProcess.spawnSync = captureSpawnCall(calls, {
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
 
     try {
       delete require.cache[require.resolve(runnerPath)];
       const { runFile } = require(runnerPath);
       process.env.PATH = "/usr/local/bin:/usr/bin";
       runFile("bash", ["/tmp/setup.sh"], {
-        env: { OPENSHELL_CLUSTER_IMAGE: "ghcr.io/nvidia/openshell/cluster:0.0.12" },
+        env: {
+          OPENSHELL_CLUSTER_IMAGE: "ghcr.io/nvidia/openshell/cluster:0.0.12",
+        },
       });
     } finally {
       if (originalPath === undefined) {
@@ -222,15 +399,16 @@ describe("runner env merging", () => {
       delete require.cache[require.resolve(runnerPath)];
     }
 
-    expect(calls).toHaveLength(1);
-    const firstCall = requireCall(calls, 0);
+    const runnerCalls = withoutDockerAuthorityProbe(calls);
+    expect(runnerCalls).toHaveLength(1);
+    const firstCall = requireCall(runnerCalls, 0);
     expect(firstCall[2]?.env?.OPENSHELL_CLUSTER_IMAGE).toBe(
       "ghcr.io/nvidia/openshell/cluster:0.0.12",
     );
     expect(firstCall[2]?.env?.PATH).toBe("/usr/local/bin:/usr/bin");
   });
 
-  it("#2616: runCaptureEx injects NO_PROXY=localhost,127.0.0.1 when http_proxy is set", () => {
+  it("injects NO_PROXY=localhost,127.0.0.1 in runCaptureEx when http_proxy is set (#2616)", () => {
     // Regression for the macOS Privoxy scenario: validateOllamaModel calls
     // runCaptureEx with a curl probe against http://localhost:11434. Before
     // the fix, runCaptureEx merged raw process.env (including the user's
@@ -242,7 +420,11 @@ describe("runner env merging", () => {
     const originalNoProxy = process.env.NO_PROXY;
     const originalNoProxyLower = process.env.no_proxy;
     // @ts-expect-error — intentional partial mock for testing
-    childProcess.spawnSync = captureSpawnCall(calls, { status: 0, stdout: "", stderr: "" });
+    childProcess.spawnSync = captureSpawnCall(calls, {
+      status: 0,
+      stdout: "",
+      stderr: "",
+    });
 
     try {
       delete require.cache[require.resolve(runnerPath)];
@@ -250,13 +432,7 @@ describe("runner env merging", () => {
       process.env.http_proxy = "http://127.0.0.1:8118";
       delete process.env.NO_PROXY;
       delete process.env.no_proxy;
-      runCaptureEx([
-        "curl",
-        "-sS",
-        "--max-time",
-        "3",
-        "http://localhost:11434/api/ps",
-      ]);
+      runCaptureEx(["curl", "-sS", "--max-time", "3", "http://localhost:11434/api/ps"]);
     } finally {
       if (originalHttpProxy === undefined) delete process.env.http_proxy;
       else process.env.http_proxy = originalHttpProxy;
@@ -268,8 +444,9 @@ describe("runner env merging", () => {
       delete require.cache[require.resolve(runnerPath)];
     }
 
-    expect(calls).toHaveLength(1);
-    const firstCall = requireCall(calls, 0);
+    const runnerCalls = withoutDockerAuthorityProbe(calls);
+    expect(runnerCalls).toHaveLength(1);
+    const firstCall = requireCall(runnerCalls, 0);
     const env = firstCall[2]?.env ?? {};
     expect(env.http_proxy).toBe("http://127.0.0.1:8118");
     // Both casings get the loopback hosts so curl, Node, Python all respect
@@ -297,7 +474,9 @@ describe("shellQuote", () => {
     const dangerous = "test; rm -rf /";
     const quoted = shellQuote(dangerous);
     expect(quoted).toBe("'test; rm -rf /'");
-    const result = spawnSync("bash", ["-c", `echo ${quoted}`], { encoding: "utf-8" });
+    const result = spawnSync("bash", ["-c", `echo ${quoted}`], {
+      encoding: "utf-8",
+    });
     expect(result.stdout.trim()).toBe(dangerous);
   });
 
@@ -305,7 +484,9 @@ describe("shellQuote", () => {
     const { shellQuote } = require(runnerPath);
     const payload = "test`whoami`$HOME";
     const quoted = shellQuote(payload);
-    const result = spawnSync("bash", ["-c", `echo ${quoted}`], { encoding: "utf-8" });
+    const result = spawnSync("bash", ["-c", `echo ${quoted}`], {
+      encoding: "utf-8",
+    });
     expect(result.stdout.trim()).toBe(payload);
   });
 });
@@ -322,7 +503,7 @@ describe("validateName", () => {
     const { validateName } = require(runnerPath);
     expect(() => validateName("test; whoami")).toThrow(/Invalid/);
     expect(() => validateName("test`id`")).toThrow(/Invalid/);
-    expect(() => validateName("test$(cat /etc/passwd)")).toThrow(/Invalid/);
+    expect(() => validateName("a$(id)")).toThrow(/Invalid/);
     expect(() => validateName("../etc/passwd")).toThrow(/Invalid/);
   });
 
@@ -335,10 +516,44 @@ describe("validateName", () => {
 
   it("rejects excessively long valid-looking names before spawning OpenShell", () => {
     const { validateName } = require(runnerPath);
-    expect(validateName("a".repeat(63))).toBe("a".repeat(63));
-    expect(() => validateName("a".repeat(64 * 1024), "sandbox name")).toThrow(
-      /sandbox name too long \(max 63 chars\)/,
+    expect(validateName("a".repeat(19))).toBe("a".repeat(19));
+    expect(() => validateName("a".repeat(20), "sandbox name")).toThrow(
+      /sandbox name too long \(max 19 chars\)/,
     );
+    expect(() => validateName("a".repeat(64 * 1024), "sandbox name")).toThrow(
+      /sandbox name too long \(max 19 chars\)/,
+    );
+  });
+
+  it("escapes control characters in a rejected name instead of echoing raw bytes (#7796)", () => {
+    const { validateName } = require(runnerPath);
+    const escapeByte = String.fromCharCode(27);
+
+    let message = "";
+    try {
+      validateName(`bad${escapeByte}[31mX`, "sandbox name");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain(String.raw`Invalid sandbox name: "bad\u001b[31mX".`);
+    expect(message).not.toContain(escapeByte);
+  });
+
+  it("escapes control characters in an over-length rejected name (#7796)", () => {
+    const { validateName } = require(runnerPath);
+    const escapeByte = String.fromCharCode(27);
+
+    let message = "";
+    try {
+      validateName(`bad${escapeByte}[31m${"x".repeat(200)}`, "sandbox name");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain("sandbox name too long (max 19 chars)");
+    expect(message).not.toContain(escapeByte);
+    expect(message).toContain('..."');
   });
 
   it("rejects uppercase and special characters", () => {
@@ -371,8 +586,10 @@ describe("redact", () => {
 
   it("masks key assignments in commands", () => {
     const { redact } = require(runnerPath);
-    expect(redact("export NVIDIA_API_KEY=nvapi-realkey12345")).toContain("nvap");
-    expect(redact("export NVIDIA_API_KEY=nvapi-realkey12345")).not.toContain("realkey12345");
+    expect(redact("export NVIDIA_INFERENCE_API_KEY=nvapi-realkey12345")).toContain("nvap");
+    expect(redact("export NVIDIA_INFERENCE_API_KEY=nvapi-realkey12345")).not.toContain(
+      "realkey12345",
+    );
   });
 
   it("masks variables ending in _KEY", () => {
@@ -437,7 +654,7 @@ describe("redact", () => {
   it("masks dashboard URL hash tokens", () => {
     const token = "a".repeat(64);
     const output = redact(`http://127.0.0.1:18789/#token=${token}`);
-    expect(output).toBe("http://127.0.0.1:18789/#token=aaaa********************");
+    expect(output).toBe("http://127.0.0.1:18789/#token=****");
     expect(output).not.toContain(token);
   });
 
@@ -600,7 +817,7 @@ describe("regression guards", () => {
       delete require.cache[require.resolve(runnerPath)];
       const { runInteractive } = require(runnerPath);
       runInteractive(["echo", "interactive"]);
-      const firstCall = requireCall(calls, 0);
+      const firstCall = requireCall(withoutDockerAuthorityProbe(calls), 0);
       expect(firstCall[2]?.stdio).toEqual(["inherit", "pipe", "pipe"]);
       expect(stdoutSpy).toHaveBeenCalledWith("visit https://****:****@example.com/?token=****\n");
       expect(stderrSpy).not.toHaveBeenCalled();
@@ -637,7 +854,8 @@ describe("regression guards", () => {
   });
 
   describe("credential exposure guards (#429)", () => {
-    it("walkthrough.sh does not embed NVIDIA_API_KEY in tmux or sandbox commands", () => {
+    // source-shape-contract: security -- Executable walkthrough commands must never materialize the NVIDIA inference credential in child arguments
+    it("walkthrough.sh does not embed NVIDIA_INFERENCE_API_KEY in tmux or sandbox commands", () => {
       const fs = require("fs");
       const src = fs.readFileSync(
         path.join(import.meta.dirname, "..", "scripts", "walkthrough.sh"),
@@ -653,7 +871,7 @@ describe("regression guards", () => {
             (l.includes("tmux") || l.includes("openshell sandbox connect")),
         );
       for (const line of cmdLines) {
-        expect(line.includes("NVIDIA_API_KEY")).toBe(false);
+        expect(line.includes("NVIDIA_INFERENCE_API_KEY")).toBe(false);
       }
     });
 
@@ -662,8 +880,8 @@ describe("regression guards", () => {
       const tmpBin = fs.mkdtempSync(path.join(os.tmpdir(), "gh-absent-"));
       const stub = `
         #!/usr/bin/env bash
-        openshell() { echo "openshell 0.0.1"; }
-        export -f openshell
+        printf '%s\n' '#!/bin/sh' 'echo "openshell 0.0.1"' > "${tmpBin}/openshell"
+        chmod +x "${tmpBin}/openshell"
         export PATH="${tmpBin}:/usr/bin:/bin"
         command() { if [ "\${1:-}" = "-v" ] && [ "\${2:-}" = "gh" ]; then return 1; fi; builtin command "$@"; }
         curl() {
@@ -680,22 +898,20 @@ describe("regression guards", () => {
             case "$(basename "$out")" in
             openshell-checksums-sha256.txt)
               printf '%s\n' \
-                'ignored  openshell-x86_64-unknown-linux-musl.tar.gz' \
-                'ignored  openshell-aarch64-unknown-linux-musl.tar.gz' \
-                'ignored  openshell-x86_64-apple-darwin.tar.gz' \
-                'ignored  openshell-aarch64-apple-darwin.tar.gz' \
-                'ignored  openshell-driver-vm-aarch64-apple-darwin.tar.gz' > "$out"
+                '${PINNED_OPEN_SHELL_SHA256.cliLinuxX64}  openshell-x86_64-unknown-linux-musl.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.cliLinuxArm64}  openshell-aarch64-unknown-linux-musl.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.cliDarwinArm64}  openshell-aarch64-apple-darwin.tar.gz' > "$out"
               ;;
             openshell-gateway-checksums-sha256.txt)
               printf '%s\n' \
-                'ignored  openshell-gateway-x86_64-unknown-linux-gnu.tar.gz' \
-                'ignored  openshell-gateway-aarch64-unknown-linux-gnu.tar.gz' \
-                'ignored  openshell-gateway-aarch64-apple-darwin.tar.gz' > "$out"
+                '${PINNED_OPEN_SHELL_SHA256.gatewayLinuxX64}  openshell-gateway-x86_64-unknown-linux-gnu.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.gatewayLinuxArm64}  openshell-gateway-aarch64-unknown-linux-gnu.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.gatewayDarwinArm64}  openshell-gateway-aarch64-apple-darwin.tar.gz' > "$out"
               ;;
             openshell-sandbox-checksums-sha256.txt)
               printf '%s\n' \
-                'ignored  openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz' \
-                'ignored  openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz' > "$out"
+                '${PINNED_OPEN_SHELL_SHA256.sandboxLinuxX64}  openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.sandboxLinuxArm64}  openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz' > "$out"
               ;;
             *)
               : > "$out"
@@ -707,10 +923,40 @@ describe("regression guards", () => {
         export -f curl
         sha256sum() { cat >/dev/null; echo "checksum OK"; return 0; }
         export -f sha256sum
-        strings() { echo "request-body-credential-rewrite websocket-credential-rewrite"; }
+        strings() { echo "request-body-credential-rewrite websocket-credential-rewrite allow_all_known_mcp_methods"; }
         export -f strings
-        tar() { return 0; }; export -f tar
-        install() { return 0; }; export -f install
+        tar() {
+          local mode="\${1:-}" archive="\${2:-}" expected="" destination=""
+          case "$(basename "$archive")" in
+          openshell-gateway-*) expected="openshell-gateway" ;;
+          openshell-sandbox-*) expected="openshell-sandbox" ;;
+          openshell-*) expected="openshell" ;;
+          *) return 2 ;;
+          esac
+          case "$mode" in
+          -tzf)
+            printf '%s\n' "$expected"
+            ;;
+          -tvzf)
+            printf '%s\n' "-rwxr-xr-x 0/0 0 2026-01-01 00:00 $expected"
+            ;;
+          xzf|-xzf)
+            shift 2
+            while [ "$#" -gt 0 ]; do
+              if [ "$1" = "-C" ]; then
+                shift
+                destination="$1"
+              fi
+              shift || true
+            done
+            [ -n "$destination" ] || return 2
+            printf '%s\n' '#!/bin/sh' 'echo "0.0.101"' > "$destination/$expected"
+            chmod +x "$destination/$expected"
+            ;;
+          *) return 2 ;;
+          esac
+        }; export -f tar
+        install() { /usr/bin/install "$@"; }; export -f install
         source "${scriptPath}"
       `;
       try {
@@ -737,17 +983,82 @@ describe("regression guards", () => {
 
       const stub = `
         #!/usr/bin/env bash
-        openshell() { echo "openshell 0.0.1"; }
-        export -f openshell
+        printf '%s\n' '#!/bin/sh' 'echo "openshell 0.0.1"' > "${tmpBin}/openshell"
+        chmod +x "${tmpBin}/openshell"
         export PATH="${tmpBin}:/usr/bin:/bin"
-        curl() { echo "CURL_FALLBACK $*"; return 0; }
+        curl() {
+          echo "CURL_FALLBACK $*"
+          local out=""
+          while [ "$#" -gt 0 ]; do
+            if [ "$1" = "-o" ]; then
+              shift
+              out="$1"
+            fi
+            shift || true
+          done
+          if [ -n "$out" ]; then
+            case "$(basename "$out")" in
+            openshell-checksums-sha256.txt)
+              printf '%s\n' \
+                '${PINNED_OPEN_SHELL_SHA256.cliLinuxX64}  openshell-x86_64-unknown-linux-musl.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.cliLinuxArm64}  openshell-aarch64-unknown-linux-musl.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.cliDarwinArm64}  openshell-aarch64-apple-darwin.tar.gz' > "$out"
+              ;;
+            openshell-gateway-checksums-sha256.txt)
+              printf '%s\n' \
+                '${PINNED_OPEN_SHELL_SHA256.gatewayLinuxX64}  openshell-gateway-x86_64-unknown-linux-gnu.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.gatewayLinuxArm64}  openshell-gateway-aarch64-unknown-linux-gnu.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.gatewayDarwinArm64}  openshell-gateway-aarch64-apple-darwin.tar.gz' > "$out"
+              ;;
+            openshell-sandbox-checksums-sha256.txt)
+              printf '%s\n' \
+                '${PINNED_OPEN_SHELL_SHA256.sandboxLinuxX64}  openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz' \
+                '${PINNED_OPEN_SHELL_SHA256.sandboxLinuxArm64}  openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz' > "$out"
+              ;;
+            *)
+              : > "$out"
+              ;;
+            esac
+          fi
+          return 0
+        }
         export -f curl
         sha256sum() { echo "SHA256SUM $*" >> ${JSON.stringify(checksumLog)}; echo "checksum OK"; return 0; }
         export -f sha256sum
-        strings() { echo "request-body-credential-rewrite websocket-credential-rewrite"; }
+        strings() { echo "request-body-credential-rewrite websocket-credential-rewrite allow_all_known_mcp_methods"; }
         export -f strings
-        tar() { return 0; }; export -f tar
-        install() { return 0; }; export -f install
+        tar() {
+          local mode="\${1:-}" archive="\${2:-}" expected="" destination=""
+          case "$(basename "$archive")" in
+          openshell-gateway-*) expected="openshell-gateway" ;;
+          openshell-sandbox-*) expected="openshell-sandbox" ;;
+          openshell-*) expected="openshell" ;;
+          *) return 2 ;;
+          esac
+          case "$mode" in
+          -tzf)
+            printf '%s\n' "$expected"
+            ;;
+          -tvzf)
+            printf '%s\n' "-rwxr-xr-x 0/0 0 2026-01-01 00:00 $expected"
+            ;;
+          xzf|-xzf)
+            shift 2
+            while [ "$#" -gt 0 ]; do
+              if [ "$1" = "-C" ]; then
+                shift
+                destination="$1"
+              fi
+              shift || true
+            done
+            [ -n "$destination" ] || return 2
+            printf '%s\n' '#!/bin/sh' 'echo "0.0.101"' > "$destination/$expected"
+            chmod +x "$destination/$expected"
+            ;;
+          *) return 2 ;;
+          esac
+        }; export -f tar
+        install() { /usr/bin/install "$@"; }; export -f install
         source "${scriptPath}"
       `;
       try {
@@ -789,7 +1100,11 @@ describe("regression guards", () => {
             [path.join(import.meta.dirname, "..", script), "--version"],
             {
               encoding: "utf-8",
-              env: { ...process.env, HOME: tmp, PATH: `${fakeBin}:/usr/bin:/bin` },
+              env: {
+                ...process.env,
+                HOME: tmp,
+                PATH: `${fakeBin}:/usr/bin:/bin`,
+              },
               timeout: 15000,
             },
           );
@@ -813,50 +1128,125 @@ describe("regression guards", () => {
       const mode = fs.statSync(scriptPath).mode;
       expect((mode & 0o111) !== 0).toBe(true);
     });
+  });
 
-    it("brev e2e suite includes a deploy-cli mode", () => {
-      const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
+  describe("OpenClaw runtime hardening", () => {
+    const repoRoot = path.join(import.meta.dirname, "..");
+
+    it("disables jiti filesystem cache in base, runtime, and connect shells", () => {
+      const baseSrc = fs.readFileSync(path.join(repoRoot, "Dockerfile.base"), "utf-8");
+      const runtimeSrc = fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf-8");
+      const startSrc = fs.readFileSync(
+        path.join(repoRoot, "scripts", "nemoclaw-start.sh"),
         "utf-8",
       );
-      expect(src).toContain('TEST_SUITE === "deploy-cli"');
-      expect(src).toContain("deploy CLI provisions a remote sandbox end to end");
-      expect(src).toContain('NEMOCLAW_DEPLOY_NO_CONNECT: "1"');
+
+      expect(baseSrc).toContain("ENV JITI_FS_CACHE=false");
+      expect(runtimeSrc).toContain("ENV JITI_FS_CACHE=false");
+      expect(startSrc).toContain('export JITI_FS_CACHE="false"');
     });
 
-    it("brev e2e suite relies on an authenticated brev CLI instead of a Brev API token", () => {
-      const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
+    it("disables EC2 metadata credential discovery across image, startup, and shell boundaries", () => {
+      const baseSrc = fs.readFileSync(path.join(repoRoot, "Dockerfile.base"), "utf-8");
+      const runtimeSrc = fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf-8");
+      const startSrc = fs.readFileSync(
+        path.join(repoRoot, "scripts", "nemoclaw-start.sh"),
         "utf-8",
       );
-      expect(src).toContain("const hasAuthenticatedBrev =");
-      expect(src).toContain('brev("ls")');
-      expect(src).not.toContain("BREV_API_TOKEN");
-      expect(src).not.toContain('brev("login", "--token"');
+      const hermesBaseSrc = fs.readFileSync(
+        path.join(repoRoot, "agents", "hermes", "Dockerfile.base"),
+        "utf-8",
+      );
+      const hermesRuntimeSrc = fs.readFileSync(
+        path.join(repoRoot, "agents", "hermes", "Dockerfile"),
+        "utf-8",
+      );
+      const hermesStartSrc = fs.readFileSync(
+        path.join(repoRoot, "agents", "hermes", "start.sh"),
+        "utf-8",
+      );
+
+      expect(baseSrc).toContain("ENV AWS_EC2_METADATA_DISABLED=true");
+      expect(runtimeSrc).toContain("ENV AWS_EC2_METADATA_DISABLED=true");
+      const baseRuntimeStageStart = baseSrc.lastIndexOf("\nFROM ");
+      expect(baseRuntimeStageStart).toBeGreaterThan(-1);
+      const runtimeStageStart = runtimeSrc.indexOf("# Stage 3: Runtime image");
+      expect(runtimeStageStart).toBeGreaterThan(-1);
+      for (const [source, stageStart] of [
+        [baseSrc, baseRuntimeStageStart],
+        [runtimeSrc, runtimeStageStart],
+      ] as const) {
+        const fromIndex = source.indexOf("\nFROM ", stageStart);
+        expect(fromIndex).toBeGreaterThan(-1);
+        const firstRunIndex = source.indexOf("\nRUN ", fromIndex);
+        expect(firstRunIndex).toBeGreaterThan(-1);
+        const metadataEnvIndex = source.indexOf("ENV AWS_EC2_METADATA_DISABLED=true", fromIndex);
+        expect(metadataEnvIndex).toBeGreaterThan(fromIndex);
+        expect(metadataEnvIndex).toBeLessThan(firstRunIndex);
+      }
+      expect(startSrc).toContain("export AWS_EC2_METADATA_DISABLED=true");
+      expect(startSrc).toContain('export AWS_EC2_METADATA_DISABLED="true"');
+      expect(hermesBaseSrc).not.toContain("AWS_EC2_METADATA_DISABLED");
+      expect(hermesRuntimeSrc).not.toContain("AWS_EC2_METADATA_DISABLED");
+      expect(hermesStartSrc).not.toContain("AWS_EC2_METADATA_DISABLED");
+    });
+  });
+
+  describe("sandbox ships tmux for the bundled tmux-session flow (#4513)", () => {
+    const repoRoot = path.join(import.meta.dirname, "..");
+
+    it("base image installs a pinned tmux in the apt package list", () => {
+      const src = fs.readFileSync(path.join(repoRoot, "Dockerfile.base"), "utf-8");
+      // Pinned (DL3008) tmux must be part of the single base apt-get install
+      // layer so fresh builds ship it without a runtime apt round-trip.
+      expect(src).toMatch(/tmux=[0-9]/);
     });
 
-    it("brev e2e suite captures CPU candidates before piping them into create", () => {
-      const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
-        "utf-8",
-      );
-      expect(src).toContain(
-        'const CAPTURE_OUTPUT_STDIO: StdioOptions = ["ignore", "pipe", "inherit"]',
-      );
-      expect(src).toMatch(
-        /const cpuCandidates = execFileSync\([\s\S]*"search",[\s\S]*"cpu",[\s\S]*stdio: CAPTURE_OUTPUT_STDIO/,
-      );
-      expect(src).toMatch(/input: cpuCandidates,[\s\S]*stdio: PIPE_INPUT_STDIO/);
+    it("runtime image repairs tmux on stale bases and asserts it at build time", () => {
+      const src = fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf-8");
+      // Stale GHCR bases predating the tmux addition must still converge: the
+      // hardening layer detects a missing tmux, installs a pinned version, and
+      // fails the build if tmux is still absent afterwards.
+      expect(src).toContain("needs_tmux=1");
+      expect(src).toMatch(/apt-get install -y --no-install-recommends tmux=[0-9]/);
+      expect(src).toContain("command -v tmux >/dev/null");
     });
 
-    it("brev e2e suite no longer contains the old brev-setup compatibility path", () => {
+    it("base and runtime images pin tmux to the same version", () => {
+      const baseSrc = fs.readFileSync(path.join(repoRoot, "Dockerfile.base"), "utf-8");
+      const runtimeSrc = fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf-8");
+      const baseVersion = baseSrc.match(/tmux=([0-9][^\s\\]*)/)?.[1];
+      const runtimeVersion = runtimeSrc.match(
+        /apt-get install -y --no-install-recommends tmux=([0-9][^\s\\;]*)/,
+      )?.[1];
+      expect(baseVersion).toBeDefined();
+      expect(runtimeVersion).toBeDefined();
+      expect(runtimeVersion).toBe(baseVersion);
+    });
+
+    it("the e2e sandbox suite exercises the tmux-session flow", () => {
       const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
+        path.join(repoRoot, "test", "e2e", "live", "sandbox-operations.test.ts"),
         "utf-8",
       );
-      expect(src).not.toContain("scripts/brev-setup.sh");
-      expect(src).not.toContain("USE_LAUNCHABLE");
-      expect(src).not.toContain("SKIP_VLLM=1");
+      expect(src).toContain("assertTmuxPtyFlow");
+      expect(src).toContain("command -v tmux");
+      // The smoke must be wired into the run, not just defined.
+      expect(src).toContain("await assertTmuxPtyFlow(sandbox, SANDBOX_A)");
+    });
+
+    it("e2e TC-SBX-09 hard-asserts the tmux lifecycle and no longer skips on fork failure", () => {
+      const src = fs.readFileSync(
+        path.join(repoRoot, "test", "e2e", "live", "sandbox-operations.test.ts"),
+        "utf-8",
+      );
+      // The PTY root cause is pinned with an explicit openpty() probe.
+      expect(src).toContain("os.openpty()");
+      // The #4640 soft-skip-on-fork-failure branch must be gone — a fork
+      // failure now means the devpts grant regressed and must fail loudly.
+      const tc09 = src.slice(src.indexOf("async function assertTmuxPtyFlow"));
+      const tc09Body = tc09.slice(0, tc09.indexOf("\n}\n") + 3);
+      expect(tc09Body).not.toMatch(/skip "TC-SBX-09"/);
     });
   });
 });

@@ -1,0 +1,263 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Set Up an OpenAI-Compatible Endpoint"
+sidebar-title: "OpenAI-Compatible Endpoint"
+description: "Connect NemoClaw to a self-hosted or custom OpenAI-compatible inference endpoint."
+description-agent: "Shows how to configure an OpenAI-compatible endpoint for NemoClaw, including portable inference descriptors, raw model files, and non-interactive onboarding."
+keywords: ["nemoclaw openai compatible endpoint", "portable inference descriptor", "custom inference endpoint", "self-hosted inference"]
+content:
+  type: "how_to"
+---
+
+Use the custom OpenAI-compatible provider for servers that implement `/v1/chat/completions` or a compatible `/v1/responses` API.
+Examples include vLLM, TensorRT-LLM, llama.cpp, LocalAI, and other compatible servers.
+
+The agent connects to `inference.local` inside the sandbox.
+OpenShell forwards that traffic to the endpoint configured during onboarding.
+
+## Start the Server
+
+Start the compatible server before onboarding.
+The following example starts vLLM on port `8000`.
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct --host 0.0.0.0 --port 8000
+```
+
+Port `8000` is one of NemoClaw's bundled host-gateway ports.
+
+<Warning>
+The examples on this page listen on every IPv4 interface so both host-side onboarding and a containerized gateway can reach the server.
+When the server does not require authentication, use a host firewall with default-deny inbound rules.
+Allow TCP port `8000` only from the OpenShell Docker subnet to its gateway address, keep loopback access, and deny the port on every other interface.
+Do not expose the port to your LAN or the internet.
+</Warning>
+
+## Run Onboarding
+
+Start the onboard wizard.
+
+```bash
+$$nemoclaw onboard
+```
+
+Select **Other OpenAI-compatible endpoint**.
+Enter the server base URL and the model ID reported by the server.
+
+Use a host-routable URL such as `http://localhost:8000/v1` when you want onboarding to verify the API, tool-calling, and streaming paths before gateway registration.
+To qualify for automatic rewriting, an HTTP endpoint URL must use the exact loopback host `localhost`, `127.0.0.1`, or `[::1]`.
+Automatic rewriting is limited to NemoClaw's bundled host-gateway ports: `8000`, `11434`, and `11435`.
+NemoClaw validates the entered URL from the host and registers the OpenShell gateway route through `host.openshell.internal:<port>` for sandbox traffic.
+Sandbox inference requests continue to use the base `inference.local` policy, so the managed compatible-endpoint route does not require adding the `local-inference` preset.
+NemoClaw leaves URLs without an explicit port, URLs on `:80` or another privileged port, and URLs on unsupported ports unchanged.
+Those URLs require a separately compatible runtime topology and network policy.
+This rewrite depends on an OpenShell topology that resolves `host.openshell.internal` inside the sandbox; if that bridge is unavailable, onboarding can still validate the host URL, but `$$nemoclaw <name> status` is the authoritative runtime check.
+Make sure the server listens on an address reachable from containers, such as `0.0.0.0`; a server bound only to `127.0.0.1` can still be unreachable from the sandbox route.
+
+If you manually enter a sandbox-internal alias such as `http://host.openshell.internal:8000/v1`, host-side endpoint probing is skipped during onboarding.
+Use a host-routable endpoint such as `localhost` when you need onboarding to verify the API, tool-calling, and streaming paths before gateway registration.
+Otherwise, verify the runtime route after onboarding with `$$nemoclaw <name> status` and a short agent request.
+
+For an HTTP URL using the exact host `localhost`, `127.0.0.1`, or `[::1]` and port `8000`, `11434`, or `11435`, the API key prompt says that pressing Enter selects no authentication.
+Other URLs still require `COMPATIBLE_API_KEY`.
+
+Refer to [Choose a Compatible Inference API](choose-compatible-inference-api) for the probe order and runtime API selection.
+
+## Supply a Portable Inference Descriptor
+
+A host-side activation component can select a compatible endpoint for the portable experimental profile.
+The component must write the descriptor before the installer or onboarding command starts.
+The activation component owns authentication to the descriptor source and writes only the five resolved inference fields.
+
+<Warning>
+The descriptor contains an API key.
+Use a real `/run/nemoclaw` directory owned by root or the user who runs NemoClaw.
+Do not permit group or other users to write that directory.
+Publish the descriptor only at `/run/nemoclaw/portable-inference.json`.
+Use a regular file with one hard link, mode `0600`, and ownership by the user who runs NemoClaw.
+Do not add descriptor-source locations or source credentials to the descriptor.
+Do not include the descriptor or its values in a repository, image, log, shell argument, artifact, or activation-component persistent state.
+Use a short-lived API key and set `expiresAt` to that credential's expiration time.
+</Warning>
+
+Create a temporary regular file in `/run/nemoclaw` with the required owner and mode `0600`.
+Write the complete JSON.
+Close the temporary file.
+Rename that file to `/run/nemoclaw/portable-inference.json`.
+This atomic replacement prevents NemoClaw from reading a partial descriptor.
+The descriptor uses this schema:
+
+```json
+{
+  "schemaVersion": 1,
+  "apiKey": "<short-lived-api-key>",
+  "baseUrl": "https://inference.example.com/v1",
+  "model": "example-model",
+  "expiresAt": "<future-ISO-8601-UTC-timestamp>"
+}
+```
+
+Each field has one required purpose:
+
+| Field | Requirement |
+|---|---|
+| `schemaVersion` | Use the integer `1`. |
+| `apiKey` | Supply the short-lived API key for the compatible endpoint. |
+| `baseUrl` | Supply a compatible endpoint base URL that uses HTTPS, without credentials, a query, or a fragment. NemoClaw applies its existing endpoint and server-side request forgery (SSRF) policy. |
+| `model` | Supply the provider model ID. |
+| `expiresAt` | Supply a future ISO 8601 UTC timestamp that matches the API key lifetime. |
+
+Run the portable installer after the final descriptor is available:
+
+<AgentOnly variant="openclaw">
+
+```bash
+curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash -s -- --experimental-profile portable --fresh
+```
+
+</AgentOnly>
+<AgentOnly variant="hermes">
+
+```bash
+curl -fsSL https://www.nvidia.com/nemoclaw.sh | NEMOCLAW_AGENT=hermes bash -s -- --experimental-profile portable --fresh
+```
+
+</AgentOnly>
+<AgentOnly variant="deepagents">
+
+```bash
+curl -fsSL https://www.nvidia.com/nemoclaw.sh | NEMOCLAW_AGENT=langchain-deepagents-code bash -s -- --experimental-profile portable --fresh
+```
+
+</AgentOnly>
+
+The portable profile handles the descriptor as follows:
+
+| Descriptor state | Onboarding result |
+|---|---|
+| Absent | NemoClaw keeps the existing portable behavior. The local Podman `qwen3-vl:4b` model remains the active inference route. |
+| Directory and file metadata meet the requirements above, the descriptor is valid, and the authenticated onboarding checks pass | NemoClaw makes the compatible endpoint model the active inference route. If the local Podman `qwen3-vl:4b` runner already exists, NemoClaw leaves it installed as standby. |
+| File passes the metadata checks but contains malformed JSON, an invalid schema, an expired credential, or a rejected endpoint | NemoClaw deletes the descriptor and exits before it changes gateway, provider, sandbox, or onboarding state. |
+| Descriptor is valid, but the endpoint, selected model, or configured route fails an authenticated onboarding check | NemoClaw deletes the descriptor and exits without reporting onboarding success. The compatible route may already be configured. NemoClaw does not activate an existing local runner automatically. |
+| Descriptor entry is present, but directory or file metadata does not meet the requirements above | NemoClaw does not read or delete the filesystem entry. It exits before onboarding changes state. The activation component or operator must atomically replace the entry. |
+
+OpenShell keeps one active inference route.
+The local runner is standby only when it already exists.
+OpenShell does not automatically switch to that runner when the compatible endpoint is unavailable.
+Use [Switch Inference Providers](../manage-inference/switch-providers) when you need to change the active route.
+
+Endpoint validation is a point-in-time onboarding check, not continuous health monitoring.
+During onboarding, NemoClaw sends an authenticated Chat Completions request for the selected model.
+After route setup, applicable flows also verify that the sandbox receives non-empty assistant content through `inference.local`.
+These checks do not provide continuous availability monitoring or automatic failover.
+
+NemoClaw consumes and deletes a descriptor only after its file metadata passes these checks.
+It deletes an admitted descriptor whether it accepts or rejects the descriptor content.
+During onboarding, NemoClaw holds the API key in an asynchronous in-process credential scope instead of `process.env`.
+Unrelated child processes do not inherit the API key.
+Compatible-endpoint validation reads the scoped value, and provider registration passes it explicitly to OpenShell.
+After registration, OpenShell holds the provider credential and adds it to managed inference requests.
+NemoClaw does not write the API key into the sandbox or its persistent state.
+The upstream credential expiration still controls the registered credential's lifetime.
+The activation component must supply a new descriptor for each onboarding attempt that needs the compatible endpoint.
+
+## Serve a Raw Model File
+
+Start a compatible server for a raw model file instead of passing the file path to NemoClaw.
+The Ollama provider accepts Ollama model tags and does not accept a raw `.gguf` path.
+
+The following example starts `llama-server` with a GGUF model.
+
+```bash
+llama-server \
+  -m /models/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf \
+  --host 0.0.0.0 \
+  --port 8000 \
+  -c 16384 \
+  -ngl 999 \
+  --parallel 1 \
+  --chat-template chatml
+```
+
+During onboarding, select **Other OpenAI-compatible endpoint**.
+Enter the server base URL and the model ID returned by `/v1/models`.
+Use the model ID, not the raw file path.
+
+For the example above, the server commonly reports `NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf` as its model ID.
+
+## Run Non-Interactive Onboarding
+
+Start the endpoint before running the non-interactive command because onboarding validates the server.
+Set `NEMOCLAW_REASONING=true` when the endpoint serves a reasoning-only model.
+
+<Warning>
+Reasoning mode validates only `/v1/chat/completions` and does not verify tool calling or streaming.
+Enable it only when the endpoint supports the capabilities your agent requires.
+</Warning>
+
+```bash
+NEMOCLAW_PROVIDER=custom \
+  NEMOCLAW_ENDPOINT_URL=http://localhost:8000/v1 \
+  NEMOCLAW_MODEL=meta-llama/Llama-3.1-8B-Instruct \
+  NEMOCLAW_COMPATIBLE_AUTH_MODE=none \
+  $$nemoclaw onboard --non-interactive
+```
+
+For the raw model example, use the ID returned by `/v1/models`.
+
+```bash
+NEMOCLAW_PROVIDER=custom \
+  NEMOCLAW_ENDPOINT_URL=http://localhost:8000/v1 \
+  NEMOCLAW_MODEL=NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf \
+  NEMOCLAW_COMPATIBLE_AUTH_MODE=none \
+  $$nemoclaw onboard --non-interactive
+```
+
+| Variable | Purpose |
+|---|---|
+| `NEMOCLAW_PROVIDER` | Set to `custom`. |
+| `NEMOCLAW_ENDPOINT_URL` | Base URL of the server. |
+| `NEMOCLAW_MODEL` | Model ID reported by the server. |
+| `NEMOCLAW_COMPATIBLE_AUTH_MODE` | Set to `none` to explicitly select no authentication for an HTTP endpoint using `localhost`, `127.0.0.1`, or `[::1]` and port `8000`, `11434`, or `11435`. |
+| `NEMOCLAW_REASONING` | Enables reasoning-only validation with the case-insensitive true values `true`, `1`, `yes`, and `y`. |
+| `NEMOCLAW_TRUSTED_PRIVATE_HOSTS` | Optional comma-separated exact hostnames or IP literals for operator-owned private endpoints. Wildcards are not supported. |
+| `NEMOCLAW_TRUSTED_PRIVATE_INFERENCE_HOSTS` | Inference-only compatibility alias for `NEMOCLAW_TRUSTED_PRIVATE_HOSTS`. Inference onboarding combines entries from both variables. |
+| `COMPATIBLE_API_KEY` | Endpoint API key. Required unless loopback no-auth mode is selected. |
+
+<AgentOnly variant="openclaw">
+
+For OpenClaw, `NEMOCLAW_REASONING_EFFORT` accepts `low`, `medium`, `high`, or `default`.
+A `low`, `medium`, or `high` value writes `params.extra_body.reasoning_effort` when the selected API is `openai-completions`.
+Another API family omits the field.
+An unset value or `default` leaves the endpoint's own default in place.
+NemoClaw rejects an invalid value or a provider/API mismatch before changing provider, sandbox, policy, or registry state.
+After `inference set` changes the effort, an ordinary sandbox restart preserves the persisted value instead of restoring the image's original onboarding value.
+
+</AgentOnly>
+
+Private and reserved addresses are blocked by default.
+To use an inference gateway on a trusted corporate network, list only its exact host and keep the endpoint URL on that host:
+
+```bash
+NEMOCLAW_TRUSTED_PRIVATE_HOSTS=llm.corp.example \
+  NEMOCLAW_PROVIDER=custom \
+  NEMOCLAW_ENDPOINT_URL=https://llm.corp.example/v1 \
+  NEMOCLAW_MODEL=your-model \
+  COMPATIBLE_API_KEY="$COMPATIBLE_API_KEY" \
+  $$nemoclaw onboard --non-interactive
+```
+
+NemoClaw still resolves the host before probing and pins outbound validation to the complete canonical address set.
+An exact trusted host can return both public and supported private addresses.
+NemoClaw pins every canonical answer.
+If any answer is a disallowed private, reserved, or special-purpose address, validation rejects the endpoint instead of discarding that answer.
+Among private answers, NemoClaw admits only RFC1918, carrier-grade network address translation (CGNAT), and IPv6 unique local address (ULA) destinations.
+Link-local metadata and other reserved ranges remain blocked.
+An unlisted private host, a hostname suffix match, or a DNS failure also remains blocked.
+
+## Related Topics
+
+- [Choose a Compatible Inference API](choose-compatible-inference-api) to select Chat Completions or Responses.
+- [Meet Custom Endpoint Security Requirements](custom-endpoint-security) before saving a public custom endpoint.
+- [Verify the Inference Route](../validate-inference/verify-inference-route) after setup.

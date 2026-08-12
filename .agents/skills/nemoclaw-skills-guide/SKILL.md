@@ -4,6 +4,9 @@ description: "Start here. Introduces what NemoClaw is, what agent skills are ava
 license: "Apache-2.0"
 ---
 
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # NemoClaw Skills Guide
 
 NVIDIA NemoClaw runs OpenClaw always-on assistants inside hardened OpenShell sandboxes with NVIDIA inference (Nemotron).
@@ -17,20 +20,27 @@ Load the specific skill you need after identifying it here.
 Skills are grouped into three buckets by audience.
 The prefix in each skill name indicates who it is for.
 
-### `nemoclaw-user-*` (9 skills)
+### `nemoclaw-user-*` (1 skill)
 
 For end users operating a NemoClaw sandbox.
-Covers installation, inference configuration, network policy management, monitoring, remote deployment, security configuration, workspace management, and reference material.
+Covers routing human users' AI agents to the canonical NemoClaw Markdown documentation.
 
-### `nemoclaw-maintainer-*` (8 skills)
+### `nemoclaw-maintainer-*` (15 skills)
 
 For project maintainers.
-Covers the daily maintainer cadence (morning standup, daytime loop, evening handoff), cutting releases, finding PRs to review, normalizing issue and PR title tags, performing security code reviews, and verifying whether stale bug reports still reproduce on the latest release.
+Covers the daily maintainer cadence, trusted E2E dispatch, workflow policy, documentation refactors, releases, review selection, comparison, triage, security review, and stale bug verification.
 
-### `nemoclaw-contributor-*` (2 skills)
+### `nemoclaw-contributor-*` (6 skills)
 
 For contributors to the NemoClaw codebase.
-Covers creating pull requests that follow the project template and drafting documentation updates from recent commits.
+The lifecycle runs from checkout setup through planning, implementation, and publication.
+Each stage has one owner: `nemoclaw-contributor-plan-issue` refines an issue into capability slices,
+`nemoclaw-contributor-implement-issue` implements a slice and owns its tests, and
+`nemoclaw-contributor-create-pr` publishes the branch and follows CI and automated review.
+Load `nemoclaw-contributor-update-dependencies` for a dependency upgrade and
+`nemoclaw-contributor-update-docs` for documentation catch-up.
+The dependency workflow runs inside the implementation stage. The documentation workflow also runs during pre-tag release preparation.
+Component-specific guidance lives with the package it describes, not in a skill.
 
 ## Skill Catalog
 
@@ -39,15 +49,7 @@ Covers creating pull requests that follow the project template and drafting docu
 <!-- user-skills-table:begin -->
 | Skill | Summary |
 |-------|---------|
-| `nemoclaw-user-overview` | What NemoClaw is, ecosystem placement (OpenClaw + OpenShell + NemoClaw), how it works internally, and release notes. |
-| `nemoclaw-user-get-started` | Install NemoClaw, launch a sandbox, and run the first agent prompt. |
-| `nemoclaw-user-configure-inference` | Choose inference providers during onboarding, switch models without restarting, and set up local inference servers (Ollama, vLLM, TensorRT-LLM, NIM). |
-| `nemoclaw-user-manage-policy` | Approve or deny blocked egress requests in the TUI and customize the sandbox network policy (add, remove, or modify allowed endpoints). |
-| `nemoclaw-user-monitor-sandbox` | Check sandbox health, read logs, and trace agent behavior to diagnose problems. |
-| `nemoclaw-user-deploy-remote` | Deploy NemoClaw to a remote GPU instance, set up the Telegram bridge, and review sandbox container hardening. |
-| `nemoclaw-user-configure-security` | Review the risk framework for every configurable security control, understand credential storage, and assess posture trade-offs. |
-| `nemoclaw-user-manage-sandboxes` | Manage day-two sandbox operations, including status, logs, diagnostics, rebuilds, upgrades, messaging channels, workspace files, backup, and restore. |
-| `nemoclaw-user-reference` | CLI command reference, plugin and blueprint architecture, baseline network policies, and troubleshooting guide. |
+| `nemoclaw-user-guide` | Route human users' AI agents to `llms.txt` and the relevant NemoClaw Markdown docs for installation, configuration, operation, security, and troubleshooting. |
 <!-- user-skills-table:end -->
 
 ### Maintainer Skills
@@ -55,20 +57,31 @@ Covers creating pull requests that follow the project template and drafting docu
 | Skill | Summary |
 |-------|---------|
 | `nemoclaw-maintainer-morning` | Morning standup: triage the backlog, determine the day's target version, label selected items, surface stragglers, and output the daily plan. |
-| `nemoclaw-maintainer-day` | Daytime loop: pick the highest-value version-targeted item and execute the right workflow (merge gate, salvage, security sweep, test gaps, hotspot cooling, or sequencing). Designed for `/loop`. |
-| `nemoclaw-maintainer-evening` | End-of-day handoff: check version progress, bump stragglers to the next patch, generate a QA handoff summary, and cut the release tag. |
-| `nemoclaw-maintainer-cut-release-tag` | Cut an annotated semver tag on main, move the `latest` floating tag, and push both to origin. |
-| `nemoclaw-maintainer-find-review-pr` | Find open PRs labeled security + priority-high, link each to its issue, detect duplicates, and present a review summary. |
+| `nemoclaw-maintainer-triage` | Propose Issue Type, Project fields, and approved labels for issues and PRs. Apply only changes that the maintainer accepts. |
+| `nemoclaw-maintainer-policies` | Answer maintainer workflow questions from the read-only policy references. |
+| `nemoclaw-maintainer-cross-issue-sweep` | Find open issues that a PR can also fix or conflict with. Report file and line evidence. |
+| `nemoclaw-maintainer-day` | Run one daytime maintainer pass for the release version. Select a merge, salvage, security, test, conflict, or sequencing workflow. Designed for `/loop`. |
+| `nemoclaw-maintainer-evening` | End-of-day handoff: require the pre-tag dated changelog PR, check version progress, identify stragglers, generate a QA handoff summary, cut the release tag, carry stragglers forward, retire the released label, and hand off the Announcement. |
+| `nemoclaw-maintainer-cut-release-tag` | Verify the dated changelog entry, cut an annotated semver tag on a maintainer-confirmed `origin/main` commit, wait for workflow-managed `latest`, carry remaining open items forward, and delete the released label; `lkg` stays manual. |
+| `nemoclaw-maintainer-e2e` | Describe default E2E triggered by pushes to `main`, dispatch exact-revision manual PR E2E, and verify applicable workflow evidence. |
+| `nemoclaw-maintainer-release-notes` | Draft the post-tag Announcement from live tag/compare data, with the three-paragraph narrative, categorized change list, and external-only contributor thanks. |
+| `nemoclaw-maintainer-find-review-pr` | Find open security PRs with Urgent or High Project Priority. Link each PR to its issue and identify competing PRs. |
+| `nemoclaw-maintainer-pr-comparator` | Compare open PRs for the same issue. Apply gates and score the eligible PRs before you recommend one to merge. |
 | `nemoclaw-maintainer-normalize-title-tags` | Preview and remove bracketed `NemoClaw` title tags from issues and PRs case-insensitively, even when the tag appears later in the title. |
-| `nemoclaw-maintainer-security-code-review` | Perform a 9-category security review of a PR or issue, producing per-category PASS/WARNING/FAIL verdicts. |
-| `nemoclaw-maintainer-verify-stale` | Verify whether old bug reports still reproduce on latest. Reuses or provisions a Brev box (CPU or GPU), runs the extracted reproducer, scores confidence, and posts an evidence-backed comment with `fixed-on-latest` or `verify-inconclusive`. Tag-only — never auto-closes. |
+| `nemoclaw-maintainer-refactor-docs` | Split oversized Fern docs into focused topics with journey-based navigation, canonical ownership, route-safe redirects, variant checks, and deduplication. |
+| `nemoclaw-maintainer-security-code-review` | Review PR or issue changes in nine security categories. Report PASS, WARNING, or FAIL for each category. |
+| `nemoclaw-maintainer-verify-stale` | Verify whether old issues with native Issue Type `Bug` still reproduce on latest. Reuses or provisions a Brev box, scores confidence, and proposes evidence-backed Project/comment writes for approval; never auto-closes. |
 
 ### Contributor Skills
 
 | Skill | Summary |
 |-------|---------|
-| `nemoclaw-contributor-create-pr` | Create GitHub pull requests that follow the NemoClaw PR template, including pre-PR checks, conventional commit titles, and DCO sign-off. |
-| `nemoclaw-contributor-update-docs` | Scan recent git commits for user-facing changes, draft or update documentation pages, and refresh generated user skills during release prep. |
+| `nemoclaw-contributor-onboard` | Set up, repair, or verify a trusted source checkout, with explicit opt-ins for host-visible CLI exposure, the pinned agent, and runtime onboarding. |
+| `nemoclaw-contributor-plan-issue` | Research, refine, and divide a named issue into independently valuable capability slices without implementing or publishing them. |
+| `nemoclaw-contributor-implement-issue` | Implement the smallest accepted issue capability slice with focused validation and no pull request publication. |
+| `nemoclaw-contributor-create-pr` | Create a PR with the NemoClaw template, required checks, DCO declaration, and verified commits. Then, monitor CI and automated reviews. |
+| `nemoclaw-contributor-update-dependencies` | Audit and implement a dependency upgrade from current upstream and downstream contracts, including Hermes CalVer and base-image upgrades. |
+| `nemoclaw-contributor-update-docs` | Find user-visible changes and update their owning documentation under current repository policy. |
 
 ## Getting Started
 
@@ -82,8 +95,8 @@ Skills are cumulative. Each role includes the skills from the roles above it:
 
 | Role | Skills included | Count | Start with |
 |------|----------------|-------|------------|
-| User | `nemoclaw-user-*` | 9 | `nemoclaw-user-get-started` |
-| Contributor | `nemoclaw-user-*` + `nemoclaw-contributor-*` | 11 | `nemoclaw-user-overview` |
-| Maintainer | All skills | 19 | `nemoclaw-maintainer-morning` |
+| User | `nemoclaw-user-*` | 1 | `nemoclaw-user-guide` |
+| Contributor | `nemoclaw-user-*` + `nemoclaw-contributor-*` | 7 | `nemoclaw-contributor-onboard` |
+| Maintainer | All skills | 22 | `nemoclaw-maintainer-morning` |
 
 After identifying the role, present the applicable skills from the Skill Catalog above and recommend the starting skill.

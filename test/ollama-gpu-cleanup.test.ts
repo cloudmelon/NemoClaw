@@ -8,11 +8,11 @@ import { describe, expect, it } from "vitest";
 const modulePath = path.join(
   import.meta.dirname,
   "..",
-  "dist",
+  "src",
   "lib",
   "inference",
   "ollama",
-  "proxy.js",
+  "proxy.ts",
 );
 
 type SpawnCall = { command: string; args: readonly string[] };
@@ -65,9 +65,7 @@ describe("Ollama GPU cleanup", () => {
     withMockedSpawnSync(
       ({ args }) => {
         if (args.some((a) => a.endsWith("/api/ps"))) {
-          return ok(
-            JSON.stringify({ models: [{ name: "llama3.1:8b" }, { name: "qwen:7b" }] }),
-          );
+          return ok(JSON.stringify({ models: [{ name: "llama3.1:8b" }, { name: "qwen:7b" }] }));
         }
         return ok();
       },
@@ -75,19 +73,20 @@ describe("Ollama GPU cleanup", () => {
         const { unloadOllamaModels } = require(modulePath);
         unloadOllamaModels();
 
-        expect(calls).toHaveLength(3);
+        const curlCalls = calls.filter(({ command }) => command === "curl");
+        expect(curlCalls).toHaveLength(3);
 
-        expect(calls[0].command).toBe("curl");
-        expect(calls[0].args).toContain("--max-time");
-        expect(calls[0].args[calls[0].args.length - 1]).toMatch(/\/api\/ps$/);
+        expect(curlCalls[0].args).toContain("--max-time");
+        expect(curlCalls[0].args[curlCalls[0].args.length - 1]).toMatch(/\/api\/ps$/);
 
-        expect(calls[1].command).toBe("curl");
-        expect(calls[1].args).toContain("-X");
-        expect(calls[1].args).toContain("POST");
-        expect(calls[1].args).toContain(JSON.stringify({ model: "llama3.1:8b", keep_alive: 0 }));
-        expect(calls[1].args[calls[1].args.length - 1]).toMatch(/\/api\/generate$/);
+        expect(curlCalls[1].args).toContain("-X");
+        expect(curlCalls[1].args).toContain("POST");
+        expect(curlCalls[1].args).toContain(
+          JSON.stringify({ model: "llama3.1:8b", keep_alive: 0 }),
+        );
+        expect(curlCalls[1].args[curlCalls[1].args.length - 1]).toMatch(/\/api\/generate$/);
 
-        expect(calls[2].args).toContain(JSON.stringify({ model: "qwen:7b", keep_alive: 0 }));
+        expect(curlCalls[2].args).toContain(JSON.stringify({ model: "qwen:7b", keep_alive: 0 }));
       },
     );
   });

@@ -3,12 +3,11 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import {
-  bestEffortForwardStop,
-  bestEffortForwardStopForSandbox,
-} from "../../../dist/lib/onboard/forward-cleanup";
+import { bestEffortForwardStop, bestEffortForwardStopForSandbox } from "./forward-cleanup";
 
-function forwardListWith(entries: Array<{ sandbox: string; port: number; status?: string }>): string {
+function forwardListWith(
+  entries: Array<{ sandbox: string; port: number; status?: string }>,
+): string {
   const header = "SANDBOX   BIND        PORT   PID    STATUS";
   const rows = entries.map(
     (e) => `${e.sandbox}  127.0.0.1   ${e.port}   1234   ${e.status ?? "running"}`,
@@ -20,10 +19,10 @@ describe("bestEffortForwardStop", () => {
   it("invokes `forward stop` with the port and silently ignores errors", () => {
     const run = vi.fn();
     bestEffortForwardStop(run, 18789);
-    expect(run).toHaveBeenCalledWith(
-      ["forward", "stop", "18789"],
-      { ignoreError: true, suppressOutput: true },
-    );
+    expect(run).toHaveBeenCalledWith(["forward", "stop", "18789"], {
+      ignoreError: true,
+      suppressOutput: true,
+    });
   });
 });
 
@@ -42,8 +41,8 @@ describe("bestEffortForwardStopForSandbox", () => {
       ["forward", "list"],
       expect.objectContaining({ timeout: 15_000 }),
     );
-    // Caller must NOT pass ignoreError; failures should throw so the catch
-    // branch returns "list-failed" instead of running a stop with no owner data.
+    // The helper must not suppress list failures. A runner may throw or return
+    // null, but it must not convert a failed probe to empty output.
     expect(fetch).not.toHaveBeenCalledWith(
       ["forward", "list"],
       expect.objectContaining({ ignoreError: true }),
@@ -62,10 +61,10 @@ describe("bestEffortForwardStopForSandbox", () => {
     // Sandbox-scoped stop closes the TOCTOU window between list and stop:
     // even if another sandbox bound the port in the meantime, openshell
     // forward stop with both args will refuse to kill it.
-    expect(run).toHaveBeenCalledWith(
-      ["forward", "stop", "18789", "my-sandbox"],
-      { ignoreError: true, suppressOutput: true },
-    );
+    expect(run).toHaveBeenCalledWith(["forward", "stop", "18789", "my-sandbox"], {
+      ignoreError: true,
+      suppressOutput: true,
+    });
   });
 
   it("returns no-entry and runs a sandbox-scoped stop when no live forward is on that port", () => {
@@ -75,10 +74,10 @@ describe("bestEffortForwardStopForSandbox", () => {
     const outcome = bestEffortForwardStopForSandbox(run, fetch, 18789, "my-sandbox");
 
     expect(outcome).toBe("no-entry");
-    expect(run).toHaveBeenCalledWith(
-      ["forward", "stop", "18789", "my-sandbox"],
-      { ignoreError: true, suppressOutput: true },
-    );
+    expect(run).toHaveBeenCalledWith(["forward", "stop", "18789", "my-sandbox"], {
+      ignoreError: true,
+      suppressOutput: true,
+    });
   });
 
   it("skips the stop entirely when `forward list` itself throws (owner unknown)", () => {
@@ -89,10 +88,22 @@ describe("bestEffortForwardStopForSandbox", () => {
 
     const outcome = bestEffortForwardStopForSandbox(run, fetch, 18789, "my-sandbox");
 
+    expect(fetch).toHaveBeenCalledWith(["forward", "list"], expect.anything());
     expect(outcome).toBe("list-failed");
     // Without ownership data, a port-only stop could kill another
     // sandbox's forward — better to leave the port alone and let the
     // helper's retry / next poll observe the real state.
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("skips the stop entirely when `forward list` reports failure as null (owner unknown)", () => {
+    const run = vi.fn();
+    const fetch = vi.fn().mockReturnValue(null);
+
+    const outcome = bestEffortForwardStopForSandbox(run, fetch, 18789, "my-sandbox");
+
+    expect(fetch).toHaveBeenCalledWith(["forward", "list"], expect.anything());
+    expect(outcome).toBe("list-failed");
     expect(run).not.toHaveBeenCalled();
   });
 

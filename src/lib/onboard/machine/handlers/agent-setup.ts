@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { Session, SessionUpdates } from "../../../state/onboard-session";
+import { advanceTo, type OnboardStateTransitionResult } from "../result";
 
 export interface AgentSetupStateOptions<Agent> {
   agent: Agent | null;
@@ -24,10 +25,14 @@ export interface AgentSetupStateOptions<Agent> {
     ): Promise<void>;
     agentSetupContext(): unknown;
     ensureAgentDashboardForward(sandboxName: string, agent: Agent): number;
+    persistDashboardPort(sandboxName: string, dashboardPort: number): void;
     recordStepSkipped(stepName: string): Promise<Session>;
     isOpenclawReady(sandboxName: string): boolean;
     skippedStepMessage(stepName: string, detail?: string | null): void;
-    recordStateSkipped(state: "openclaw", metadata?: Record<string, unknown> | null): Promise<Session>;
+    recordStateSkipped(
+      state: "openclaw",
+      metadata?: Record<string, unknown> | null,
+    ): Promise<Session>;
     startRecordedStep(
       stepName: string,
       updates: { sandboxName: string; provider: string; model: string },
@@ -41,6 +46,7 @@ export interface AgentSetupStateOptions<Agent> {
 
 export interface AgentSetupStateResult {
   session: Session | null;
+  stateResult: OnboardStateTransitionResult;
 }
 
 export async function handleAgentSetupState<Agent>({
@@ -64,9 +70,17 @@ export async function handleAgentSetupState<Agent>({
       session,
       deps.agentSetupContext(),
     );
-    deps.ensureAgentDashboardForward(sandboxName, agent);
+    // ensureAgentDashboardForward returns the port the dashboard forward was
+    // actually established on, which may be bumped when the default is already
+    // taken by another sandbox. Persist it to the registry so `dashboard-url`
+    // reports the live port instead of the default. Discarding the return here
+    // regressed multi-sandbox onboarding in the machine handler path (#8214).
+    const dashboardPort = deps.ensureAgentDashboardForward(sandboxName, agent);
+    if (dashboardPort > 0) {
+      deps.persistDashboardPort(sandboxName, dashboardPort);
+    }
     session = await deps.recordStepSkipped("openclaw");
-    return { session };
+    return { session, stateResult: advanceTo("policies", { metadata: { state: "agent_setup" } }) };
   }
 
   const resumeOpenclaw = resume && sandboxName && deps.isOpenclawReady(sandboxName);
@@ -74,7 +88,7 @@ export async function handleAgentSetupState<Agent>({
     deps.skippedStepMessage("openclaw", sandboxName);
     deps.syncNemoClawConfigInSandbox(sandboxName, provider, model);
     await deps.recordStateSkipped("openclaw", { reason: "resume", sandboxName });
-    session = await deps.recordStepComplete(
+    await deps.recordStepComplete(
       "openclaw",
       deps.toSessionUpdates({ sandboxName, provider, model, hermesAuthMethod, hermesToolGateways }),
     );
@@ -87,5 +101,5 @@ export async function handleAgentSetupState<Agent>({
     );
   }
   session = await deps.recordStepSkipped("agent_setup");
-  return { session };
+  return { session, stateResult: advanceTo("policies", { metadata: { state: "openclaw" } }) };
 }

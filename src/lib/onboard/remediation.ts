@@ -6,7 +6,15 @@ import path from "node:path";
 const OPENCLAW_LAUNCH_AGENT_PLIST = "~/Library/LaunchAgents/ai.openclaw.gateway.plist";
 
 export function printRemediationActions(
-  actions: Array<{ title: string; reason: string; commands?: string[] }> | null | undefined,
+  actions:
+    | readonly {
+        id: string;
+        title: string;
+        reason: string;
+        commands?: readonly string[];
+      }[]
+    | null
+    | undefined,
 ): void {
   if (!Array.isArray(actions) || actions.length === 0) {
     return;
@@ -16,14 +24,17 @@ export function printRemediationActions(
   console.error("  Suggested fix:");
   console.error("");
   for (const action of actions) {
-    console.error(`  - ${action.title}: ${action.reason}`);
+    console.error(`  - ${action.title} (${action.id}): ${action.reason}`);
     for (const command of action.commands || []) {
       console.error(`    ${command}`);
     }
   }
 }
 
-export function getFutureShellPathHint(binDir: string, pathValue = process.env.PATH || ""): string | null {
+export function getFutureShellPathHint(
+  binDir: string,
+  pathValue = process.env.PATH || "",
+): string | null {
   const parts = String(pathValue).split(path.delimiter).filter(Boolean);
   if (parts[0] === binDir) {
     return null;

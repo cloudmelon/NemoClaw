@@ -4,9 +4,9 @@
 // Host-side credential helpers.
 //
 // The OpenShell gateway is the system of record for provider credentials.
-// This module holds them only in the current process environment so they
-// can be passed through to `openshell provider create/update --credential KEY`
-// during onboarding. Nothing is written to disk.
+// This module exposes staged process-environment values and asynchronous
+// in-process overrides. Callers pass the selected value explicitly to
+// `openshell provider create/update --credential KEY`. Nothing is written to disk.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -14,7 +14,14 @@ import path from "node:path";
 import readline from "node:readline";
 
 import { isErrnoException } from "../core/errno";
+import { GATEWAY_PORT } from "../core/ports";
+import { createPromptActivityCleanup } from "../core/prompt-activity";
+import { listMessagingCredentialMetadata } from "../messaging/channels";
 import { rejectSymlinksOnPath } from "../state/config-io";
+import { nemoclawStateRoot } from "../state/state-root";
+import { getScopedCredentialOverride } from "./scoped-overrides";
+
+export { withCredentialOverrides } from "./scoped-overrides";
 
 const UNSAFE_HOME_PATHS = new Set(["/tmp", "/var/tmp", "/dev/shm", "/"]);
 
@@ -31,23 +38,27 @@ export type CredentialPromptIntent =
 // Exported so tests can import the same source-of-truth list and stay in
 // sync without a second hand-maintained copy.
 export const KNOWN_CREDENTIAL_ENV_KEYS: readonly string[] = [
+  "NVIDIA_INFERENCE_API_KEY",
   "NVIDIA_API_KEY",
   "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
   "ANTHROPIC_API_KEY",
   "GEMINI_API_KEY",
   "COMPATIBLE_API_KEY",
   "COMPATIBLE_ANTHROPIC_API_KEY",
+  "NEMOCLAW_LLAMACPP_LOCAL_TOKEN",
   "BRAVE_API_KEY",
+  "TAVILY_API_KEY",
   "GITHUB_TOKEN",
   "HF_TOKEN",
   "HUGGING_FACE_HUB_TOKEN",
-  "TELEGRAM_BOT_TOKEN",
   "ALLOWED_CHAT_IDS",
-  "DISCORD_BOT_TOKEN",
-  "SLACK_BOT_TOKEN",
-  "SLACK_APP_TOKEN",
-  "WECHAT_BOT_TOKEN",
+  ...listMessagingCredentialMetadata().map((credential) => credential.providerEnvKey),
 ];
+
+const LEGACY_CREDENTIAL_ENV_ALIASES: Partial<Record<string, readonly string[]>> = {
+  NVIDIA_INFERENCE_API_KEY: ["NVIDIA_API_KEY"],
+};
 
 // Hard upper bound on the legacy credentials.json size we are willing to
 // read into memory. The largest realistic credential set NemoClaw has ever
@@ -55,6 +66,23 @@ export const KNOWN_CREDENTIAL_ENV_KEYS: readonly string[] = [
 // can write to ~/.nemoclaw/ cannot OOM the next onboard by planting a
 // huge file. 1 MiB leaves plenty of headroom over any plausible mutation.
 const LEGACY_CREDS_FILE_MAX_BYTES = 1 * 1024 * 1024;
+
+function noFollowFlag(): number | undefined {
+  return typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : undefined;
+}
+
+function openReadOnlyNoFollow(filePath: string): number {
+  const flag = noFollowFlag();
+  if (flag === undefined) {
+    const stat = fs.lstatSync(filePath);
+    if (stat.isSymbolicLink()) {
+      const error = new Error(`Refusing to follow symlink: ${filePath}`) as NodeJS.ErrnoException;
+      error.code = "ELOOP";
+      throw error;
+    }
+  }
+  return fs.openSync(filePath, fs.constants.O_RDONLY | (flag ?? 0));
+}
 
 /**
  * Resolve the user's home directory and reject obviously unsafe choices
@@ -81,10 +109,7 @@ export function resolveHomeDir(): string {
       );
     }
   } catch (error) {
-    if (
-      !isErrnoException(error) ||
-      error.code !== "ENOENT"
-    ) {
+    if (!isErrnoException(error) || error.code !== "ENOENT") {
       throw error;
     }
   }
@@ -108,10 +133,10 @@ export function getCredsDir(): string {
   const home = resolveHomeDir();
   if (_cachedHome !== home) {
     _cachedHome = home;
-    _credsDir = path.join(home, ".nemoclaw");
+    _credsDir = nemoclawStateRoot(home, GATEWAY_PORT);
     _legacyCredsFile = null;
   }
-  return _credsDir || path.join(home, ".nemoclaw");
+  return _credsDir || nemoclawStateRoot(home, GATEWAY_PORT);
 }
 
 /**
@@ -148,7 +173,7 @@ export function getCredentialPromptIntent(value: CredentialInput): CredentialPro
  *
  * NOTE for tests: this mutates `process.env` directly (not via vitest's
  * `vi.stubEnv`), so callers that pollute the env in a unit test must
- * clean up themselves — see `test/credentials.test.ts` for the
+ * clean up themselves — see the credentials tests for the
  * `clearTrackedEnv` pattern.
  */
 export function saveCredential(key: string, value: CredentialInput): void {
@@ -160,20 +185,31 @@ export function saveCredential(key: string, value: CredentialInput): void {
   }
 }
 
-/** Return the staged value for `key` from the current process env, or null. */
+/** Return the scoped or staged value for `key`, or null. */
 export function getCredential(key: string): string | null {
+  const scoped = getScopedCredentialOverride(key);
+  if (scoped) return scoped;
   const raw = process.env[key];
   if (!raw) return null;
   const normalized = normalizeCredentialValue(raw);
   return normalized || null;
 }
 
+function getLegacyCredentialAlias(envName: string): string | null {
+  for (const alias of LEGACY_CREDENTIAL_ENV_ALIASES[envName] ?? []) {
+    const value = getCredential(alias);
+    if (value) return value;
+  }
+  return null;
+}
+
 /**
  * Canonical entry point for provider credential resolution (PR #2306).
- * Resolves the credential for `envName` from `process.env`, falling back
- * to a one-time on-demand stage of any pre-fix `~/.nemoclaw/credentials.json`,
- * and writes the resolved value back into `process.env` so downstream
- * code that reads `process.env[envName]` directly sees it.
+ * Resolves an asynchronous in-process override before `process.env`.
+ * Without an override, falls back to a one-time on-demand stage of any
+ * pre-fix `~/.nemoclaw/credentials.json` and writes the resolved value back
+ * into `process.env` for downstream compatibility. A scoped override never
+ * enters `process.env` through this function.
  *
  * Returns the resolved value, or `null` if neither env nor the legacy
  * file produced one.
@@ -188,10 +224,12 @@ export function getCredential(key: string): string | null {
  * guard inside the staging helper itself.
  */
 export function resolveProviderCredential(envName: string): string | null {
-  let value = getCredential(envName);
+  const scoped = getScopedCredentialOverride(envName);
+  if (scoped) return scoped;
+  let value = getCredential(envName) || getLegacyCredentialAlias(envName);
   if (!value) {
     stageLegacyCredentialsToEnv();
-    value = getCredential(envName);
+    value = getCredential(envName) || getLegacyCredentialAlias(envName);
   }
   if (value) {
     process.env[envName] = value;
@@ -235,18 +273,20 @@ export function listCredentialKeys(): string[] {
  * backup tools and same-user processes tend to read.
  */
 function secureUnlink(filePath: string): void {
+  let opened = false;
   try {
-    const stat = fs.lstatSync(filePath);
-    if (stat.isSymbolicLink()) {
-      // The credentials path was a symlink; remove the link itself without
-      // touching whatever it pointed at.
-      fs.unlinkSync(filePath);
+    const flag = noFollowFlag();
+    if (flag === undefined) {
+      const stat = fs.lstatSync(filePath);
+      if (stat.isFile() || stat.isSymbolicLink()) fs.unlinkSync(filePath);
       return;
     }
-    if (!stat.isFile()) return;
-    if (stat.size > 0) {
-      const fd = fs.openSync(filePath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
-      try {
+    const fd = fs.openSync(filePath, fs.constants.O_RDWR | flag);
+    opened = true;
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) return;
+      if (stat.size > 0) {
         const chunkSize = Math.min(stat.size, 64 * 1024);
         const zeros = Buffer.alloc(chunkSize);
         let written = 0;
@@ -256,15 +296,18 @@ function secureUnlink(filePath: string): void {
           written += len;
         }
         fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
       }
+    } finally {
+      fs.closeSync(fd);
     }
   } catch {
-    // best effort
+    // best effort; a final-component symlink either fails O_NOFOLLOW or is
+    // handled by the no-O_NOFOLLOW lstat fallback without touching its target.
   }
   try {
-    fs.unlinkSync(filePath);
+    if (opened || fs.lstatSync(filePath).isSymbolicLink()) {
+      fs.unlinkSync(filePath);
+    }
   } catch {
     // best effort
   }
@@ -310,7 +353,7 @@ export function stageLegacyCredentialsToEnv(): string[] {
   // symlink planted at the credentials path.
   let fd: number;
   try {
-    fd = fs.openSync(legacyFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = openReadOnlyNoFollow(legacyFile);
   } catch {
     return [];
   }
@@ -421,7 +464,7 @@ export function removeLegacyCredentialsFileIfEmpty(): boolean {
 
   let fd: number;
   try {
-    fd = fs.openSync(legacyFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    fd = openReadOnlyNoFollow(legacyFile);
   } catch {
     return false;
   }
@@ -487,7 +530,7 @@ export function removeLegacyCredentialsFileIfEmpty(): boolean {
  * (asterisks are written instead). Resolves to the trimmed answer or
  * rejects with `code: "SIGINT"` on Ctrl-C.
  */
-export function promptSecret(question: string): Promise<string> {
+export function promptSecret(question: string, maskCap?: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const input = process.stdin;
     const output = process.stderr;
@@ -501,9 +544,13 @@ export function promptSecret(question: string): Promise<string> {
     let answer = "";
     let rawModeEnabled = false;
     let finished = false;
+    let drawnStars = 0;
+    let drawnSuffix = "";
 
-    function cleanup() {
+    const cleanup = createPromptActivityCleanup(() => {
       input.removeListener("data", onData);
+      input.removeListener("end", onInputClosed);
+      input.removeListener("close", onInputClosed);
       if (rawModeEnabled && typeof input.setRawMode === "function") {
         input.setRawMode(false);
       }
@@ -516,7 +563,7 @@ export function promptSecret(question: string): Promise<string> {
       if (typeof input.unref === "function") {
         input.unref();
       }
-    }
+    });
 
     function resolvePrompt(value: string) {
       if (finished) return;
@@ -534,6 +581,50 @@ export function promptSecret(question: string): Promise<string> {
       reject(error);
     }
 
+    function onInputClosed() {
+      rejectPrompt(Object.assign(new Error("Prompt closed before input"), { code: "EOF" }));
+    }
+
+    // With maskCap set, cap the asterisks and add an "(and N more characters)"
+    // tail so a huge paste (a ~2 KB SA JSON) doesn't flood the line; the full
+    // value stays in `answer`. maskCap unset → the plain per-char echo, unchanged.
+    function renderMask() {
+      const cap = maskCap ?? Number.POSITIVE_INFINITY;
+      const targetStars = Math.min(answer.length, cap);
+      const targetSuffix =
+        answer.length > targetStars ? ` (and ${answer.length - targetStars} more characters)` : "";
+      if (targetStars === drawnStars && targetSuffix === drawnSuffix) return;
+      if (drawnSuffix.length > 0) {
+        const back = "\b".repeat(drawnSuffix.length);
+        output.write(`${back}${" ".repeat(drawnSuffix.length)}${back}`);
+      }
+      if (targetStars > drawnStars) {
+        output.write("*".repeat(targetStars - drawnStars));
+      } else if (targetStars < drawnStars) {
+        output.write("\b \b".repeat(drawnStars - targetStars));
+      }
+      if (targetSuffix.length > 0) output.write(targetSuffix);
+      drawnStars = targetStars;
+      drawnSuffix = targetSuffix;
+    }
+
+    // Word-delete (Meta-Backspace / Ctrl-W) so Option/Alt+Delete works here too:
+    // drop trailing spaces, then the last word (a minified secret clears at once).
+    function wordDeleteBackward() {
+      const before = answer.length;
+      let end = answer.length;
+      while (end > 0 && answer[end - 1] <= " ") end -= 1;
+      while (end > 0 && answer[end - 1] > " ") end -= 1;
+      answer = answer.slice(0, end);
+      const removed = before - answer.length;
+      if (removed <= 0) return;
+      if (maskCap === undefined) {
+        output.write("\b \b".repeat(removed));
+      } else {
+        renderMask();
+      }
+    }
+
     function onData(chunk: Buffer | string) {
       const text = chunk.toString();
       for (let i = 0; i < text.length; i += 1) {
@@ -544,7 +635,13 @@ export function promptSecret(question: string): Promise<string> {
           return;
         }
 
+        if (ch.charCodeAt(0) === 0x17) {
+          wordDeleteBackward();
+          continue;
+        }
+
         if (ch === "\r" || ch === "\n") {
+          if (maskCap !== undefined) renderMask();
           resolvePrompt(answer.trim());
           return;
         }
@@ -552,13 +649,18 @@ export function promptSecret(question: string): Promise<string> {
         if (ch === "\u0008" || ch === "\u007f") {
           if (answer.length > 0) {
             answer = answer.slice(0, -1);
-            output.write("\b \b");
+            if (maskCap === undefined) output.write("\b \b");
           }
           continue;
         }
 
         if (ch === "\u001b") {
           const rest = text.slice(i);
+          if (rest.charCodeAt(1) === 0x7f || rest.charCodeAt(1) === 0x08) {
+            i += 1;
+            wordDeleteBackward();
+            continue;
+          }
           const match = rest.match(/^\u001b(?:\[[0-9;?]*[~A-Za-z]|\][^\u0007]*\u0007|.)/);
           if (match) {
             i += match[0].length - 1;
@@ -568,21 +670,28 @@ export function promptSecret(question: string): Promise<string> {
 
         if (ch >= " ") {
           answer += ch;
-          output.write("*");
+          if (maskCap === undefined) output.write("*");
         }
       }
+      if (!finished && maskCap !== undefined) renderMask();
     }
 
-    output.write(question);
-    input.setEncoding("utf8");
-    if (typeof input.resume === "function") {
-      input.resume();
+    try {
+      output.write(question);
+      input.setEncoding("utf8");
+      if (typeof input.resume === "function") {
+        input.resume();
+      }
+      if (typeof input.setRawMode === "function") {
+        input.setRawMode(true);
+        rawModeEnabled = true;
+      }
+      input.on("data", onData);
+      input.on("end", onInputClosed);
+      input.on("close", onInputClosed);
+    } catch (error) {
+      rejectPrompt(error instanceof Error ? error : new Error(String(error)));
     }
-    if (typeof input.setRawMode === "function") {
-      input.setRawMode(true);
-      rawModeEnabled = true;
-    }
-    input.on("data", onData);
   });
 }
 
@@ -591,7 +700,10 @@ export function promptSecret(question: string): Promise<string> {
  * `{ secret: true }` to mask input on a TTY (falls back to plain readline
  * when stdin/stderr is non-interactive, e.g. in CI).
  */
-export function prompt(question: string, opts: { secret?: boolean } = {}): Promise<string> {
+export function prompt(
+  question: string,
+  opts: { secret?: boolean; maskCap?: number } = {},
+): Promise<string> {
   return new Promise((resolve, reject) => {
     // Re-attach stdin to the event loop before any prompt path. unref() in
     // cleanup (below, and in the secret path) is sticky — neither
@@ -603,7 +715,7 @@ export function prompt(question: string, opts: { secret?: boolean } = {}): Promi
     }
     const silent = opts.secret === true && process.stdin.isTTY && process.stderr.isTTY;
     if (silent) {
-      promptSecret(question)
+      promptSecret(question, opts.maskCap)
         .then(resolve)
         .catch((error: NodeJS.ErrnoException) => {
           if (error && error.code === "SIGINT") {
@@ -618,7 +730,7 @@ export function prompt(question: string, opts: { secret?: boolean } = {}): Promi
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
     let finished = false;
 
-    function cleanup() {
+    const cleanup = createPromptActivityCleanup(() => {
       rl.close();
       // pause+unref so the process exits naturally after the last prompt
       // resolves. The matching ref() above keeps subsequent prompts working;
@@ -630,7 +742,7 @@ export function prompt(question: string, opts: { secret?: boolean } = {}): Promi
       if (typeof process.stdin.unref === "function") {
         process.stdin.unref();
       }
-    }
+    });
 
     function resolvePrompt(value: string) {
       if (finished) return;
@@ -646,14 +758,28 @@ export function prompt(question: string, opts: { secret?: boolean } = {}): Promi
       reject(error);
     }
 
-    rl.on("SIGINT", () => {
-      const error = Object.assign(new Error("Prompt interrupted"), { code: "SIGINT" });
-      rejectPrompt(error);
-      process.kill(process.pid, "SIGINT");
-    });
-    rl.question(question, (answer) => {
-      resolvePrompt(answer.trim());
-    });
+    try {
+      rl.on("SIGINT", () => {
+        const error = Object.assign(new Error("Prompt interrupted"), { code: "SIGINT" });
+        rejectPrompt(error);
+        process.kill(process.pid, "SIGINT");
+      });
+      // Treat readline closing before the question is answered as cancellation.
+      // When stdin reaches EOF (e.g. `nemoclaw onboard ... < /dev/null`), the
+      // `question` callback never fires; without this the prompt promise would
+      // hang or the process would exit 0 silently. resolvePrompt/rejectPrompt set
+      // `finished` before calling cleanup() (which itself closes rl), so the
+      // post-answer close is ignored and only a premature EOF rejects here.
+      rl.on("close", () => {
+        if (finished) return;
+        rejectPrompt(Object.assign(new Error("Prompt closed before input"), { code: "EOF" }));
+      });
+      rl.question(question, (answer) => {
+        resolvePrompt(answer.trim());
+      });
+    } catch (error) {
+      rejectPrompt(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }
 
@@ -665,15 +791,17 @@ export async function readCredentialPrompt(
 }
 
 /**
- * Ensure `NVIDIA_API_KEY` is staged for this process. Returns immediately
+ * Ensure `NVIDIA_INFERENCE_API_KEY` is staged for this process. Returns immediately
  * if it is already in env, otherwise prompts interactively (validating
  * the `nvapi-` prefix) and stages the result. Onboarding registers the
  * value with the OpenShell gateway later in the flow.
  */
 export async function ensureApiKey(): Promise<CredentialPromptIntent> {
-  let key = getCredential("NVIDIA_API_KEY");
+  let key =
+    getCredential("NVIDIA_INFERENCE_API_KEY") ||
+    getLegacyCredentialAlias("NVIDIA_INFERENCE_API_KEY");
   if (key) {
-    process.env.NVIDIA_API_KEY = key;
+    process.env.NVIDIA_INFERENCE_API_KEY = key;
     return { kind: "credential", value: key };
   }
 
@@ -710,8 +838,8 @@ export async function ensureApiKey(): Promise<CredentialPromptIntent> {
     break;
   }
 
-  saveCredential("NVIDIA_API_KEY", key);
-  process.env.NVIDIA_API_KEY = key;
+  saveCredential("NVIDIA_INFERENCE_API_KEY", key);
+  process.env.NVIDIA_INFERENCE_API_KEY = key;
   console.log("");
   console.log("  Key staged for the OpenShell gateway. It is held in process memory only;");
   console.log("  onboarding registers it with the gateway and nothing is written to disk.");

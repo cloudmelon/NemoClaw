@@ -2,14 +2,57 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-
+import { MIN_OLLAMA_VERSION } from "../inference/ollama-version";
 import {
   assertOllamaUpgradeApplied,
   resolveOllamaInstallMenuEntry,
-} from "../../../dist/lib/onboard/ollama-install-menu";
-import { MIN_OLLAMA_VERSION } from "../../../dist/lib/inference/ollama-version";
+  resolveRunningOllamaMenuEntry,
+} from "./ollama-install-menu";
 
 const LINUX_NON_WSL = { platform: "linux" as const, isWsl: false };
+
+describe("resolveRunningOllamaMenuEntry", () => {
+  it("labels unsupported Windows-host Ollama without suggesting it", () => {
+    const entry = resolveRunningOllamaMenuEntry({
+      hasOllama: false,
+      ollamaRunning: true,
+      ollamaHost: "host.docker.internal",
+      isWsl: true,
+      ollamaPort: 11434,
+      windowsHostLabelSuffix: " (requires Docker Desktop WSL integration)",
+    });
+
+    expect(entry).toEqual({
+      key: "ollama",
+      label:
+        "Local Ollama (Windows host:11434) — running (requires Docker Desktop WSL integration)",
+    });
+  });
+
+  it("renders a start action for installed-but-stopped Ollama on WSL (#6750)", () => {
+    const entry = resolveRunningOllamaMenuEntry({
+      hasOllama: true,
+      ollamaRunning: false,
+      ollamaHost: null,
+      isWsl: true,
+      ollamaPort: 11434,
+    });
+
+    expect(entry).toEqual({ key: "ollama", label: "Start local Ollama (WSL:11434)" });
+  });
+
+  it("renders a start action for installed-but-stopped Ollama on non-WSL hosts (#6750)", () => {
+    const entry = resolveRunningOllamaMenuEntry({
+      hasOllama: true,
+      ollamaRunning: false,
+      ollamaHost: null,
+      isWsl: false,
+      ollamaPort: 11434,
+    });
+
+    expect(entry).toEqual({ key: "ollama", label: "Start local Ollama (localhost:11434)" });
+  });
+});
 
 describe("resolveOllamaInstallMenuEntry", () => {
   it("offers a fresh install when no Ollama is present", () => {
@@ -17,6 +60,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: false,
       ollamaRunning: false,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: null,
       ...LINUX_NON_WSL,
     });
@@ -30,6 +74,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: true,
       ollamaRunning: true,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: "0.6.2",
       runningOllamaVersion: "0.6.2",
       ...LINUX_NON_WSL,
@@ -46,6 +91,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: true,
       ollamaRunning: true,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: "0.24.0",
       runningOllamaVersion: "0.24.0",
       ...LINUX_NON_WSL,
@@ -59,6 +105,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: true,
       ollamaRunning: true,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       ollamaHost: "127.0.0.1",
       installedOllamaVersion: "0.24.0",
       runningOllamaVersion: "0.6.2",
@@ -76,6 +123,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: true,
       ollamaRunning: true,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       ollamaHost: "127.0.0.1",
       installedOllamaVersion: "0.6.2",
       runningOllamaVersion: "0.24.0",
@@ -93,6 +141,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: false,
       ollamaRunning: true,
       hasWindowsOllama: true,
+      windowsHostOllamaSupported: true,
       ollamaHost: "host.docker.internal",
       // Pretend the local-loopback probe would have returned a stale version
       // if it were applied. The Windows-host case must short-circuit and not
@@ -110,10 +159,25 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: false,
       ollamaRunning: false,
       hasWindowsOllama: true,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: null,
       ...LINUX_NON_WSL,
     });
     expect(result.entry).toBeNull();
+  });
+
+  it("offers a WSL-local install when the sandbox cannot reach the Windows-host Ollama (#8199)", () => {
+    const result = resolveOllamaInstallMenuEntry({
+      hasOllama: false,
+      ollamaRunning: false,
+      hasWindowsOllama: true,
+      windowsHostOllamaSupported: false,
+      installedOllamaVersion: null,
+      platform: "linux",
+      isWsl: true,
+    });
+    expect(result.entry?.key).toBe("install-ollama");
+    expect(result.entry?.label).toBe("Install Ollama (WSL Linux)");
   });
 
   it("treats null versions as below the minimum to recover stale installs", () => {
@@ -121,6 +185,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: true,
       ollamaRunning: true,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: null,
       ...LINUX_NON_WSL,
     });
@@ -135,6 +200,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: false,
       ollamaRunning: false,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: null,
       platform: "linux",
       isWsl: true,
@@ -147,6 +213,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: false,
       ollamaRunning: false,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: null,
       platform: "darwin",
       isWsl: false,
@@ -159,6 +226,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: true,
       ollamaRunning: true,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: "0.6.2",
       runningOllamaVersion: "0.6.2",
       platform: "darwin",
@@ -216,6 +284,7 @@ describe("resolveOllamaInstallMenuEntry", () => {
       hasOllama: false,
       ollamaRunning: false,
       hasWindowsOllama: false,
+      windowsHostOllamaSupported: true,
       installedOllamaVersion: null,
       platform: "win32",
       isWsl: false,

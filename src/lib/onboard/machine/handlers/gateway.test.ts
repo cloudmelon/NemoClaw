@@ -1,12 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-
-import { createSession, type Session } from "../../../state/onboard-session";
-import type { GatewayContainerState } from "../../gateway-container-running";
 import type { GatewayReuseState } from "../../../state/gateway";
-import { handleGatewayState, type GatewayStateOptions } from "./gateway";
+import { createSession, type Session } from "../../../state/onboard-session";
+import { flushTrace, resetTraceForTests, TRACE_FILE_ENV, type TraceArtifact } from "../../../trace";
+import type { GatewayContainerState } from "../../gateway-container-running";
+import {
+  type GatewayAttachmentProbe,
+  type GatewayOwner,
+  GatewayOwnershipError,
+  resolveGatewayOwner,
+} from "../../gateway-ownership";
+import { createGatewayReuseHelpers } from "../../gateway-reuse";
+import { ONBOARD_TRACE_PHASE_NAMES } from "../../tracing";
+import { type GatewayStateOptions, handleGatewayState } from "./gateway";
+
+const EXTERNAL_OWNER: GatewayOwner = resolveGatewayOwner({
+  gatewayName: "nemoclaw",
+  gatewayPort: 8080,
+  declaration: {
+    version: 1,
+    mode: "externally-supervised",
+    endpoint: "http://127.0.0.1:8080",
+    stateDir: "/var/lib/openshell/gateway",
+    supervisor: {
+      kind: "systemd-system",
+      serviceName: "openshell-gateway.service",
+      execPath: "/usr/local/bin/openshell-gateway",
+    },
+    requiredCapabilities: [],
+  },
+  hasPackagedService: false,
+});
 
 type Gpu = { type: string } | null;
 
@@ -35,10 +64,36 @@ function createDeps(overrides: Partial<GatewayStateOptions<Gpu>["deps"]> = {}) {
     exit: vi.fn((code: number): never => {
       throw new Error(`exit ${code}`);
     }),
+    resolveOwner: vi.fn(
+      (): GatewayOwner =>
+        resolveGatewayOwner({
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+          declaration: null,
+          hasPackagedService: false,
+        }),
+    ),
+    attachGateway: vi.fn(async () => undefined),
+    probeAttachment: vi.fn(
+      async (): Promise<GatewayAttachmentProbe> => ({
+        gatewayPort: 8080,
+        httpReady: true,
+        portOccupied: true,
+        listenerPids: [4242],
+        listenerScanComplete: true,
+        listenerStartTime: "710024",
+        supervisorActive: true,
+        listenerExecPath: "/usr/local/bin/openshell-gateway",
+        listenerSupervisorMatch: true,
+      }),
+    ),
   };
   return {
     calls,
     deps: {
+      resolveGatewayOwner: calls.resolveOwner,
+      attachGateway: calls.attachGateway,
+      probeGatewayAttachment: calls.probeAttachment,
       refreshDockerDriverGatewayReuseState: calls.refresh,
       gatewayCliSupportsLifecycleCommands: calls.lifecycle,
       verifyGatewayContainerRunning: calls.verifyContainer,
@@ -85,6 +140,32 @@ function baseOptions(
   };
 }
 
+async function captureTraceArtifact(run: () => Promise<void>): Promise<TraceArtifact> {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-gateway-trace-"));
+  const traceFile = path.join(directory, "trace.json");
+  const previousTraceFile = process.env[TRACE_FILE_ENV];
+  process.env[TRACE_FILE_ENV] = traceFile;
+  resetTraceForTests();
+
+  try {
+    await run();
+    flushTrace();
+    return JSON.parse(fs.readFileSync(traceFile, "utf8")) as TraceArtifact;
+  } finally {
+    previousTraceFile === undefined
+      ? Reflect.deleteProperty(process.env, TRACE_FILE_ENV)
+      : Reflect.set(process.env, TRACE_FILE_ENV, previousTraceFile);
+    resetTraceForTests();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function gatewaySpans(artifact: TraceArtifact) {
+  return artifact.resource_spans[0].scope_spans[0].spans.filter(
+    (span) => span.name === ONBOARD_TRACE_PHASE_NAMES.gateway,
+  );
+}
+
 describe("handleGatewayState", () => {
   it("starts the gateway when no reusable gateway exists", async () => {
     const { deps, calls } = createDeps();
@@ -95,6 +176,93 @@ describe("handleGatewayState", () => {
     expect(calls.startGateway).toHaveBeenCalledWith({ type: "nvidia" }, { gpuPassthrough: true });
     expect(calls.complete).toHaveBeenCalledWith("gateway");
     expect(result.gatewayReuseState).toBe("missing");
+    expect(result.stateResult).toEqual({
+      type: "transition",
+      next: "provider_selection",
+      transitionKind: "advance",
+      updates: undefined,
+      metadata: {
+        state: "gateway",
+        gatewayReuseState: "missing",
+        gatewayOwner: {
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+          mode: "nemoclaw-managed",
+          source: "standalone",
+          endpoint: null,
+          supervisor: null,
+          requiredCapabilities: [],
+        },
+      },
+    });
+  });
+
+  it("starts the gateway when stderr-only status marks the selected gateway stale (#7087)", async () => {
+    const statusOutput = [
+      "Server Status",
+      "",
+      "Gateway: nemoclaw",
+      "Error: Connection refused",
+    ].join("\n");
+    const gatewayReuseSnapshot = createGatewayReuseHelpers({
+      gatewayName: "nemoclaw",
+      runCaptureOpenshell: vi.fn((args: string[], opts?: Record<string, unknown>) =>
+        args[0] === "status" && opts?.includeStderr === true ? statusOutput : "",
+      ),
+      runOpenshell: vi.fn(() => ({ status: 0 })),
+      cliDisplayName: () => "NemoClaw",
+    }).getGatewayReuseSnapshot();
+    const { deps, calls } = createDeps();
+
+    const result = await handleGatewayState(
+      baseOptions(deps, gatewayReuseSnapshot.gatewayReuseState),
+    );
+
+    expect(gatewayReuseSnapshot.gatewayReuseState).toBe("stale");
+    expect(calls.skipped).not.toHaveBeenCalled();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.startStep).toHaveBeenCalledWith("gateway");
+    expect(calls.startGateway).toHaveBeenCalledWith({ type: "nvidia" }, { gpuPassthrough: true });
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(result.gatewayReuseState).toBe("stale");
+  });
+
+  it("completes one gateway step when a refused-status start succeeds on retry (#7087)", async () => {
+    const startGateway = vi
+      .fn<GatewayStateOptions<Gpu>["deps"]["startGateway"]>()
+      .mockRejectedValueOnce(new Error("gateway start failed"))
+      .mockResolvedValueOnce(undefined);
+    const { deps, calls } = createDeps({ startGateway });
+
+    await expect(handleGatewayState(baseOptions(deps, "stale"))).rejects.toThrow(
+      "gateway start failed",
+    );
+
+    expect(calls.startStep).toHaveBeenCalledOnce();
+    expect(calls.complete).not.toHaveBeenCalled();
+    expect(calls.skipped).not.toHaveBeenCalled();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+
+    const result = await handleGatewayState(baseOptions(deps, "stale"));
+
+    expect(startGateway).toHaveBeenCalledTimes(2);
+    expect(calls.startStep).toHaveBeenCalledTimes(2);
+    expect(calls.complete).toHaveBeenCalledOnce();
+    expect(calls.skipped).not.toHaveBeenCalled();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(result.gatewayReuseState).toBe("stale");
+    expect(result.stateResult).toEqual(
+      expect.objectContaining({
+        type: "transition",
+        next: "provider_selection",
+        metadata: expect.objectContaining({
+          state: "gateway",
+          gatewayReuseState: "stale",
+        }),
+      }),
+    );
   });
 
   it("reuses healthy gateways on fresh runs", async () => {
@@ -110,6 +278,40 @@ describe("handleGatewayState", () => {
     expect(calls.note).toHaveBeenCalledWith("  Reusing healthy NemoClaw gateway.");
     expect(calls.startGateway).not.toHaveBeenCalled();
     expect(calls.complete).toHaveBeenCalledWith("gateway");
+  });
+
+  it("emits one successful gateway phase when reusing a healthy gateway", async () => {
+    const artifact = await captureTraceArtifact(async () => {
+      const { deps } = createDeps();
+
+      await handleGatewayState(baseOptions(deps, "healthy"));
+    });
+
+    expect(gatewaySpans(artifact)).toEqual([
+      expect.objectContaining({
+        status: { code: "OK" },
+        attributes: { reuse_state: "healthy", gpu_passthrough: true },
+      }),
+    ]);
+  });
+
+  it("emits one failed gateway phase when stopped-container recovery fails", async () => {
+    const artifact = await captureTraceArtifact(async () => {
+      const { deps } = createDeps({
+        gatewayCliSupportsLifecycleCommands: vi.fn(() => true),
+        verifyGatewayContainerRunning: vi.fn(() => "stopped" as GatewayContainerState),
+        recoverGatewayRuntime: vi.fn(async () => false),
+      });
+
+      await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toThrow("exit 1");
+    });
+
+    expect(gatewaySpans(artifact)).toEqual([
+      expect.objectContaining({
+        status: { code: "ERROR", message: "exit 1" },
+        attributes: { reuse_state: "healthy", gpu_passthrough: true },
+      }),
+    ]);
   });
 
   it("reuses healthy gateways on resume only when the gateway step was complete", async () => {
@@ -223,7 +425,9 @@ describe("handleGatewayState", () => {
   it("refuses to destroy an unknown container state when HTTP is also unavailable", async () => {
     const { deps, calls } = createDeps({
       gatewayCliSupportsLifecycleCommands: vi.fn(() => true),
-      verifyGatewayContainerRunning: vi.fn((_gatewayName: string): GatewayContainerState => "unknown"),
+      verifyGatewayContainerRunning: vi.fn(
+        (_gatewayName: string): GatewayContainerState => "unknown",
+      ),
       waitForGatewayHttpReady: vi.fn(async () => false),
     });
 
@@ -254,7 +458,10 @@ describe("handleGatewayState", () => {
     const { deps, calls } = createDeps({
       gatewayCliSupportsLifecycleCommands: vi.fn(() => true),
       waitForGatewayHttpReady: vi.fn(async () => true),
-      getGatewayClusterImageDrift: vi.fn(() => ({ currentVersion: "0.0.38", expectedVersion: "0.0.39" })),
+      getGatewayClusterImageDrift: vi.fn(() => ({
+        currentVersion: "0.0.38",
+        expectedVersion: "0.0.39",
+      })),
       destroyGatewayForReuse: vi.fn(() => "missing" as GatewayReuseState),
     });
 
@@ -306,5 +513,146 @@ describe("handleGatewayState", () => {
     expect(calls.note).toHaveBeenCalledWith(
       "  Replacing legacy OpenShell gateway metadata with Docker-driver gateway.",
     );
+  });
+
+  it("does not retire a foreign-active Docker-driver gateway (concurrent instances)", async () => {
+    const { deps, calls } = createDeps({
+      isLinuxDockerDriverGatewayEnabled: vi.fn(() => true),
+      reconcileGatewayGpuReuseForGpuIntent: vi.fn(() => "foreign-active" as GatewayReuseState),
+    });
+
+    const result = await handleGatewayState(baseOptions(deps, "foreign-active"));
+
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(calls.note).not.toHaveBeenCalledWith(
+      "  Replacing legacy OpenShell gateway metadata with Docker-driver gateway.",
+    );
+    expect(calls.startGateway).toHaveBeenCalledOnce();
+    expect(result.gatewayReuseState).toBe("missing");
+  });
+});
+
+describe("externally supervised gateway lifecycle authority", () => {
+  function externalDeps(probe: Partial<GatewayAttachmentProbe> = {}) {
+    const { calls, deps } = createDeps();
+    calls.resolveOwner.mockReturnValue(EXTERNAL_OWNER);
+    calls.probeAttachment.mockResolvedValue({
+      gatewayPort: 8080,
+      httpReady: true,
+      portOccupied: true,
+      listenerPids: [4242],
+      listenerScanComplete: true,
+      listenerStartTime: "710024",
+      supervisorActive: true,
+      listenerExecPath: "/usr/local/bin/openshell-gateway",
+      listenerSupervisorMatch: true,
+      ...probe,
+    });
+    return { calls, deps };
+  }
+
+  it("attaches to the supervised gateway without running any lifecycle effect (#6576)", async () => {
+    const order: string[] = [];
+    const { calls, deps } = externalDeps();
+    calls.attachGateway.mockImplementation(async () => {
+      order.push("attach");
+    });
+    calls.complete.mockImplementation(async () => {
+      order.push("complete");
+      return createSession();
+    });
+
+    const result = await handleGatewayState(baseOptions(deps, "missing"));
+
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.attachGateway).toHaveBeenCalledWith(
+      EXTERNAL_OWNER,
+      expect.objectContaining({ listenerPids: [4242], listenerSupervisorMatch: true }),
+    );
+    expect(calls.destroy).not.toHaveBeenCalled();
+    expect(calls.destroyForReuse).not.toHaveBeenCalled();
+    expect(calls.retireLegacy).not.toHaveBeenCalled();
+    expect(calls.complete).toHaveBeenCalledWith("gateway");
+    expect(order).toEqual(["attach", "complete"]);
+    expect(result.stateResult).toMatchObject({
+      metadata: { gatewayOwner: { mode: "externally-supervised", source: "declared" } },
+    });
+  });
+
+  it("rejects host mounts before any externally supervised gateway effect", async () => {
+    const { calls, deps } = externalDeps();
+
+    await expect(
+      handleGatewayState({ ...baseOptions(deps, "missing"), requiresBindMounts: true }),
+    ).rejects.toMatchObject({ code: "capability_unsupported" });
+
+    expect(calls.attachGateway).not.toHaveBeenCalled();
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.destroy).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("does not cross the provider-mutation boundary when exact registration fails (#6576)", async () => {
+    const { calls, deps } = externalDeps();
+    calls.attachGateway.mockImplementation(async () => {
+      throw new GatewayOwnershipError(
+        "gateway_registration_failed",
+        "registration failed",
+        EXTERNAL_OWNER,
+      );
+    });
+
+    await expect(handleGatewayState(baseOptions(deps, "missing"))).rejects.toMatchObject({
+      code: "gateway_registration_failed",
+    });
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
+  it("never falls back to a standalone gateway when the supervisor is inactive (#6576)", async () => {
+    const { calls, deps } = externalDeps({ supervisorActive: false });
+
+    await expect(handleGatewayState(baseOptions(deps, "missing"))).rejects.toThrow(
+      GatewayOwnershipError,
+    );
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.destroy).not.toHaveBeenCalled();
+  });
+
+  it("fails before any effect when a competing listener holds the port (#6576)", async () => {
+    const { calls, deps } = externalDeps({ listenerPids: [4242, 4243] });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toMatchObject({
+      code: "multiple_owners",
+    });
+    expect(calls.startGateway).not.toHaveBeenCalled();
+    expect(calls.destroyForReuse).not.toHaveBeenCalled();
+  });
+
+  it("fails before any effect when the running gateway is not the declared one (#6576)", async () => {
+    const { calls, deps } = externalDeps({ listenerExecPath: "/opt/other/openshell-gateway" });
+
+    await expect(handleGatewayState(baseOptions(deps, "healthy"))).rejects.toMatchObject({
+      code: "identity_mismatch",
+    });
+    expect(calls.startGateway).not.toHaveBeenCalled();
+  });
+
+  it("revalidates the declared owner on resume rather than trusting the recorded step (#6576)", async () => {
+    const { calls, deps } = externalDeps({
+      portOccupied: false,
+      listenerPids: [],
+      httpReady: false,
+    });
+    const session = createSession();
+    session.steps = {
+      gateway: { status: "complete", startedAt: null, completedAt: null, error: null },
+    };
+
+    await expect(
+      handleGatewayState({ ...baseOptions(deps, "healthy", session), resume: true }),
+    ).rejects.toMatchObject({ code: "gateway_unreachable" });
+    expect(calls.probeAttachment).toHaveBeenCalledOnce();
+    expect(calls.startGateway).not.toHaveBeenCalled();
   });
 });

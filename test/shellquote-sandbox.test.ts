@@ -1,18 +1,44 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { spawnSync } from "child_process";
 // Verify sandbox names stay validated and out of raw shell command strings.
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { pathToFileURL } from "url";
-import { spawnSync } from "child_process";
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
+
+import { writeOkOpenshell } from "./helpers/onboard-openshell-fixture";
 
 describe("sandboxName command hardening in onboard.js", () => {
+  it("rejects a marker-only security inventory fixture probe", async () => {
+    const helper = (await import("./helpers/onboard-script-mocks.cjs")) as {
+      isOpenClawSecurityInventoryProbe: (command: unknown) => boolean;
+    };
+
+    expect(
+      helper.isOpenClawSecurityInventoryProbe([
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--read-only",
+        "--entrypoint",
+        "/bin/sh",
+        "nemoclaw:test",
+        "-c",
+        "echo nemoclaw-security-inventory-ok",
+      ]),
+    ).toBe(false);
+  });
+
   it("re-validates sandboxName at the createSandbox boundary", async () => {
-    const onboardModule = await import("../dist/lib/onboard.js");
-    const { createSandbox } = (onboardModule.default ?? onboardModule) as unknown as {
+    const onboardModule = await import("../src/lib/onboard.js");
+    const { createSandbox } = onboardModule as unknown as {
       createSandbox: (
         gpu: null,
         model: string,
@@ -23,7 +49,7 @@ describe("sandboxName command hardening in onboard.js", () => {
     };
 
     await expect(
-      createSandbox(null, "test-model", "nvidia-prod", null, "bad; touch /tmp/pwned"),
+      createSandbox(null, "test-model", "nvidia-prod", null, "bad;touch"),
     ).rejects.toThrow(/Invalid sandbox name/);
   });
 
@@ -31,43 +57,32 @@ describe("sandboxName command hardening in onboard.js", () => {
     const repoRoot = path.join(import.meta.dirname, "..");
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dns-argv-"));
     const fakeBin = path.join(tmpDir, "bin");
-    const scriptPath = path.join(tmpDir, "create-sandbox-dns-argv.mjs");
-    const onboardUrl = JSON.stringify(
-      pathToFileURL(path.join(repoRoot, "dist", "lib", "onboard.js")).href,
-    );
-    const runnerUrl = JSON.stringify(
-      pathToFileURL(path.join(repoRoot, "dist", "lib", "runner.js")).href,
-    );
-    const registryUrl = JSON.stringify(
-      pathToFileURL(path.join(repoRoot, "dist", "lib", "state", "registry.js")).href,
-    );
-    const preflightUrl = JSON.stringify(
-      pathToFileURL(path.join(repoRoot, "dist", "lib", "onboard", "preflight.js")).href,
-    );
-    const credentialsUrl = JSON.stringify(
-      pathToFileURL(path.join(repoRoot, "dist", "lib", "credentials", "store.js")).href,
-    );
-    const streamUrl = JSON.stringify(
-      pathToFileURL(path.join(repoRoot, "dist", "lib", "sandbox", "create-stream.js")).href,
-    );
+    const scriptPath = path.join(tmpDir, "create-sandbox-dns-argv.cjs");
+    const sourceModule = (...segments: string[]) =>
+      JSON.stringify(path.join(repoRoot, "src", "lib", ...segments));
+    const onboardPath = sourceModule("onboard.ts");
+    const runnerPath = sourceModule("runner.ts");
+    const registryPath = sourceModule("state", "registry.ts");
+    const preflightPath = sourceModule("onboard", "preflight.ts");
+    const credentialsPath = sourceModule("credentials", "store.ts");
+    const streamPath = sourceModule("sandbox", "create-stream.ts");
 
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
     fs.writeFileSync(
       scriptPath,
       String.raw`
-const runner = (await import(${runnerUrl})).default;
-const registry = (await import(${registryUrl})).default;
-const preflight = (await import(${preflightUrl})).default;
-const credentials = (await import(${credentialsUrl})).default;
-const sandboxCreateStream = (await import(${streamUrl})).default;
+const runner = require(${runnerPath});
+const registry = require(${registryPath});
+const preflight = require(${preflightPath});
+const credentials = require(${credentialsPath});
+const sandboxCreateStream = require(${streamPath});
 for (const key of Object.keys(process.env)) {
   if (/^(NEMOCLAW|OPENSHELL)_/.test(key) || key === "CHAT_UI_URL") {
     delete process.env[key];
   }
 }
+process.env.NEMOCLAW_OPENSHELL_BIN = ${JSON.stringify(path.join(fakeBin, "openshell"))};
 const commands = [];
 const asText = (command) => Array.isArray(command) ? command.join(" ") : String(command);
 runner.run = (command, opts = {}) => {
@@ -80,11 +95,15 @@ runner.runFile = (file, args = [], opts = {}) => {
 };
 runner.runCapture = (command) => {
   const text = asText(command);
-  if (text.includes("sandbox get my-assistant")) return "";
+  if (text.includes("sandbox get") && text.includes("my-assistant")) return "";
   if (text.includes("sandbox list")) return "my-assistant Ready";
   if (text.includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running";
   if (text.includes("sandbox exec") && text.includes("http://localhost:") && text.includes("/health")) return "200";
   if (text === "uname -r") return "6.8.0";
+  const mockedCapture = require(${JSON.stringify(
+    path.join(repoRoot, "test", "helpers", "onboard-script-mocks.cjs"),
+  )}).mockOnboardRunCapture(command);
+  if (mockedCapture !== null) return mockedCapture;
   return "";
 };
 registry.getSandbox = () => null;
@@ -99,7 +118,8 @@ sandboxCreateStream.streamSandboxCreate = async () => ({
   output: "Built image openshell/sandbox-from:123\nCreated sandbox: my-assistant",
   sawProgress: true,
 });
-const { createSandbox } = await import(${onboardUrl});
+const { createSandbox } = require(${onboardPath});
+(async () => {
 try {
   process.env.OPENSHELL_GATEWAY = "nemoclaw";
   process.env.NEMOCLAW_NON_INTERACTIVE = "1";
@@ -112,16 +132,29 @@ try {
   console.error(error && error.stack ? error.stack : String(error));
   process.exit(1);
 }
+})();
 `,
     );
 
     try {
-      const result = spawnSync(process.execPath, [scriptPath], {
-        cwd: repoRoot,
-        encoding: "utf-8",
-        env: { HOME: tmpDir, PATH: `${fakeBin}:${process.env.PATH || ""}` },
-        timeout: 30_000,
-      });
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--require",
+          path.join(repoRoot, "test", "helpers", "onboard-script-mocks.cjs"),
+          scriptPath,
+        ],
+        {
+          cwd: repoRoot,
+          encoding: "utf-8",
+          env: {
+            HOME: tmpDir,
+            PATH: `${fakeBin}:${process.env.PATH || ""}`,
+            NEMOCLAW_TEST_MANAGED_IMAGE_FALLBACK: "1",
+          },
+          timeout: 30_000,
+        },
+      );
       expect(result.status, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`).toBe(0);
       const payloadLine = result.stdout
         .trim()
@@ -148,8 +181,8 @@ try {
   });
 
   it("builds openshell argv with an explicit openshellBinary override", async () => {
-    const onboardModule = await import("../dist/lib/onboard.js");
-    const onboard = (onboardModule.default ?? onboardModule) as unknown as {
+    const onboardModule = await import("../src/lib/onboard.js");
+    const onboard = onboardModule as unknown as {
       openshellArgv: (args: string[], opts?: { openshellBinary?: string }) => string[];
     };
 

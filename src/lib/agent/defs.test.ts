@@ -9,9 +9,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AGENTS_DIR,
   getAgentChoices,
+  listAgents,
   loadAgent,
+  requireAgentPolicyAdditionsPath,
   resolveAgentName,
-} from "../../../dist/lib/agent/defs";
+  resolveAgentNameAlias,
+} from "./defs";
 
 const tempAgentDirs: string[] = [];
 
@@ -34,57 +37,51 @@ afterEach(() => {
 });
 
 describe("agent definitions", () => {
-  it("loads computed OpenClaw manifest properties", () => {
-    const openclaw = loadAgent("openclaw");
+  it("cannot discover or load a local NemoCUA manifest while the feature is disabled (#7755)", () => {
+    const realExistsSync = fs.existsSync.bind(fs);
+    vi.spyOn(fs, "existsSync").mockImplementation((candidate) =>
+      candidate === path.join(AGENTS_DIR, "nemocua", "manifest.yaml")
+        ? true
+        : realExistsSync(candidate),
+    );
+    vi.spyOn(fs, "readdirSync").mockReturnValue([
+      { name: "nemocua", isDirectory: () => true } as fs.Dirent,
+    ] as never);
+    const disabledEnv = {
+      NEMOCLAW_CUA_RUNTIME_MANIFEST: "/private/untrusted/runtime-manifest.json",
+      NEMOCLAW_CUA_RUNTIME_MANIFEST_SHA256: "a".repeat(64),
+    };
 
-    expect(openclaw.name).toBe("openclaw");
-    expect(openclaw.displayName).toBe("OpenClaw");
-    expect(openclaw.healthProbe.port).toBe(18789);
-    expect(openclaw.forwardPort).toBe(18789);
-    expect(openclaw.configPaths).toEqual({
-      dir: "/sandbox/.openclaw",
-      configFile: "openclaw.json",
-      envFile: null,
-      format: "json",
-    });
-    expect(openclaw.messagingPlatforms).toEqual([
-      "telegram",
-      "discord",
-      "slack",
-      "wechat",
-      "whatsapp",
-    ]);
-    expect(openclaw.inferenceProviderOptions).toEqual([]);
-    expect(openclaw.legacyPaths?.startScript).toContain("scripts/nemoclaw-start.sh");
-  });
-
-  it("loads Hermes manifest properties without falling back to OpenClaw defaults", () => {
-    const hermes = loadAgent("hermes");
-
-    expect(hermes.name).toBe("hermes");
-    expect(hermes.displayName).toBe("Hermes Agent");
-    expect(hermes.hasDevicePairing).toBe(false);
-    expect(hermes.configPaths).toEqual({
-      dir: "/sandbox/.hermes",
-      configFile: "config.yaml",
-      envFile: ".env",
-      format: "yaml",
-    });
-    expect(hermes.inferenceProviderOptions).toEqual(["hermesProvider"]);
-    expect(hermes.healthProbe.url).toBe("http://localhost:8642/health");
-    expect(hermes.messagingPlatforms).toEqual([
-      "telegram",
-      "discord",
-      "slack",
-      "wechat",
-      "whatsapp",
-    ]);
+    expect(listAgents(disabledEnv)).not.toContain("nemocua");
+    expect(() => loadAgent("nemocua", disabledEnv)).toThrow(
+      "use the controlled Brev Launchable activation",
+    );
   });
 
   it("orders OpenClaw first in interactive choices", () => {
     const choices = getAgentChoices();
     expect(choices[0]?.name).toBe("openclaw");
     expect(choices.map((choice) => choice.name)).toContain("hermes");
+  });
+
+  it("requires a readable regular policy-additions file for non-OpenClaw baselines (#7194)", () => {
+    const agentName = `missing-baseline-${String(Date.now())}`;
+    writeTempAgentManifest(agentName, `name: ${agentName}\ndisplay_name: Missing Baseline\n`);
+    const agent = loadAgent(agentName);
+    const policyPath = path.join(AGENTS_DIR, agentName, "policy-additions.yaml");
+
+    expect(() => requireAgentPolicyAdditionsPath(agent)).toThrow(
+      "Refusing to substitute the OpenClaw baseline",
+    );
+
+    fs.mkdirSync(policyPath);
+    expect(() => requireAgentPolicyAdditionsPath(agent)).toThrow(
+      "Refusing to substitute the OpenClaw baseline",
+    );
+    fs.rmSync(policyPath, { recursive: true });
+    fs.writeFileSync(policyPath, "version: 1\nnetwork_policies: {}\n");
+
+    expect(requireAgentPolicyAdditionsPath(agent)).toBe(policyPath);
   });
 
   it("falls back to openclaw when session references an unknown agent", () => {
@@ -102,6 +99,27 @@ describe("agent definitions", () => {
     expect(resolveAgentName({ agentFlag: "openclaw" })).toBe("openclaw");
   });
 
+  it("resolves common user-facing agent aliases to canonical manifest names", () => {
+    const available = ["openclaw", "hermes", "langchain-deepagents-code"];
+
+    expect(resolveAgentNameAlias("nemohermes", available)).toBe("hermes");
+    expect(resolveAgentNameAlias("NEMO_HERMES", available)).toBe("hermes");
+    expect(resolveAgentNameAlias("dcode", available)).toBe("langchain-deepagents-code");
+    expect(resolveAgentNameAlias("deepagent", available)).toBe("langchain-deepagents-code");
+    expect(resolveAgentNameAlias("deepagents", available)).toBe("langchain-deepagents-code");
+    expect(resolveAgentNameAlias("deep agents code", available)).toBe("langchain-deepagents-code");
+    expect(resolveAgentNameAlias("deepagentscode", available)).toBe("langchain-deepagents-code");
+    expect(resolveAgentNameAlias("langchain", available)).toBe("langchain-deepagents-code");
+    expect(resolveAgentNameAlias("nemoclaw", available)).toBe("openclaw");
+  });
+
+  it("resolves --agent and NEMOCLAW_AGENT aliases through resolveAgentName", () => {
+    expect(resolveAgentName({ agentFlag: "dcode" })).toBe("langchain-deepagents-code");
+
+    vi.stubEnv("NEMOCLAW_AGENT", "nemohermes");
+    expect(resolveAgentName()).toBe("hermes");
+  });
+
   it("rejects non-object manifest payloads", () => {
     const agentName = `invalid-top-level-manifest-${String(Date.now())}`;
     writeTempAgentManifest(agentName, ["- not", "- an", "- object"].join("\n"));
@@ -109,16 +127,77 @@ describe("agent definitions", () => {
     expect(() => loadAgent(agentName)).toThrow(/YAML object/);
   });
 
-  it("rejects invalid forward_ports values in manifests", () => {
-    const agentName = `invalid-forward-port-${String(Date.now())}`;
+  it("rejects the superseded runtime auth directory inventory (#8006)", () => {
+    const agentName = `runtime-auth-inventory-${String(Date.now())}`;
     writeTempAgentManifest(
       agentName,
-      [`name: ${agentName}`, "display_name: Broken Ports", "forward_ports:", "  - 70000"].join(
-        "\n",
-      ),
+      [
+        `name: ${agentName}`,
+        "display_name: Runtime Auth Inventory",
+        "state_dirs:",
+        "  - identity",
+        "runtime_auth_state_dirs:",
+        "  - identity",
+      ].join("\n"),
     );
 
-    expect(() => loadAgent(agentName)).toThrow(/forward_ports\[0\]/);
+    expect(() => loadAgent(agentName)).toThrow(/replaced.*backup: false/);
+  });
+
+  it("derives protected configuration files from each agent manifest (#8006)", () => {
+    expect(loadAgent("hermes").configPaths.shieldsFiles).toEqual([".env"]);
+    expect(loadAgent("openclaw").configPaths.shieldsFiles).toEqual([]);
+    expect(loadAgent("langchain-deepagents-code").configPaths.shieldsFiles).toEqual([]);
+  });
+
+  it("derives image state-lock-plan support from each agent manifest (#8006)", () => {
+    expect(loadAgent("openclaw").stateLockPlanInImage).toBe(true);
+    expect(loadAgent("hermes").stateLockPlanInImage).toBe(true);
+    expect(loadAgent("langchain-deepagents-code").stateLockPlanInImage).toBe(false);
+  });
+
+  it("rejects a non-boolean image state-lock-plan declaration (#8006)", () => {
+    const agentName = `invalid-image-plan-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "state_lock_plan_in_image: yes-please"].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/state_lock_plan_in_image.*boolean/);
+  });
+
+  it.each([
+    ["a scalar", "  shields_files: .env"],
+    ["a non-string entry", "  shields_files:\n    - 42"],
+  ])("rejects config.shields_files with %s", (_case, declaration) => {
+    const agentName = `invalid-shields-files-${String(Date.now())}-${_case.replaceAll(" ", "-")}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Invalid Shields Files",
+        "config:",
+        "  dir: /sandbox/.invalid",
+        "  config_file: config.json",
+        declaration,
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/config\.shields_files/);
+  });
+
+  it("rejects invalid forward_ports values in manifests", () => {
+    for (const port of [1023, 70000]) {
+      const agentName = `invalid-forward-port-${String(port)}-${String(Date.now())}`;
+      writeTempAgentManifest(
+        agentName,
+        [`name: ${agentName}`, "display_name: Broken Ports", "forward_ports:", `  - ${port}`].join(
+          "\n",
+        ),
+      );
+
+      expect(() => loadAgent(agentName)).toThrow(/forward_ports\[0\]/);
+    }
   });
 
   it("rejects invalid health_probe.port values in manifests", () => {
@@ -136,6 +215,56 @@ describe("agent definitions", () => {
     );
 
     expect(() => loadAgent(agentName)).toThrow(/health_probe\.port/);
+  });
+
+  it("rejects invalid dashboard auth values in manifests", () => {
+    const agentName = `invalid-dashboard-auth-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Dashboard Auth",
+        "dashboard:",
+        "  kind: ui",
+        "  auth: bearer",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/dashboard\.auth/);
+  });
+
+  it("rejects invalid dashboard health path values in manifests", () => {
+    const agentName = `invalid-dashboard-health-path-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Dashboard Health Path",
+        "dashboard:",
+        "  kind: ui",
+        "  health_path: api/status",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/dashboard\.health_path/);
+  });
+
+  it("rejects invalid dashboard_ui.port values in manifests", () => {
+    const agentName = `invalid-dashboard-ui-port-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Dashboard UI",
+        "dashboard_ui:",
+        "  label: Web dashboard",
+        "  port: 1023",
+        "  enable_env: NEMOCLAW_TEST_DASHBOARD",
+        "  port_env: NEMOCLAW_TEST_DASHBOARD_PORT",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/dashboard_ui\.port/);
   });
 
   it("rejects invalid inference provider options in manifests", () => {
@@ -168,5 +297,209 @@ describe("agent definitions", () => {
     );
 
     expect(() => loadAgent(agentName)).toThrow(/inference\.provider_type/);
+  });
+
+  it.each([
+    "42",
+    '"bad model"',
+  ])("rejects invalid inference default models in manifests (%s)", (defaultModel) => {
+    const agentName = `invalid-inference-default-model-${String(Date.now())}-${defaultModel.length}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Inference Default",
+        "inference:",
+        `  default_model: ${defaultModel}`,
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/inference\.default_model/);
+  });
+
+  it("rejects invalid MCP bridge adapter declarations in manifests", () => {
+    const agentName = `invalid-mcp-adapter-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken MCP",
+        "mcp:",
+        "  support: bridge",
+        "  adapter: unsupported-adapter",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/mcp\.adapter/);
+  });
+
+  it("requires an MCP adapter when bridge support is declared", () => {
+    const agentName = `missing-mcp-adapter-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Missing MCP Adapter", "mcp:", "  support: bridge"].join(
+        "\n",
+      ),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/mcp\.adapter/);
+  });
+
+  it("loads terminal runtime manifests without OpenClaw gateway defaults", () => {
+    const agentName = `terminal-agent-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Terminal Agent",
+        "binary_path: /usr/local/bin/terminal-agent",
+        "version_command: terminal-agent --version",
+        "runtime:",
+        "  kind: terminal",
+        "  interactive_command: terminal-agent",
+        "  headless_command: terminal-agent -n",
+        "  smoke_commands:",
+        "    - terminal-agent --version",
+      ].join("\n"),
+    );
+
+    const agent = loadAgent(agentName);
+
+    expect(agent.runtime).toEqual({
+      kind: "terminal",
+      interactive_command: "terminal-agent",
+      headless_command: "terminal-agent -n",
+      smoke_commands: ["terminal-agent --version"],
+    });
+    expect(agent.healthProbe).toBeNull();
+    expect(agent.forwardPort).toBe(0);
+  });
+
+  it("rejects invalid runtime kinds in manifests", () => {
+    const agentName = `invalid-runtime-kind-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Broken Runtime", "runtime:", "  kind: daemon"].join(
+        "\n",
+      ),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/runtime\.kind/);
+  });
+
+  it("requires terminal manifests to declare a launch command", () => {
+    const agentName = `invalid-terminal-runtime-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Broken Terminal", "runtime:", "  kind: terminal"].join(
+        "\n",
+      ),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/interactive_command or headless_command/);
+  });
+
+  it("rejects invalid terminal smoke command values in manifests", () => {
+    const agentName = `invalid-terminal-smoke-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken Terminal Smoke",
+        "runtime:",
+        "  kind: terminal",
+        "  interactive_command: broken-terminal",
+        "  smoke_commands:",
+        "    - broken-terminal --version",
+        "    - 42",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/runtime\.smoke_commands/);
+  });
+
+  it("rejects non-string user_managed_files entries", () => {
+    const agentName = `invalid-umf-nonstring-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken UMF",
+        "user_managed_files:",
+        "  - .env",
+        "  - 42",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/user_managed_files\[1\].*string/);
+  });
+
+  it("rejects non-array user_managed_files values", () => {
+    const agentName = `invalid-umf-nonarray-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Broken UMF", "user_managed_files: not-an-array"].join(
+        "\n",
+      ),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/user_managed_files.*must be an array/);
+  });
+
+  it("rejects empty-string user_managed_files entries", () => {
+    const agentName = `invalid-umf-empty-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [`name: ${agentName}`, "display_name: Broken UMF", "user_managed_files:", '  - ""'].join(
+        "\n",
+      ),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/user_managed_files\[0\].*empty/);
+  });
+
+  it("rejects absolute paths in user_managed_files entries", () => {
+    const agentName = `invalid-umf-absolute-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken UMF",
+        "user_managed_files:",
+        "  - /sandbox/.env",
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/user_managed_files\[0\].*absolute/);
+  });
+
+  it("rejects '..' traversal in user_managed_files entries", () => {
+    const agentName = `invalid-umf-traversal-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken UMF",
+        "user_managed_files:",
+        '  - "../secret"',
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/user_managed_files\[0\].*'\.\.'/);
+  });
+
+  it("rejects control characters in user_managed_files entries", () => {
+    const agentName = `invalid-umf-control-${String(Date.now())}`;
+    writeTempAgentManifest(
+      agentName,
+      [
+        `name: ${agentName}`,
+        "display_name: Broken UMF",
+        "user_managed_files:",
+        '  - ".env\\n.malicious"',
+      ].join("\n"),
+    );
+
+    expect(() => loadAgent(agentName)).toThrow(/user_managed_files\[0\].*control characters/);
   });
 });

@@ -1,0 +1,919 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+
+import ts from "typescript";
+import YAML from "yaml";
+import { PR_E2E_MANUAL_CONTROLLER_JOB_IDS, RISK_RULES } from "../advisors/risk-plan.mts";
+
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const DEFAULT_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "e2e.yaml");
+const DEFAULT_ADVISOR_PATH = join(REPO_ROOT, ".github", "workflows", "pr-review-advisor.yaml");
+const META_JOBS = new Set(["report-to-pr", "scorecard"]);
+const FULL_SHA_ACTION = /^[^\s@]+@[0-9a-f]{40}$/u;
+const GITHUB_SCRIPT_NODE24_ACTION =
+  "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3";
+const DOWNLOAD_ARTIFACT_ACTION =
+  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+const PR_GATE_REPORTER = "test/e2e/risk-signal-reporter.ts";
+const LIVE_VITEST_HELPER = "tools/e2e/live-vitest-invocation.mts run --test-path";
+const E2E_ARTIFACT_ACTION = "NVIDIA/NemoClaw/.github/actions/upload-e2e-artifacts@";
+const PUBLICATION_REQUIRED_CONDITION = "${{ steps.publication_mode.outputs.required == '1' }}";
+const PUBLICATION_CLASSIFIER_SCRIPT =
+  [
+    "set -euo pipefail",
+    'case "${REPOSITORY}:${REF}:${EVENT_NAME}:${CHECKOUT_SHA:+controller}" in',
+    "  NVIDIA/NemoClaw:refs/heads/main:push:|NVIDIA/NemoClaw:refs/heads/main:workflow_dispatch:)",
+    "    required=1",
+    "    ;;",
+    "  NVIDIA/NemoClaw:refs/heads/main:workflow_dispatch:controller)",
+    "    required=0",
+    "    ;;",
+    "  *)",
+    '    echo "::error::base-image publication mode is not trusted" >&2',
+    "    exit 1",
+    "    ;;",
+    "esac",
+    'printf \'required=%s\\n\' "${required}" >> "${GITHUB_OUTPUT}"',
+  ].join("\n") + "\n";
+const ISSUE_API_REFERENCE = /\bgithub\.rest\.issues\b/u;
+const ISSUE_MUTATION_BEYOND_COMMENT =
+  /github\.rest\.issues\.(?:addAssignees|addLabels|create|deleteComment|lock|removeAssignees|removeLabel|setLabels|unlock|update|updateComment)\s*\(/u;
+const GENERIC_GITHUB_WRITE_SURFACE =
+  /github\s*(?:(?:\?\.|\.)\s*(?:graphql|request)\b|\[\s*["'](?:graphql|request)["']\s*\])|\b(?:const|let|var)\s+(?:[A-Za-z_$][\w$]*\s*=\s*github\b|\{[^}]*\b(?:graphql|request)\b[^}]*\}\s*=\s*github(?:\.rest)?\b)|\bfetch\b|\bgh\s+api\b/u;
+const GENERIC_ISSUE_REST_MUTATION =
+  /github\.request\s*\(\s*["'`](?:POST|PATCH|PUT|DELETE)\s+\/repos\/[^/\s]+\/[^/\s]+\/issues(?:\/|\b)/u;
+const GENERIC_ISSUE_GRAPHQL_MUTATION =
+  /github\.graphql\s*\(\s*["'`]\s*mutation\b[\s\S]*?\b(?:addComment|closeIssue|createIssue|reopenIssue|updateIssue)\b/u;
+const NEEDS_INTERPOLATION = /\$\{\{\s*toJSON\s*\(\s*needs\s*\)\s*\}\}/iu;
+
+type WorkflowStep = {
+  "continue-on-error"?: boolean;
+  env?: Record<string, unknown>;
+  if?: string;
+  name?: string;
+  run?: string;
+  uses?: string;
+  with?: Record<string, unknown>;
+};
+
+type WorkflowPermissions = Record<string, unknown> | string;
+
+type WorkflowJob = {
+  env?: Record<string, unknown>;
+  if?: string;
+  needs?: unknown;
+  permissions?: WorkflowPermissions;
+  "runs-on"?: unknown;
+  steps?: WorkflowStep[];
+  "timeout-minutes"?: unknown;
+};
+
+export type OperationsWorkflow = {
+  concurrency?: {
+    "cancel-in-progress"?: unknown;
+    group?: unknown;
+  };
+  env?: Record<string, unknown>;
+  jobs: Record<string, WorkflowJob>;
+  permissions?: WorkflowPermissions;
+  "run-name"?: unknown;
+  on?: {
+    workflow_dispatch?: {
+      inputs?: Record<string, Record<string, unknown>>;
+    };
+  };
+};
+
+export function readE2eOperationsWorkflow(path = DEFAULT_WORKFLOW_PATH): OperationsWorkflow {
+  return YAML.parse(readFileSync(path, "utf8")) as OperationsWorkflow;
+}
+
+function needs(job: WorkflowJob): string[] {
+  return Array.isArray(job.needs)
+    ? job.needs.filter((name): name is string => typeof name === "string")
+    : typeof job.needs === "string"
+      ? [job.needs]
+      : [];
+}
+
+function sorted(values: Iterable<string>): string[] {
+  return [...values].sort((left, right) => left.localeCompare(right));
+}
+
+function sameMembers(left: readonly string[], right: readonly string[]): boolean {
+  return JSON.stringify(sorted(left)) === JSON.stringify(sorted(right));
+}
+
+function permissionMap(permissions: WorkflowPermissions | undefined): Record<string, unknown> {
+  return permissions !== null && typeof permissions === "object" ? permissions : {};
+}
+
+function findStep(job: WorkflowJob, name: string): WorkflowStep {
+  return job.steps?.find((step) => step.name === name) ?? {};
+}
+
+function executableSource(job: WorkflowJob): string {
+  return (job.steps ?? [])
+    .flatMap((step) => [step.run, step.with?.script])
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+function isNeedsEnvironmentAccess(expression: ts.Expression): boolean {
+  if (!ts.isPropertyAccessExpression(expression) || expression.name.text !== "NEEDS_JSON") {
+    return false;
+  }
+  const environment = expression.expression;
+  return (
+    ts.isPropertyAccessExpression(environment) &&
+    environment.name.text === "env" &&
+    ts.isIdentifier(environment.expression) &&
+    environment.expression.text === "process"
+  );
+}
+
+function isNeedsEnvironmentParse(expression: ts.Expression): boolean {
+  if (!ts.isCallExpression(expression) || expression.arguments.length !== 1) {
+    return false;
+  }
+  const parser = expression.expression;
+  const input = expression.arguments[0];
+  return (
+    ts.isPropertyAccessExpression(parser) &&
+    ts.isIdentifier(parser.expression) &&
+    parser.expression.text === "JSON" &&
+    parser.name.text === "parse" &&
+    ts.isBinaryExpression(input) &&
+    input.operatorToken.kind === ts.SyntaxKind.BarBarToken &&
+    isNeedsEnvironmentAccess(input.left) &&
+    ts.isStringLiteral(input.right) &&
+    input.right.text === "{}"
+  );
+}
+
+function assignsNeedsFromEnvironment(script: string): boolean {
+  const source = ts.createSourceFile(
+    "github-script.js",
+    script,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.JS,
+  );
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === "needs" &&
+      node.initializer !== undefined &&
+      isNeedsEnvironmentParse(node.initializer)
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+}
+
+function requirePinnedAction(errors: string[], step: WorkflowStep, owner: string): void {
+  if (!FULL_SHA_ACTION.test(step.uses ?? "")) {
+    errors.push(`${owner} must pin its action to a full SHA`);
+  }
+}
+
+function requireNode24GithubScript(errors: string[], step: WorkflowStep, owner: string): void {
+  requirePinnedAction(errors, step, owner);
+  if (step.uses !== GITHUB_SCRIPT_NODE24_ACTION) {
+    errors.push(`${owner} must use the pinned Node 24 github-script runtime`);
+  }
+}
+
+function passesNeedsAsEnvironmentData(step: WorkflowStep): boolean {
+  const script = String(step.with?.script ?? "");
+  return (
+    step.env?.NEEDS_JSON === "${{ toJSON(needs) }}" &&
+    !NEEDS_INTERPOLATION.test(script) &&
+    assignsNeedsFromEnvironment(script)
+  );
+}
+
+function validateManualPrDispatch(errors: string[], workflow: OperationsWorkflow): void {
+  const inputs = workflow.on?.workflow_dispatch?.inputs ?? {};
+  for (const name of [
+    "jobs",
+    "pr_number",
+    "checkout_sha",
+    "checkout_repository",
+    "review_reason",
+    "base_sha",
+    "workflow_sha",
+    "correlation_id",
+  ]) {
+    const input = inputs[name];
+    if (input?.type !== "string" || input.default !== "") {
+      errors.push(`workflow_dispatch ${name} must be an optional string with an empty default`);
+    }
+  }
+  const expectedEnvironment = {
+    NEMOCLAW_E2E_CORRELATION_ID: "${{ inputs.correlation_id }}",
+    NEMOCLAW_E2E_EXPECTED_SHA: "${{ inputs.checkout_sha }}",
+    NEMOCLAW_E2E_SHARD: "default",
+  };
+  for (const [name, value] of Object.entries(expectedEnvironment)) {
+    if (workflow.env?.[name] !== value) errors.push(`E2E workflow must bind ${name}`);
+  }
+  const runName = String(workflow["run-name"] ?? "");
+  for (const fragment of ["inputs.checkout_sha", "inputs.pr_number"]) {
+    if (!runName.includes(fragment)) errors.push(`Manual PR E2E run name must include ${fragment}`);
+  }
+  const concurrencyGroup = String(workflow.concurrency?.group ?? "");
+  if (
+    !concurrencyGroup.includes("inputs.checkout_sha") ||
+    !concurrencyGroup.includes("inputs.pr_number") ||
+    !concurrencyGroup.includes("manual-pr")
+  ) {
+    errors.push("Manual PR E2E concurrency must be scoped to its pull request");
+  }
+  if (
+    workflow.concurrency?.["cancel-in-progress"] !==
+    "${{ inputs.checkout_sha != '' && !inputs.allow_jetson_dispatch }}"
+  ) {
+    errors.push("Manual PR E2E concurrency must not cancel an active Jetson dispatch");
+  }
+
+  const matrixJob = workflow.jobs["generate-matrix"] ?? {};
+  const steps = matrixJob.steps ?? [];
+  const authenticationIndex = steps.findIndex(
+    (step) => step.name === "Authenticate manual PR dispatch",
+  );
+  const checkoutIndex = steps.findIndex((step) => step.uses?.startsWith("actions/checkout@"));
+  const validationIndex = steps.findIndex((step) => step.name === "Validate manual PR checkout");
+  const prepareIndex = steps.findIndex((step) => step.name === "Prepare E2E workspace");
+  if (
+    authenticationIndex < 0 ||
+    checkoutIndex < 0 ||
+    validationIndex < 0 ||
+    prepareIndex < 0 ||
+    authenticationIndex >= checkoutIndex ||
+    checkoutIndex >= validationIndex ||
+    validationIndex >= prepareIndex
+  ) {
+    errors.push("Manual PR authorization and validation must surround checkout before preparation");
+  }
+
+  const authentication = authenticationIndex >= 0 ? steps[authenticationIndex] : {};
+  if (authentication.if !== "${{ inputs.checkout_sha != '' }}") {
+    errors.push("Manual PR authentication must be activated only by checkout_sha");
+  }
+  const authEnvironment = {
+    ACTOR: "${{ github.actor }}",
+    ALLOW_JETSON_DISPATCH: "${{ inputs.allow_jetson_dispatch && 'true' || 'false' }}",
+    BASE_SHA: "${{ inputs.base_sha }}",
+    CHECKOUT_REPOSITORY: "${{ inputs.checkout_repository }}",
+    CHECKOUT_SHA: "${{ inputs.checkout_sha }}",
+    EXPECTED_WORKFLOW_SHA: "${{ inputs.workflow_sha }}",
+    GITHUB_TOKEN: "${{ github.token }}",
+    INCLUDE_LAUNCHABLE: "${{ inputs.include_staging_brev_launchable }}",
+    JOBS: "${{ inputs.jobs }}",
+    PR_NUMBER: "${{ inputs.pr_number }}",
+    REVIEW_REASON: "${{ inputs.review_reason }}",
+    RUN_ATTEMPT: "${{ github.run_attempt }}",
+    TARGETS: "${{ inputs.targets }}",
+    TRIGGERING_ACTOR: "${{ github.triggering_actor }}",
+    WORKFLOW_EVENT: "${{ github.event_name }}",
+    WORKFLOW_REF: "${{ github.ref }}",
+    WORKFLOW_SHA: "${{ github.workflow_sha }}",
+  };
+  for (const [name, value] of Object.entries(authEnvironment)) {
+    if (authentication.env?.[name] !== value)
+      errors.push(`Manual PR authentication must bind ${name}`);
+  }
+  const authSource = String(authentication.run ?? "");
+  const acceptedJobCases = [
+    "::false:false",
+    ...PR_E2E_MANUAL_CONTROLLER_JOB_IDS.map((jobId) => `${jobId}::false:false`),
+    ":jetson-nvmap-gpu:false:true",
+  ].join(" | ");
+  const acceptedNames = [
+    ...PR_E2E_MANUAL_CONTROLLER_JOB_IDS,
+    "jetson-nvmap-gpu with its dispatch flag",
+  ];
+  const acceptedJobNames = `${acceptedNames.slice(0, -1).join(", ")}, or ${acceptedNames.at(-1)}`;
+  for (const fragment of [
+    '"$WORKFLOW_EVENT" == "workflow_dispatch"',
+    '"$WORKFLOW_REF" == "refs/heads/main"',
+    '"$RUN_ATTEMPT" == "1"',
+    '"$PR_NUMBER" =~ ^[1-9][0-9]*$',
+    '"$CHECKOUT_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$',
+    '"$CHECKOUT_SHA" =~ ^[a-f0-9]{40}$',
+    '"$BASE_SHA" =~ ^[a-f0-9]{40}$',
+    '"$REVIEW_REASON" =~ ^[[:print:]]+$',
+    "${#REVIEW_REASON} >= 10",
+    "${#REVIEW_REASON} <= 500",
+    '"$EXPECTED_WORKFLOW_SHA" == "$WORKFLOW_SHA"',
+    "Manual PR E2E requires a repository maintainer or administrator",
+    `${acceptedJobCases}) ;;`,
+    `Manual PR E2E accepts only empty selectors, ${acceptedJobNames}`,
+    "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}",
+    `[[ "$(jq -r '.head.repo.full_name // ""' <<< "$pull_json")" == "$CHECKOUT_REPOSITORY" ]]`,
+    `[[ "$(jq -r '.head.sha' <<< "$pull_json")" == "$CHECKOUT_SHA" ]]`,
+    `[[ "$(jq -r '.base.sha' <<< "$pull_json")" == "$BASE_SHA" ]]`,
+  ]) {
+    if (!authSource.includes(fragment))
+      errors.push(`Manual PR authentication must retain ${fragment}`);
+  }
+
+  const validation = validationIndex >= 0 ? steps[validationIndex] : {};
+  if (validation.if !== "${{ inputs.checkout_sha != '' }}") {
+    errors.push("Manual PR checkout validation must be activated only by checkout_sha");
+  }
+  const validationSource = String(validation.run ?? "");
+  for (const fragment of [
+    '"$(git rev-parse --verify HEAD)" == "$CHECKOUT_SHA"',
+    "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}",
+    "pull request must still be open",
+    "checkout_repository changed before execution",
+    "checkout_sha changed before execution",
+    "base_sha changed before execution",
+  ]) {
+    if (!validationSource.includes(fragment)) {
+      errors.push(`Manual PR checkout validation must retain ${fragment}`);
+    }
+  }
+
+  for (const [jobName, job] of Object.entries(workflow.jobs)) {
+    for (const step of job.steps ?? []) {
+      const trustedHermesFixtureCheckout =
+        jobName === "hermes-gpu-startup" &&
+        step.name === "Checkout trusted Hermes GPU runtime fixture" &&
+        step.with?.repository === "NVIDIA/NemoClaw" &&
+        step.with?.ref === "${{ github.workflow_sha }}";
+      const trustedReportHelperCheckout =
+        jobName === "report-to-pr" &&
+        step.name === "Check out the trusted E2E reporting helper" &&
+        step.with?.ref === "${{ github.workflow_sha }}";
+      const trustedLaunchableLaneCheckout =
+        jobName === "staging-brev-launchable" &&
+        step.name === "Checkout trusted Launchable lane" &&
+        step.with?.ref === "${{ github.workflow_sha }}";
+      const trustedPublicationCheckout =
+        jobName === "base-image-publication" &&
+        step.name === "Check out trusted E2E workflow" &&
+        step.if === PUBLICATION_REQUIRED_CONDITION &&
+        step.with?.ref === "${{ github.sha }}";
+      const trustedManagedImageRuntimeCheckout =
+        jobName === "managed-image-protected-runtime" &&
+        step.name === "Checkout trusted protected runtime qualification" &&
+        step.with?.repository === "${{ github.repository }}" &&
+        step.with?.ref === "${{ inputs.workflow_sha || github.workflow_sha }}";
+      const trustedLlamaCppPlanCheckout =
+        jobName === "llama-cpp-dgx-spark-plan" &&
+        step.name === "Checkout trusted llama.cpp plan compiler" &&
+        step.with?.repository === "${{ github.repository }}" &&
+        step.with?.ref === "${{ inputs.workflow_sha || github.workflow_sha }}";
+      const trustedLlamaCppQualificationCheckout =
+        jobName === "llama-cpp-dgx-spark-qualification" &&
+        step.name === "Checkout trusted llama.cpp qualification" &&
+        step.with?.repository === "${{ github.repository }}" &&
+        step.with?.ref === "${{ inputs.workflow_sha || github.workflow_sha }}";
+      const trustedJetsonControllerCheckout =
+        jobName === "jetson-nvmap-gpu" &&
+        step.name === "Check out trusted Jetson controller" &&
+        step.with?.repository === "NVIDIA/NemoClaw" &&
+        step.with?.ref === "${{ github.workflow_sha }}";
+      const trustedCheckout =
+        trustedHermesFixtureCheckout ||
+        trustedReportHelperCheckout ||
+        trustedLaunchableLaneCheckout ||
+        trustedPublicationCheckout ||
+        trustedManagedImageRuntimeCheckout ||
+        trustedLlamaCppPlanCheckout ||
+        trustedLlamaCppQualificationCheckout ||
+        trustedJetsonControllerCheckout;
+      if (
+        step.uses?.startsWith("actions/checkout@") &&
+        step.with?.ref !== "${{ inputs.checkout_sha || github.sha }}" &&
+        !trustedCheckout
+      ) {
+        errors.push(`${jobName} checkout must use the selected PR commit`);
+      }
+      if (
+        step.uses?.startsWith("actions/checkout@") &&
+        !trustedCheckout &&
+        step.with?.repository !== "${{ inputs.checkout_repository || github.repository }}"
+      ) {
+        errors.push(`${jobName} checkout must use the selected PR head repository`);
+      }
+    }
+  }
+}
+
+export function validateBaseImagePublicationGate(workflow: OperationsWorkflow): string[] {
+  const errors: string[] = [];
+  const job = workflow.jobs["base-image-publication"] ?? {};
+  const expectedJob = {
+    "runs-on": "ubuntu-latest",
+    "timeout-minutes": 55,
+    permissions: {
+      actions: "read",
+      contents: "read",
+    },
+    steps: [
+      {
+        id: "publication_mode",
+        name: "Classify base-image publication requirement",
+        env: {
+          CHECKOUT_SHA: "${{ inputs.checkout_sha }}",
+          EVENT_NAME: "${{ github.event_name }}",
+          REF: "${{ github.ref }}",
+          REPOSITORY: "${{ github.repository }}",
+        },
+        shell: "bash",
+        run: PUBLICATION_CLASSIFIER_SCRIPT,
+      },
+      {
+        name: "Check out trusted E2E workflow",
+        if: PUBLICATION_REQUIRED_CONDITION,
+        uses: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        with: {
+          ref: "${{ github.sha }}",
+          "fetch-depth": 0,
+          "persist-credentials": false,
+        },
+      },
+      {
+        name: "Set up Node for publication verification",
+        if: PUBLICATION_REQUIRED_CONDITION,
+        uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+        with: {
+          "node-version": 22,
+        },
+      },
+      {
+        name: "Verify applicable base-image publication",
+        if: PUBLICATION_REQUIRED_CONDITION,
+        env: {
+          EXPECTED_SHA: "${{ github.sha }}",
+          GITHUB_TOKEN: "${{ github.token }}",
+        },
+        run: "node --experimental-strip-types --no-warnings tools/e2e/base-image-publication.mts --wait-seconds 3000 --poll-seconds 30",
+      },
+    ],
+  };
+
+  if (!isDeepStrictEqual(job, expectedJob)) {
+    errors.push(
+      "base-image-publication job must preserve its exact trusted-mode classifier, minimal permissions, pinned checkout, and verifier boundary",
+    );
+  }
+  if (!needs(workflow.jobs["generate-matrix"] ?? {}).includes("base-image-publication")) {
+    errors.push("generate-matrix must wait for base-image-publication");
+  }
+  return errors;
+}
+
+function validatePrGateEvidenceProducers(errors: string[], workflow: OperationsWorkflow): void {
+  const requiredJobs = new Set(RISK_RULES.flatMap((rule) => rule.requiredJobs));
+  for (const jobId of requiredJobs) {
+    const job = workflow.jobs[jobId];
+    if (!job) {
+      errors.push(`Risk-plan job is missing from E2E workflow: ${jobId}`);
+      continue;
+    }
+    if (job.env?.E2E_JOB !== "1" || job.env?.E2E_TARGET_ID !== jobId) {
+      errors.push(`${jobId} must expose matching E2E job identity`);
+    }
+    if (typeof job.env?.E2E_ARTIFACT_DIR !== "string" || !job.env.E2E_ARTIFACT_DIR) {
+      errors.push(`${jobId} must expose an evidence artifact directory`);
+    }
+    const vitestSteps = (job.steps ?? []).filter((step) => {
+      const run = String(step.run ?? "");
+      return run.includes("npx vitest") || run.includes(LIVE_VITEST_HELPER);
+    });
+    if (
+      vitestSteps.length === 0 ||
+      vitestSteps.some((step) => {
+        const run = String(step.run);
+        return !run.includes(LIVE_VITEST_HELPER) && !run.includes(PR_GATE_REPORTER);
+      })
+    ) {
+      errors.push(`${jobId} must attach the risk-signal reporter to every Vitest invocation`);
+    }
+    const uploads = (job.steps ?? []).filter((step) => step.uses?.startsWith(E2E_ARTIFACT_ACTION));
+    if (uploads.length !== 1 || uploads[0]?.if !== "always()") {
+      errors.push(`${jobId} must always upload one evidence artifact`);
+    }
+  }
+}
+
+function validateAggregation(errors: string[], workflow: OperationsWorkflow): void {
+  const executionJobs = Object.keys(workflow.jobs).filter((name) => !META_JOBS.has(name));
+  const reportNeeds = needs(workflow.jobs["report-to-pr"] ?? {});
+  for (const name of executionJobs) {
+    if (!reportNeeds.includes(name)) errors.push(`report-to-pr must wait for ${name}`);
+  }
+  for (const name of reportNeeds) {
+    if (!executionJobs.includes(name)) errors.push(`report-to-pr waits for unknown job ${name}`);
+  }
+  const scorecardNeeds = needs(workflow.jobs.scorecard ?? {});
+  if (!sameMembers(scorecardNeeds, reportNeeds)) {
+    errors.push("scorecard needs must exactly match report-to-pr needs");
+  }
+}
+
+function validateIssueRoutingRetirement(errors: string[], workflow: OperationsWorkflow): void {
+  if ("notify-on-failure" in workflow.jobs) {
+    errors.push("notify-on-failure must remain retired");
+  }
+
+  if (
+    workflow.permissions === "write-all" ||
+    permissionMap(workflow.permissions).issues === "write"
+  ) {
+    errors.push("E2E workflow must not grant top-level issues: write");
+  }
+  if (
+    workflow.permissions === "write-all" ||
+    permissionMap(workflow.permissions)["pull-requests"] === "write"
+  ) {
+    errors.push("E2E workflow must not grant top-level pull-requests: write");
+  }
+
+  for (const [name, job] of Object.entries(workflow.jobs)) {
+    const permissions = permissionMap(job.permissions);
+    const jobSource = executableSource(job);
+    if (job.permissions === "write-all" || permissions.issues === "write") {
+      errors.push(`${name} must not hold issues: write`);
+    }
+    if (name === "report-to-pr") {
+      if (
+        job.permissions === "write-all" ||
+        permissions.actions !== "read" ||
+        permissions.contents !== "read" ||
+        permissions["pull-requests"] !== "write" ||
+        Object.keys(permissions).length !== 3
+      ) {
+        errors.push(
+          "report-to-pr must hold only actions: read, contents: read, and pull-requests: write",
+        );
+      }
+      if (
+        job.if !==
+        "${{ always() && github.event_name == 'workflow_dispatch' && inputs.checkout_sha == '' }}"
+      ) {
+        errors.push("report-to-pr must run only for manual workflow dispatches");
+      }
+      const report = findStep(job, "Post E2E target results to PR");
+      const steps = job.steps ?? [];
+      const reportCheckout = steps.find((step) => step.uses?.startsWith("actions/checkout@"));
+      if (
+        steps.length !== 2 ||
+        !reportCheckout ||
+        steps.indexOf(reportCheckout) !== 0 ||
+        reportCheckout.with?.ref !== "${{ github.workflow_sha }}" ||
+        reportCheckout.with?.["persist-credentials"] !== false
+      ) {
+        errors.push(
+          "report-to-pr must first check out the trusted workflow revision, then post its PR comment",
+        );
+      }
+      requireNode24GithubScript(errors, report, "report-to-pr");
+      const reportScript = String(report.with?.script ?? "");
+      if (!passesNeedsAsEnvironmentData(report)) {
+        errors.push(
+          "report-to-pr must pass needs as environment data without script interpolation",
+        );
+      }
+      const commentCalls = jobSource.match(/github\.rest\.issues\.createComment\s*\(/gu);
+      const issueNamespaceReferences = reportScript.match(/github\.rest\.issues\b/gu);
+      const prScopedComment =
+        /await\s+github\.rest\.issues\.createComment\(\{\s*owner:\s*context\.repo\.owner,\s*repo:\s*context\.repo\.repo,\s*issue_number:\s*prNumber,\s*body:\s*report\.body,?\s*\}\);/u;
+      if (commentCalls?.length !== 1 || !prScopedComment.test(reportScript)) {
+        errors.push(
+          "report-to-pr must limit issue mutation to one validated PR-scoped createComment call",
+        );
+      }
+      if (!/\bconst\s+prNumber\s*=\s*await\s+resolveReportPr\(/u.test(reportScript)) {
+        errors.push("report-to-pr must derive prNumber from the trusted resolveReportPr call");
+      }
+      if (!/\bconst\s+report\s*=\s*renderE2eReport\(/u.test(reportScript)) {
+        errors.push("report-to-pr must derive report from the trusted renderE2eReport call");
+      }
+      if (
+        issueNamespaceReferences?.length !== 1 ||
+        ISSUE_MUTATION_BEYOND_COMMENT.test(jobSource) ||
+        GENERIC_GITHUB_WRITE_SURFACE.test(jobSource)
+      ) {
+        errors.push("report-to-pr must not use issue mutations or generic GitHub write surfaces");
+      }
+      continue;
+    }
+
+    if (job.permissions === "write-all" || permissions["pull-requests"] === "write") {
+      errors.push(`${name} must not hold pull-requests: write`);
+    }
+
+    // Deny these generic API clients by default. The scorecard's single fixed
+    // Slack webhook call is the only allowlisted use outside report-to-pr;
+    // validateScorecard binds webhookUrl to a step-scoped Slack secret. This
+    // textual scan is defense in depth; token permissions are the hard boundary.
+    const sourceWithoutSlackPublisher =
+      name === "scorecard"
+        ? jobSource.replace(/\bfetch\s*\(\s*webhookUrl\s*,/u, "validatedSlackFetch(")
+        : jobSource;
+
+    if (
+      ISSUE_API_REFERENCE.test(jobSource) ||
+      GENERIC_ISSUE_REST_MUTATION.test(jobSource) ||
+      GENERIC_ISSUE_GRAPHQL_MUTATION.test(jobSource)
+    ) {
+      errors.push(`${name} must not mutate GitHub issues`);
+    }
+    if (GENERIC_GITHUB_WRITE_SURFACE.test(sourceWithoutSlackPublisher)) {
+      errors.push(`${name} must not use unvalidated generic write surfaces`);
+    }
+  }
+}
+
+function validateScorecard(errors: string[], workflow: OperationsWorkflow): void {
+  const dispatchInput = workflow.on?.workflow_dispatch?.inputs?.post_to_slack;
+  if (dispatchInput?.type !== "boolean" || dispatchInput.default !== false) {
+    errors.push("workflow_dispatch post_to_slack must be an opt-in boolean");
+  }
+
+  const job = workflow.jobs.scorecard ?? {};
+  const permissions = permissionMap(job.permissions);
+  if (
+    job.if !==
+    "${{ always() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.checkout_sha == '')) }}"
+  ) {
+    errors.push("scorecard must run after push and direct-main manual E2E executions");
+  }
+  if (
+    permissions.actions !== "read" ||
+    permissions.contents !== "read" ||
+    Object.keys(permissions).length !== 2
+  ) {
+    errors.push("scorecard permissions must be actions: read and contents: read");
+  }
+  if (job.env && Object.keys(job.env).length > 0) {
+    errors.push("scorecard must not expose credentials at job scope");
+  }
+
+  const checkout = findStep(job, "Checkout scorecard builders");
+  requirePinnedAction(errors, checkout, "scorecard checkout");
+  if (checkout.with?.["persist-credentials"] !== false) {
+    errors.push("scorecard checkout must disable persisted credentials");
+  }
+  const sparseCheckout = String(checkout.with?.["sparse-checkout"] ?? "")
+    .split(/\r?\n/u)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (
+    sparseCheckout.length !== 3 ||
+    !sparseCheckout.includes("ci/onboard-performance-budget.json") ||
+    !sparseCheckout.includes("scripts/audit-test-runtime.mts") ||
+    !sparseCheckout.includes("scripts/scorecard")
+  ) {
+    errors.push(
+      "scorecard checkout must be limited to runtime and scorecard builders and budget config",
+    );
+  }
+
+  const download = findStep(job, "Download E2E progress artifacts");
+  requirePinnedAction(errors, download, "scorecard artifact download");
+  if (
+    download.uses !== DOWNLOAD_ARTIFACT_ACTION ||
+    download["continue-on-error"] !== true ||
+    download.with?.pattern !== "e2e-*" ||
+    download.with?.path !== "${{ runner.temp }}/e2e-runtime-audit"
+  ) {
+    errors.push(
+      "scorecard must download this run's E2E artifacts into the runtime audit directory",
+    );
+  }
+
+  const generate = findStep(job, "Generate E2E scorecard");
+  requireNode24GithubScript(errors, generate, "scorecard generator");
+  const generateScript = String(generate.with?.script ?? "");
+  if (!passesNeedsAsEnvironmentData(generate)) {
+    errors.push(
+      "scorecard generator must pass needs as environment data without script interpolation",
+    );
+  }
+  for (const fragment of [
+    "scripts/scorecard/coordinate-scorecard.mts",
+    "buildScorecard",
+    "scripts/scorecard/analyze-trace-timing.mts",
+    "traceTiming.buildTraceTimingResult",
+    "buildTraceTimingResult({ github, context, core })",
+    "trace.budgetWarningMessage",
+    "core.warning(trace.budgetWarningMessage)",
+    "scripts/scorecard/summarize-jobs.mts",
+    "scorecardJobs.loadWorkflowRunJobs",
+    "scripts/audit-test-runtime.mts",
+    "runtimeAudit.auditTestRuntime",
+    "runtimeAudit.collectRuntimeHistorySamples",
+    "runtimeAudit.formatRuntimeAuditSummary",
+    "scripts/scorecard/analyze-runtime-history.mts",
+    "runtimeHistory.buildRuntimeHistory",
+    "scripts/scorecard/analyze-first-turn-latency.mts",
+    "firstTurnLatency.readCurrentFirstTurnLatencySample",
+    "currentFirstTurnLatency",
+    "runtimeHistory.loadPriorPushSummaries",
+    "core.summary",
+    "scorecardData",
+    "slackData",
+  ]) {
+    if (!generateScript.includes(fragment))
+      errors.push(`scorecard generator must retain ${fragment}`);
+  }
+  if (
+    generate.env?.EXPLICIT_ONLY_JOBS !== "${{ needs.generate-matrix.outputs.explicit_only_jobs }}"
+  ) {
+    errors.push(
+      "scorecard generator must derive jobs omitted from the manual run from workflow inventory",
+    );
+  }
+  if (generate.env?.RUNTIME_ARTIFACTS !== "${{ runner.temp }}/e2e-runtime-audit") {
+    errors.push("scorecard generator must read the downloaded runtime audit directory");
+  }
+  if (generate.env?.RUNTIME_SUMMARY_FILE !== "${{ runner.temp }}/e2e-runtime-summary.json") {
+    errors.push("scorecard generator must write the bounded runtime summary under runner temp");
+  }
+
+  const slack = findStep(job, "Post scorecard to Slack");
+  requirePinnedAction(errors, slack, "scorecard Slack publisher");
+  if (
+    slack.if !== "${{ steps.scorecard.outputs.slackData != '' && github.ref == 'refs/heads/main' }}"
+  ) {
+    errors.push("scorecard Slack publisher must expose webhook secrets only on main");
+  }
+  const expectedSlackEnv = [
+    "SLACK_WEBHOOK_URL_DAILY",
+    "SLACK_WEBHOOK_URL_FULLRUN",
+    "SLACK_WEBHOOK_URL_PREVIEW",
+  ];
+  for (const name of expectedSlackEnv) {
+    if (!String(slack.env?.[name] ?? "").includes(`secrets.${name}`)) {
+      errors.push(`scorecard Slack publisher must scope ${name} to its step`);
+    }
+  }
+  if (slack.env?.POST_TO_SLACK !== "${{ inputs.post_to_slack }}") {
+    errors.push("scorecard Slack publisher must honor the post_to_slack opt-in");
+  }
+  if (slack.env?.SLACK_DATA !== "${{ steps.scorecard.outputs.slackData }}") {
+    errors.push("scorecard Slack publisher must consume the precomputed Slack payload");
+  }
+  const slackScript = String(slack.with?.script ?? "");
+  for (const fragment of [
+    "process.env.SLACK_DATA",
+    "Invalid precomputed Slack payload",
+    "Selective dispatch without post_to_slack",
+    "SLACK_WEBHOOK_URL_PREVIEW",
+    "const webhookUrl = process.env[envByChannel[channel]];",
+    "await fetch(webhookUrl, {",
+  ]) {
+    if (!slackScript.includes(fragment))
+      errors.push(`scorecard Slack publisher must retain ${fragment}`);
+  }
+  for (const forbidden of ["GITHUB_WORKSPACE", "require(", "scripts/scorecard/"]) {
+    if (slackScript.includes(forbidden)) {
+      errors.push(`scorecard Slack publisher must not execute workflow-ref code via ${forbidden}`);
+    }
+  }
+
+  const runtimeUpload = findStep(job, "Upload E2E runtime summary");
+  requirePinnedAction(errors, runtimeUpload, "scorecard runtime summary upload");
+  if (
+    runtimeUpload.if !== "${{ always() && github.event_name == 'push' }}" ||
+    !String(runtimeUpload.uses ?? "").startsWith(E2E_ARTIFACT_ACTION) ||
+    runtimeUpload.with?.name !== "e2e-runtime-summary" ||
+    runtimeUpload.with?.path !== "${{ runner.temp }}/e2e-runtime-summary.json"
+  ) {
+    errors.push("scorecard must upload only the bounded push runtime summary");
+  }
+}
+
+function validateTraceTiming(errors: string[], workflow: OperationsWorkflow): void {
+  const job = workflow.jobs["cloud-onboard"] ?? {};
+  if (job.env?.NEMOCLAW_TRACE_DIR !== undefined) {
+    errors.push("cloud-onboard trace directory must not use unavailable job-level contexts");
+  }
+  const configure = findStep(job, "Configure cloud-onboard trace directory");
+  for (const fragment of ['"${RUNNER_TEMP}/nemoclaw-cloud-onboard-traces"', '>> "${GITHUB_ENV}"']) {
+    if (!String(configure.run ?? "").includes(fragment)) {
+      errors.push(`cloud-onboard trace directory setup must retain ${fragment}`);
+    }
+  }
+  const sanitize = findStep(job, "Build trusted cloud-onboard timing summary");
+  if (sanitize.if !== "always()") {
+    errors.push("cloud-onboard trace sanitizer must always run");
+  }
+  const script = sanitize.run ?? "";
+  for (const fragment of [
+    'expected_trace_dir="${RUNNER_TEMP}/nemoclaw-cloud-onboard-traces"',
+    '[ "${NEMOCLAW_TRACE_DIR}" != "${expected_trace_dir}" ]',
+    "scripts/e2e/sanitize-trace-timing.py",
+    '"${NEMOCLAW_TRACE_DIR}"',
+    '"${E2E_ARTIFACT_DIR}"',
+  ]) {
+    if (!script.includes(fragment))
+      errors.push(`cloud-onboard trace sanitizer must retain ${fragment}`);
+  }
+  const sourceGuardIndex = script.indexOf('[ "${NEMOCLAW_TRACE_DIR}" != "${expected_trace_dir}" ]');
+  const sanitizeCommandIndex = script.indexOf("python3 scripts/e2e/sanitize-trace-timing.py");
+  if (
+    sourceGuardIndex === -1 ||
+    sanitizeCommandIndex === -1 ||
+    sourceGuardIndex > sanitizeCommandIndex
+  ) {
+    errors.push("cloud-onboard trace sanitizer must verify source path before reading traces");
+  }
+  const steps = job.steps ?? [];
+  const configureIndex = steps.findIndex(
+    (step) => step.name === "Configure cloud-onboard trace directory",
+  );
+  const runIndex = steps.findIndex((step) => step.name === "Run cloud-onboard live Vitest test");
+  const sanitizeIndex = steps.findIndex(
+    (step) => step.name === "Build trusted cloud-onboard timing summary",
+  );
+  const cleanup = findStep(job, "Delete raw cloud-onboard traces");
+  const cleanupIndex = steps.findIndex((step) => step.name === "Delete raw cloud-onboard traces");
+  const uploadIndex = steps.findIndex((step) => step.name === "Upload cloud-onboard artifacts");
+  if (cleanup.if !== "always()") {
+    errors.push("cloud-onboard raw trace cleanup must always run");
+  }
+  for (const fragment of [
+    'expected_trace_dir="${RUNNER_TEMP}/nemoclaw-cloud-onboard-traces"',
+    '[ "${NEMOCLAW_TRACE_DIR}" != "${expected_trace_dir}" ]',
+    'rm -rf -- "${NEMOCLAW_TRACE_DIR}"',
+  ]) {
+    if (!String(cleanup.run ?? "").includes(fragment)) {
+      errors.push(`cloud-onboard raw trace cleanup must retain ${fragment}`);
+    }
+  }
+  if (
+    !(
+      configureIndex >= 0 &&
+      configureIndex < runIndex &&
+      runIndex < sanitizeIndex &&
+      sanitizeIndex < cleanupIndex &&
+      cleanupIndex < uploadIndex
+    )
+  ) {
+    errors.push(
+      "cloud-onboard must test, sanitize raw traces, delete raw traces, then upload trusted artifacts",
+    );
+  }
+}
+
+function validateUnifiedAdvisorBoundary(errors: string[], advisorPath: string): void {
+  const source = readFileSync(advisorPath, "utf8");
+  const advisor = YAML.parse(source) as OperationsWorkflow;
+  const permissionBlocks = [
+    advisor.permissions,
+    ...Object.values(advisor.jobs ?? {}).map((job) => job.permissions),
+  ];
+  if (
+    permissionBlocks.some(
+      (permissions) =>
+        permissions === "write-all" || permissionMap(permissions).actions === "write",
+    )
+  ) {
+    errors.push("Unified advisor must not hold actions: write");
+  }
+  if (/createWorkflowDispatch|workflow_dispatches/u.test(source)) {
+    errors.push("Unified advisor must not auto-dispatch workflows");
+  }
+}
+
+export function validateE2eOperationsWorkflow(
+  workflow: OperationsWorkflow,
+  advisorPath = DEFAULT_ADVISOR_PATH,
+): string[] {
+  const errors: string[] = [];
+  errors.push(...validateBaseImagePublicationGate(workflow));
+  validateManualPrDispatch(errors, workflow);
+  validatePrGateEvidenceProducers(errors, workflow);
+  validateAggregation(errors, workflow);
+  validateIssueRoutingRetirement(errors, workflow);
+  validateScorecard(errors, workflow);
+  validateTraceTiming(errors, workflow);
+  validateUnifiedAdvisorBoundary(errors, advisorPath);
+  return errors;
+}
+
+export function validateE2eOperationsWorkflowBoundary(
+  workflowPath = DEFAULT_WORKFLOW_PATH,
+  advisorPath = DEFAULT_ADVISOR_PATH,
+): string[] {
+  return validateE2eOperationsWorkflow(readE2eOperationsWorkflow(workflowPath), advisorPath);
+}

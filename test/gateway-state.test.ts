@@ -5,19 +5,30 @@
 // Covers ARM64/non-TTY fallback paths where `openshell status` returns empty output.
 // See: https://github.com/NVIDIA/NemoClaw/issues/1711
 
-import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+import { mergeLivePolicyIntoSandboxOutput } from "../src/lib/actions/sandbox/gateway-state.js";
 import {
+  getGatewayReuseState,
+  getReportedGatewayName,
+  getSandboxStateFromOutputs,
+  hasActiveGatewayInfo,
+  hasStaleGateway,
   isGatewayConnected,
   isGatewayHealthy,
-  getGatewayReuseState,
-  getSandboxStateFromOutputs,
-  hasStaleGateway,
-  hasActiveGatewayInfo,
-  getReportedGatewayName,
-  shouldSelectNamedGatewayForReuse,
   parseSandboxPhase,
+  shouldSelectNamedGatewayForReuse,
 } from "../src/lib/state/gateway.js";
-import { mergeLivePolicyIntoSandboxOutput } from "../dist/lib/actions/sandbox/gateway-state.js";
+
+const OPENSHELL_STATUS_ERROR_CONTRACT = JSON.parse(
+  readFileSync(new URL("./fixtures/openshell-status-errors-v0.0.99.json", import.meta.url), "utf8"),
+) as {
+  producer: string;
+  openshellVersion: string;
+  command: string;
+  connectionRefusal: string;
+  nonLifecycleError: string;
+};
 
 // Realistic CLI outputs
 const STATUS_CONNECTED = `
@@ -48,6 +59,14 @@ const STATUS_SERVER_STATUS_REFUSED_ANSI = `\x1b[1mServer Status\x1b[0m
 \x1b[2mGateway:\x1b[0m nemoclaw
 \x1b[2mServer:\x1b[0m https://127.0.0.1:8080/
 \x1b[31mError: Connection refused (os error 61)\x1b[0m
+`;
+
+const STATUS_SERVER_STATUS_AUTH_ERROR = `
+Server Status
+
+Gateway: nemoclaw
+Server: https://127.0.0.1:8080/
+Error: authentication failed
 `;
 
 const GW_INFO_BASE = `
@@ -163,6 +182,10 @@ describe("isGatewayConnected", () => {
     expect(isGatewayConnected(STATUS_SERVER_STATUS_REFUSED_ANSI)).toBe(false);
   });
 
+  it("does not treat non-connection status errors as connected", () => {
+    expect(isGatewayConnected(STATUS_SERVER_STATUS_AUTH_ERROR)).toBe(false);
+  });
+
   it("returns false for empty string", () => {
     expect(isGatewayConnected("")).toBe(false);
   });
@@ -222,6 +245,27 @@ describe("isGatewayHealthy", () => {
     const ansiOnly = "\x1b[0m\x1b[32m";
     expect(isGatewayHealthy(ansiOnly, GW_INFO_NAMED, GW_INFO_ACTIVE)).toBe(true);
   });
+
+  // Per-port gateway (#4422): a second sandbox onboarded on a non-default
+  // NEMOCLAW_GATEWAY_PORT runs gateway `nemoclaw-<port>`. Health/reuse
+  // classification must match against that resolved name, not the `nemoclaw`
+  // singleton, so the second sandbox recognizes its own gateway.
+  it("recognizes a non-default-port gateway under its resolved name", () => {
+    const status = STATUS_CONNECTED.replace("nemoclaw", "nemoclaw-8081");
+    const info = GW_INFO_NAMED.replace("nemoclaw", "nemoclaw-8081");
+    expect(isGatewayHealthy(status, info, info, "nemoclaw-8081")).toBe(true);
+    expect(hasStaleGateway(info, "nemoclaw-8081")).toBe(true);
+    expect(getGatewayReuseState(status, info, info, "nemoclaw-8081")).toBe("healthy");
+  });
+
+  it("does not match a non-default-port gateway against the nemoclaw singleton", () => {
+    const status = STATUS_CONNECTED.replace("nemoclaw", "nemoclaw-8081");
+    const info = GW_INFO_NAMED.replace("nemoclaw", "nemoclaw-8081");
+    // The default-named classifier sees a foreign gateway, not its own.
+    expect(isGatewayHealthy(status, info, info)).toBe(false);
+    expect(hasStaleGateway(info)).toBe(false);
+    expect(getGatewayReuseState(status, info, info)).toBe("foreign-active");
+  });
 });
 
 describe("parseSandboxPhase", () => {
@@ -258,6 +302,24 @@ describe("parseSandboxPhase", () => {
 });
 
 describe("getGatewayReuseState", () => {
+  it("classifies the pinned OpenShell status-error contract without making non-lifecycle failures stale (#7087)", () => {
+    expect(OPENSHELL_STATUS_ERROR_CONTRACT.producer).toBe("OpenShell");
+    expect(OPENSHELL_STATUS_ERROR_CONTRACT.openshellVersion).toBe("0.0.99");
+    expect(OPENSHELL_STATUS_ERROR_CONTRACT.command).toBe("openshell status");
+    expect(
+      getGatewayReuseState(
+        OPENSHELL_STATUS_ERROR_CONTRACT.connectionRefusal,
+        "",
+        "",
+        "nemoclaw",
+        "nemoclaw",
+      ),
+    ).toBe("stale");
+    expect(getGatewayReuseState(OPENSHELL_STATUS_ERROR_CONTRACT.nonLifecycleError, "", "")).toBe(
+      "missing",
+    );
+  });
+
   it("returns 'healthy' for normal connected state", () => {
     expect(getGatewayReuseState(STATUS_CONNECTED, GW_INFO_NAMED, GW_INFO_ACTIVE)).toBe("healthy");
   });
@@ -272,14 +334,50 @@ describe("getGatewayReuseState", () => {
     );
   });
 
+  it("returns 'stale' when selected gateway status is refused but gateway info is unavailable (#7087)", () => {
+    expect(getGatewayReuseState(STATUS_SERVER_STATUS_REFUSED_ANSI, "", "")).toBe("stale");
+  });
+
+  it("does not classify selected-gateway non-connection errors as stale", () => {
+    expect(getGatewayReuseState(STATUS_SERVER_STATUS_AUTH_ERROR, "", "")).toBe("missing");
+  });
+
+  it.each([
+    ["authentication", "Error: authentication failed"],
+    ["configuration", "Error: invalid gateway configuration"],
+    ["TLS", "Error: transport error: invalid peer certificate: UnknownIssuer"],
+    ["CLI", "Error: unexpected argument '--gateway'"],
+  ])("keeps named active metadata non-stale for mixed stdout and %s stderr", (_kind, stderr) => {
+    const mixedStatusOutput = [STATUS_SERVER_STATUS_ONLY.trim(), stderr].join("\n");
+
+    expect(getGatewayReuseState(mixedStatusOutput, GW_INFO_NAMED, GW_INFO_ACTIVE)).toBe("missing");
+  });
+
+  it.each([
+    "Connection refused",
+    "transport error",
+    "Connection reset",
+    "Connection aborted",
+    "Connection closed",
+  ])("uses explicit status error evidence before treating %s as stale", (detail) => {
+    const errorOutput = [STATUS_SERVER_STATUS_ONLY.trim(), `Error: ${detail}`].join("\n");
+    const informationalOutput = [
+      STATUS_SERVER_STATUS_ONLY.trim(),
+      `Previous diagnostic: ${detail}`,
+    ].join("\n");
+
+    expect(getGatewayReuseState(errorOutput, GW_INFO_NAMED, GW_INFO_ACTIVE)).toBe("stale");
+    expect(getGatewayReuseState(informationalOutput, GW_INFO_NAMED, GW_INFO_ACTIVE)).toBe(
+      "healthy",
+    );
+  });
+
   it("returns 'foreign-active' when connected to a different gateway", () => {
     expect(getGatewayReuseState(STATUS_FOREIGN, "", "")).toBe("foreign-active");
   });
 
   it("returns 'foreign-active' when status is empty but active gateway info is foreign", () => {
-    expect(getGatewayReuseState("", GW_INFO_NAMED, GW_INFO_FOREIGN_ACTIVE)).toBe(
-      "foreign-active",
-    );
+    expect(getGatewayReuseState("", GW_INFO_NAMED, GW_INFO_FOREIGN_ACTIVE)).toBe("foreign-active");
   });
 
   it("returns 'stale' when named gateway exists but no active endpoint", () => {
@@ -330,9 +428,7 @@ describe("shouldSelectNamedGatewayForReuse", () => {
   });
 
   it("returns true when status is empty but active gateway info is foreign", () => {
-    expect(shouldSelectNamedGatewayForReuse("", GW_INFO_NAMED, GW_INFO_FOREIGN_ACTIVE)).toBe(
-      true,
-    );
+    expect(shouldSelectNamedGatewayForReuse("", GW_INFO_NAMED, GW_INFO_FOREIGN_ACTIVE)).toBe(true);
   });
 
   it("returns false when the named NemoClaw gateway is already active", () => {

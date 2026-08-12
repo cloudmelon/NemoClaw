@@ -1,19 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-// Import from compiled dist/ so coverage is attributed correctly.
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+// Import source directly so tests cannot pass against a stale build.
 import {
-  parseFrontmatter,
-  resolveSkillPaths,
   collectFiles,
+  parseFrontmatter,
   postInstall,
-  validateRelativePath,
+  resolveSkillPaths,
   shellQuote,
-} from "../../dist/lib/skill-install";
+  validateRelativePath,
+  verifyInstall,
+} from "./skill-install";
 
 describe("parseFrontmatter", () => {
   it("extracts name from valid frontmatter", () => {
@@ -38,13 +39,15 @@ describe("parseFrontmatter", () => {
   });
 
   it("rejects malformed YAML", () => {
-    expect(() =>
-      parseFrontmatter("---\nname: ok\ndescription: [broken\n---\n"),
-    ).toThrow("not valid YAML");
+    expect(() => parseFrontmatter("---\nname: ok\ndescription: [broken\n---\n")).toThrow(
+      "not valid YAML",
+    );
   });
 
   it("rejects non-mapping frontmatter", () => {
-    expect(() => parseFrontmatter("---\n- just\n- a list\n---\n")).toThrow("must be a YAML mapping");
+    expect(() => parseFrontmatter("---\n- just\n- a list\n---\n")).toThrow(
+      "must be a YAML mapping",
+    );
   });
 
   it("throws when frontmatter is missing entirely", () => {
@@ -71,9 +74,14 @@ describe("parseFrontmatter", () => {
   });
 
   it("rejects names with invalid characters", () => {
-    expect(() => parseFrontmatter("---\nname: my skill\n---\n")).toThrow("invalid characters");
-    expect(() => parseFrontmatter("---\nname: ../escape\n---\n")).toThrow("invalid characters");
-    expect(() => parseFrontmatter("---\nname: a/b\n---\n")).toThrow("invalid characters");
+    expect(() => parseFrontmatter("---\nname: my skill\n---\n")).toThrow("is invalid");
+    expect(() => parseFrontmatter("---\nname: ../escape\n---\n")).toThrow("is invalid");
+    expect(() => parseFrontmatter("---\nname: a/b\n---\n")).toThrow("is invalid");
+  });
+
+  it("rejects dot and double-dot as skill names in frontmatter", () => {
+    expect(() => parseFrontmatter("---\nname: .\n---\n")).toThrow("is invalid");
+    expect(() => parseFrontmatter("---\nname: ..\n---\n")).toThrow("is invalid");
   });
 });
 
@@ -188,15 +196,29 @@ describe("collectFiles", () => {
       cleanup();
     }
   });
+
+  it("rejects visible symlinks instead of following their targets", () => {
+    setup({ "SKILL.md": "---\nname: linked\n---\n" });
+    try {
+      symlinkSync("SKILL.md", join(tmpDir, "alias.md"));
+      const { files, unsupportedPaths } = collectFiles(tmpDir);
+      expect(files).toEqual(["SKILL.md"]);
+      expect(unsupportedPaths).toEqual(["alias.md"]);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("resolveSkillPaths", () => {
   it("returns OpenClaw defaults when agent is null", () => {
     const paths = resolveSkillPaths(null, "weather");
+    expect(paths.stateDir).toBe("/sandbox/.openclaw");
     expect(paths.uploadDir).toBe("/sandbox/.openclaw/skills/weather");
-    expect(paths.sessionFile).toBe(
-      "/sandbox/.openclaw/agents/main/sessions/sessions.json",
-    );
+    expect(paths.mirrorDir).toBe("$HOME/.openclaw/skills/weather");
+    expect(paths.uploadDirSharedWithAgent).toBe(false);
+    expect(paths.sessionFile).toBe("/sandbox/.openclaw/agents/main/sessions/sessions.json");
+    expect(paths.reloadsSkillsOnSessionStart).toBe(false);
     expect(paths.isOpenClaw).toBe(true);
   });
 
@@ -208,10 +230,12 @@ describe("resolveSkillPaths", () => {
       },
     };
     const paths = resolveSkillPaths(agent, "my-skill");
+    expect(paths.stateDir).toBe("/sandbox/.openclaw");
     expect(paths.uploadDir).toBe("/sandbox/.openclaw/skills/my-skill");
-    expect(paths.sessionFile).toBe(
-      "/sandbox/.openclaw/agents/main/sessions/sessions.json",
-    );
+    expect(paths.mirrorDir).toBe("$HOME/.openclaw/skills/my-skill");
+    expect(paths.uploadDirSharedWithAgent).toBe(false);
+    expect(paths.sessionFile).toBe("/sandbox/.openclaw/agents/main/sessions/sessions.json");
+    expect(paths.reloadsSkillsOnSessionStart).toBe(false);
     expect(paths.isOpenClaw).toBe(true);
   });
 
@@ -223,8 +247,32 @@ describe("resolveSkillPaths", () => {
       },
     };
     const paths = resolveSkillPaths(agent, "demo-skill");
+    expect(paths.stateDir).toBe("/sandbox/.hermes");
     expect(paths.uploadDir).toBe("/sandbox/.hermes/skills/demo-skill");
+    expect(paths.mirrorDir).toBeNull();
+    expect(paths.uploadDirSharedWithAgent).toBe(false);
     expect(paths.sessionFile).toBeNull();
+    expect(paths.reloadsSkillsOnSessionStart).toBe(true);
+    expect(paths.isOpenClaw).toBe(false);
+  });
+
+  it("installs Deep Agents skills directly into the agent skills dir dcode loads (#7634)", () => {
+    // dcode's user skill dir is ~/.deepagents/{agent}/skills (HOME=/sandbox,
+    // DEFAULT_AGENT_NAME="agent"); it never scans ~/.deepagents/skills, so the
+    // upload dir alone leaves the skill installed but unloadable.
+    const agent = {
+      name: "langchain-deepagents-code",
+      configPaths: {
+        dir: "/sandbox/.deepagents",
+      },
+    };
+    const paths = resolveSkillPaths(agent, "note-summarizer");
+    expect(paths.stateDir).toBe("/sandbox/.deepagents");
+    expect(paths.uploadDir).toBe("/sandbox/.deepagents/agent/skills/note-summarizer");
+    expect(paths.mirrorDir).toBeNull();
+    expect(paths.uploadDirSharedWithAgent).toBe(true);
+    expect(paths.sessionFile).toBeNull();
+    expect(paths.reloadsSkillsOnSessionStart).toBe(false);
     expect(paths.isOpenClaw).toBe(false);
   });
 
@@ -236,13 +284,39 @@ describe("resolveSkillPaths", () => {
       },
     };
     const paths = resolveSkillPaths(agent, "test-skill");
+    expect(paths.stateDir).toBe("/sandbox/.future");
     expect(paths.uploadDir).toBe("/sandbox/.future/skills/test-skill");
+    expect(paths.mirrorDir).toBeNull();
+    expect(paths.uploadDirSharedWithAgent).toBe(false);
     expect(paths.sessionFile).toBeNull();
+    expect(paths.reloadsSkillsOnSessionStart).toBe(false);
     expect(paths.isOpenClaw).toBe(false);
   });
 });
 
 describe("postInstall", () => {
+  it("tells Hermes users to start a fresh session without restarting the gateway", () => {
+    const paths = resolveSkillPaths(
+      { name: "hermes", configPaths: { dir: "/sandbox/.hermes" } },
+      "weather",
+    );
+    const result = postInstall(
+      { configFile: "/tmp/ssh-config", sandboxName: "alpha" },
+      paths,
+      "/unused",
+      {
+        sshExecImpl: () => {
+          throw new Error("Hermes activation must not require an SSH mutation");
+        },
+      },
+    );
+
+    expect(result).toEqual({
+      success: true,
+      messages: ["Start a new chat session to load the skill; a gateway restart is not required."],
+    });
+  });
+
   it("refreshes OpenClaw sessions after installing an updated skill", () => {
     const skillDir = mkdtempSync(join(tmpdir(), "skill-postinstall-"));
     const commands: string[] = [];
@@ -267,5 +341,96 @@ describe("postInstall", () => {
     } finally {
       rmSync(skillDir, { recursive: true, force: true });
     }
+  });
+
+  it("mirrors the uploaded skill into the OpenClaw home dir so the agent loads it", () => {
+    // Regression for #4819: on sandboxes whose agent $HOME differs from the
+    // OpenClaw state dir, `skills list` shows the upload dir while the agent
+    // loads skills from $HOME/.openclaw/skills. Install must populate that
+    // mirror — symmetric with `skill remove`, which deletes it.
+    const skillDir = mkdtempSync(join(tmpdir(), "skill-postinstall-mirror-"));
+    const commands: string[] = [];
+    try {
+      writeFileSync(skillDir + "/SKILL.md", "---\nname: report-writer\n---\n# Report\n");
+      const paths = resolveSkillPaths(null, "report-writer");
+      postInstall({ configFile: "/tmp/ssh-config", sandboxName: "alpha" }, paths, skillDir, {
+        sshExecImpl: (_ctx, command) => {
+          commands.push(command);
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+
+      // A command must copy the upload dir into the home mirror dir.
+      const mirrorCmd = commands.find(
+        (c) => c.includes(paths.uploadDir) && c.includes('"$HOME/.openclaw/skills/report-writer"'),
+      );
+      expect(
+        mirrorCmd,
+        "postInstall should mirror the skill into $HOME/.openclaw/skills",
+      ).toBeDefined();
+    } finally {
+      rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+
+  it("warns when the OpenClaw home mirror cannot be created", () => {
+    const skillDir = mkdtempSync(join(tmpdir(), "skill-postinstall-mirror-fail-"));
+    try {
+      writeFileSync(skillDir + "/SKILL.md", "---\nname: report-writer\n---\n# Report\n");
+      const paths = resolveSkillPaths(null, "report-writer");
+      const result = postInstall(
+        { configFile: "/tmp/ssh-config", sandboxName: "alpha" },
+        paths,
+        skillDir,
+        {
+          sshExecImpl: (_ctx, command) => ({
+            // Fail only the mirror command; session refresh still succeeds.
+            status: command.includes("$HOME/.openclaw/skills") ? 1 : 0,
+            stdout: "",
+            stderr: "",
+          }),
+        },
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.messages.some((m) => m.startsWith("Warning:") && m.includes("mirror"))).toBe(
+        true,
+      );
+    } finally {
+      rmSync(skillDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("verifyInstall", () => {
+  it("requires SKILL.md in the OpenClaw home mirror, not only the upload dir (#4819)", () => {
+    // The agent loads skills from the home mirror, so an install whose mirror
+    // copy failed must NOT verify as installed — otherwise the CLI reports
+    // success while the skill stays invisible to the agent.
+    const paths = resolveSkillPaths(null, "report-writer");
+    const commands: string[] = [];
+    const ok = verifyInstall({ configFile: "/tmp/ssh-config", sandboxName: "alpha" }, paths, {
+      sshExecImpl: (_ctx, command) => {
+        commands.push(command);
+        return { status: 0, stdout: "EXISTS", stderr: "" };
+      },
+    });
+
+    expect(ok).toBe(true);
+    // The verification command must cover the home mirror SKILL.md.
+    expect(
+      commands.some((c) => c.includes('"$HOME/.openclaw/skills/report-writer/SKILL.md"')),
+    ).toBe(true);
+  });
+
+  it("returns false when the upload dir has SKILL.md but the home mirror does not", () => {
+    const paths = resolveSkillPaths(null, "report-writer");
+    const ok = verifyInstall({ configFile: "/tmp/ssh-config", sandboxName: "alpha" }, paths, {
+      // A combined `test -f A && test -f B` shell command fails (non-zero,
+      // no EXISTS) when the mirror file is absent.
+      sshExecImpl: () => ({ status: 1, stdout: "", stderr: "" }),
+    });
+
+    expect(ok).toBe(false);
   });
 });

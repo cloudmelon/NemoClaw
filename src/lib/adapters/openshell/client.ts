@@ -10,6 +10,14 @@ import {
   spawnSync,
 } from "node:child_process";
 
+import { redirectInheritedChildStdoutToStderr } from "../../cli/stdout-guard";
+import { buildSubprocessEnv } from "../../subprocess-env";
+
+export {
+  openshellSandboxSshHost,
+  resolveOpenshellSandboxSshHost,
+} from "./sandbox-ssh-host";
+
 export type OpenshellSpawnSync = (
   command: string,
   args: readonly string[],
@@ -21,6 +29,7 @@ export type OpenshellSpawn = typeof spawn;
 interface OpenshellSpawnOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  replaceEnv?: boolean;
   timeout?: number;
   ignoreError?: boolean;
   spawnSyncImpl?: OpenshellSpawnSync;
@@ -28,12 +37,24 @@ interface OpenshellSpawnOptions {
   exit?: (code: number) => never;
 }
 
+function openshellSpawnEnv(opts: OpenshellSpawnOptions): NodeJS.ProcessEnv {
+  const explicitEnv = Object.fromEntries(
+    Object.entries(opts.env ?? {}).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
+  );
+  return opts.replaceEnv ? explicitEnv : buildSubprocessEnv(explicitEnv);
+}
+
 export interface RunOpenshellOptions extends OpenshellSpawnOptions {
   stdio?: SpawnSyncOptions["stdio"];
+  input?: string;
 }
 
 export interface CaptureOpenshellOptions extends OpenshellSpawnOptions {
   includeStderr?: boolean;
+  includeStreams?: boolean;
+  maxBuffer?: number;
 }
 
 export interface CaptureOpenshellAsyncOptions extends CaptureOpenshellOptions {
@@ -41,9 +62,23 @@ export interface CaptureOpenshellAsyncOptions extends CaptureOpenshellOptions {
   spawnImpl?: OpenshellSpawn;
 }
 
+export interface CaptureSandboxSshConfigOptions extends CaptureOpenshellOptions {
+  /**
+   * Gateway the sandbox is recorded against (`resolveSandboxGatewayName`).
+   * `sandbox get` and `sandbox ssh-config` resolve against OpenShell's mutable
+   * current selection when no gateway is given, so a caller that knows the
+   * sandbox's own binding must pass it — otherwise the lookup can land on a
+   * sibling gateway and report the sandbox as missing (#7429). Omitted keeps
+   * the ambient-selection behavior for callers that have no binding to supply.
+   */
+  gatewayName?: string;
+}
+
 export interface CaptureOpenshellResult {
   status: number | null;
   output: string;
+  stdout?: string;
+  stderr?: string;
   error?: Error;
   signal?: NodeJS.Signals | null;
 }
@@ -54,8 +89,32 @@ export function stripAnsi(value = ""): string {
   return String(value).replace(ANSI_RE, "");
 }
 
-export function parseVersionFromText(value = ""): string | null {
-  const match = String(value || "").match(/([0-9]+\.[0-9]+\.[0-9]+)/);
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const SEMVER_PATTERN = /(?:^|[^0-9.])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9.])/;
+
+export function parseVersionFromText(value = "", versionCommand?: string): string | null {
+  const text = String(value || "");
+  const commandToken = versionCommand?.trim().split(/\s+/, 1)[0] ?? "";
+  const executable = commandToken.split("/").pop() ?? "";
+  if (executable) {
+    const executablePattern = new RegExp(`\\b${escapeRegExp(executable)}\\b`, "i");
+    let executableSeen = false;
+    for (const line of text.split(/\r?\n/)) {
+      const executableMatch = executablePattern.exec(line);
+      if (!executableMatch) continue;
+      executableSeen = true;
+      const versionMatch = line
+        .slice(executableMatch.index + executableMatch[0].length)
+        .match(SEMVER_PATTERN);
+      if (versionMatch) return versionMatch[1];
+    }
+    if (executableSeen) return null;
+  }
+
+  const match = text.match(SEMVER_PATTERN);
   return match ? match[1] : null;
 }
 
@@ -90,12 +149,25 @@ function isIgnoredTimeout(error: Error, opts: OpenshellSpawnOptions): boolean {
   return opts.ignoreError === true && (error as NodeJS.ErrnoException).code === "ETIMEDOUT";
 }
 
+function isIgnoredCaptureError(error: Error, opts: CaptureOpenshellOptions): boolean {
+  if (isIgnoredTimeout(error, opts)) return true;
+  return opts.ignoreError === true && (error as NodeJS.ErrnoException).code === "ENOBUFS";
+}
+
 function shouldIncludeStderr(opts: CaptureOpenshellOptions): boolean {
   return opts.includeStderr === true || opts.ignoreError !== true;
 }
 
 function captureOutput(result: SpawnSyncReturns<string>, opts: CaptureOpenshellOptions): string {
   return `${result.stdout || ""}${shouldIncludeStderr(opts) ? result.stderr || "" : ""}`.trim();
+}
+
+function maybeCapturedStreams(
+  stdout: string,
+  stderr: string,
+  opts: CaptureOpenshellOptions,
+): Pick<CaptureOpenshellResult, "stdout" | "stderr"> {
+  return opts.includeStreams === true ? { stdout, stderr } : {};
 }
 
 function timeoutError(binary: string, args: string[], timeout: number): NodeJS.ErrnoException {
@@ -131,9 +203,10 @@ export function runOpenshellCommand(
   const spawnSyncImpl = opts.spawnSyncImpl ?? spawnSync;
   const result = spawnSyncImpl(binary, args, {
     cwd: opts.cwd,
-    env: { ...process.env, ...opts.env },
+    env: openshellSpawnEnv(opts),
     encoding: "utf-8",
-    stdio: opts.stdio ?? "inherit",
+    stdio: redirectInheritedChildStdoutToStderr(opts.stdio ?? "inherit"),
+    input: opts.input,
     timeout: opts.timeout,
   });
   if (result.error) {
@@ -143,9 +216,7 @@ export function runOpenshellCommand(
     return handleSpawnError(binary, args, result.error, opts);
   }
   if (result.status !== 0 && !opts.ignoreError) {
-    (opts.errorLine ?? console.error)(
-      `  OpenShell command failed (exit ${result.status})`,
-    );
+    (opts.errorLine ?? console.error)(`  OpenShell command failed (exit ${result.status})`);
     return (opts.exit ?? ((code) => process.exit(code)))(result.status || 1);
   }
   return result;
@@ -159,16 +230,18 @@ export function captureOpenshellCommand(
   const spawnSyncImpl = opts.spawnSyncImpl ?? spawnSync;
   const result = spawnSyncImpl(binary, args, {
     cwd: opts.cwd,
-    env: { ...process.env, ...opts.env },
+    env: openshellSpawnEnv(opts),
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: opts.timeout,
+    maxBuffer: opts.maxBuffer,
   });
   if (result.error) {
-    if (isIgnoredTimeout(result.error, opts)) {
+    if (isIgnoredCaptureError(result.error, opts)) {
       return {
         status: result.status,
         output: captureOutput(result, opts),
+        ...maybeCapturedStreams(result.stdout || "", result.stderr || "", opts),
         error: result.error,
         signal: result.signal,
       };
@@ -176,21 +249,39 @@ export function captureOpenshellCommand(
     return handleSpawnError(binary, args, result.error, opts);
   }
   return {
-    status: result.status ?? 1,
+    status: result.status ?? (result.signal ? null : 1),
     output: captureOutput(result, opts),
+    ...maybeCapturedStreams(result.stdout || "", result.stderr || "", opts),
+    ...(result.signal ? { signal: result.signal } : {}),
   };
+}
+
+/**
+ * Insert `-g <gateway>` after the subcommand pair, matching the placement
+ * `gatewayScopedArgs` already uses in `actions/sandbox/gateway-state.ts`.
+ * Duplicated rather than imported: an adapter must not depend on the actions
+ * layer.
+ */
+function gatewayScopedArgs(args: string[], gatewayName?: string): string[] {
+  if (!gatewayName) return args;
+  return [...args.slice(0, 2), "-g", gatewayName, ...args.slice(2)];
 }
 
 export function captureSandboxSshConfigCommand(
   binary: string,
   sandboxName: string,
-  opts: CaptureOpenshellOptions = {},
+  opts: CaptureSandboxSshConfigOptions = {},
 ): CaptureOpenshellResult {
-  const sandboxGet = captureOpenshellCommand(binary, ["sandbox", "get", sandboxName], {
-    ...opts,
-    ignoreError: true,
-    includeStderr: true,
-  });
+  const { gatewayName, ...spawnOpts } = opts;
+  const sandboxGet = captureOpenshellCommand(
+    binary,
+    gatewayScopedArgs(["sandbox", "get", sandboxName], gatewayName),
+    {
+      ...spawnOpts,
+      ignoreError: true,
+      includeStderr: true,
+    },
+  );
   if (sandboxGet.status !== 0) {
     const output = sandboxGet.output || `failed to query sandbox '${sandboxName}'`;
     const sandboxMissing = /\bnot[- ]?found\b/i.test(output);
@@ -199,7 +290,13 @@ export function captureSandboxSshConfigCommand(
       output: sandboxMissing ? `sandbox '${sandboxName}' not found` : output,
     };
   }
-  return captureOpenshellCommand(binary, ["sandbox", "ssh-config", sandboxName], opts);
+  // Pin every hop to the same gateway so `get` and `ssh-config` cannot
+  // disagree about which one owns the sandbox.
+  return captureOpenshellCommand(
+    binary,
+    gatewayScopedArgs(["sandbox", "ssh-config", sandboxName], gatewayName),
+    spawnOpts,
+  );
 }
 
 export function captureOpenshellCommandAsync(
@@ -211,7 +308,7 @@ export function captureOpenshellCommandAsync(
   return new Promise((resolve) => {
     const child = spawnImpl(binary, args, {
       cwd: opts.cwd,
-      env: { ...process.env, ...opts.env },
+      env: openshellSpawnEnv(opts),
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     }) as ChildProcess;
@@ -233,17 +330,14 @@ export function captureOpenshellCommandAsync(
 
     const buildOutput = () => `${stdout}${shouldIncludeStderr(opts) ? stderr : ""}`.trim();
 
-    const settle = (
-      status: number | null,
-      signal: NodeJS.Signals | null,
-      error?: Error,
-    ) => {
+    const settle = (status: number | null, signal: NodeJS.Signals | null, error?: Error) => {
       if (settled) return;
       settled = true;
       clearTimers();
       resolve({
         status: status ?? (timedOut ? null : 1),
         output: buildOutput(),
+        ...maybeCapturedStreams(stdout, stderr, opts),
         ...(error ? { error } : {}),
         signal,
       });
@@ -292,5 +386,5 @@ export function getInstalledOpenshellVersion(
     ...opts,
     ignoreError: true,
   });
-  return parseVersionFromText(versionResult.output);
+  return parseVersionFromText(versionResult.output, binary);
 }

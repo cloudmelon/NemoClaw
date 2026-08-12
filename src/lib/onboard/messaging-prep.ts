@@ -1,0 +1,205 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+import type { WebSearchConfig } from "../inference/web-search";
+import * as webSearch from "../inference/web-search";
+import { listMessagingCredentialMetadata } from "../messaging/channels";
+import { type ChannelDef, getChannelTokenKeys } from "../sandbox/channels";
+import * as braveProviderProfile from "./brave-provider-profile";
+import {
+  bridgeProviderNamesForChannel,
+  collectMessagingBridgeTokenDefs,
+} from "./messaging-bridge-provider";
+
+export type NamedMessagingChannel = { name: string } & ChannelDef;
+
+export interface MessagingTokenDef {
+  name: string;
+  envKey: string;
+  token: string | null;
+  providerType?: string;
+}
+
+export interface CreateSandboxMessagingPrepInput {
+  sandboxName: string;
+  agentName?: string | null;
+  requireExactProviderBinding?: boolean;
+  channels: readonly NamedMessagingChannel[];
+  enabledChannels: readonly string[] | null;
+  disabledChannels: readonly string[];
+  webSearchConfig: WebSearchConfig | null;
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>;
+  getValidatedMessagingTokenByEnvKey(
+    channels: readonly NamedMessagingChannel[],
+    envKey: string,
+  ): string | null;
+  getCredential(envKey: string): string | null;
+  normalizeCredentialValue(value: unknown): string;
+  registerExtraPlaceholderProviders(
+    sandboxName: string,
+    messagingTokenDefs: MessagingTokenDef[],
+  ): string[];
+  getMessagingChannelForEnvKey(envKey: string): string | null;
+  providerExistsInGateway(name: string): boolean;
+  providerMatchesGatewayCredential(name: string, type: string, credentialEnv: string): boolean;
+}
+
+export interface CreateSandboxMessagingPrepResult {
+  disabledChannelNames: Set<string>;
+  messagingTokenDefs: MessagingTokenDef[];
+  extraPlaceholderKeys: string[];
+  hasMessagingTokens: boolean;
+  reusableMessagingProviders: string[];
+  reusableMessagingChannels: string[];
+  missingWebSearchCredentialEnv: string | null;
+}
+
+export function prepareCreateSandboxMessaging(
+  input: CreateSandboxMessagingPrepInput,
+): CreateSandboxMessagingPrepResult {
+  const requiresExactOpenClawProviderBinding =
+    input.requireExactProviderBinding === true &&
+    (!input.agentName || input.agentName.trim().toLowerCase() === "openclaw");
+  const enabledEnvKeys =
+    input.enabledChannels != null
+      ? new Set(
+          input.channels
+            .filter((c) => input.enabledChannels?.includes(c.name))
+            .flatMap((c) => getChannelTokenKeys(c)),
+        )
+      : null;
+
+  const disabledChannelNames = new Set(input.disabledChannels);
+  const disabledEnvKeys = new Set(
+    input.channels
+      .filter((c) => disabledChannelNames.has(c.name))
+      .flatMap((c) => getChannelTokenKeys(c)),
+  );
+
+  const messagingTokenDefs: MessagingTokenDef[] = listMessagingCredentialMetadata()
+    .map((credential) => ({
+      name: credential.providerNameTemplate.replaceAll("{sandboxName}", input.sandboxName),
+      envKey: credential.providerEnvKey,
+      token: input.getValidatedMessagingTokenByEnvKey(input.channels, credential.providerEnvKey),
+    }))
+    .filter(({ envKey }) => !enabledEnvKeys || enabledEnvKeys.has(envKey))
+    .filter(({ envKey }) => !disabledEnvKeys.has(envKey));
+
+  const webSearchEnabled = braveProviderProfile.shouldEnableWebSearch(input.webSearchConfig);
+  const webSearchProvider = webSearch.webSearchProviderForConfig(input.webSearchConfig);
+  const webSearchCredentialEnv = webSearch.webSearchEnvFor(webSearchProvider);
+  const webSearchProviderType =
+    webSearchProvider === "tavily" && input.agentName?.trim().toLowerCase() === "hermes"
+      ? braveProviderProfile.HERMES_TAVILY_PROVIDER_PROFILE_ID
+      : webSearchProvider;
+  const webSearchProviderName = `${input.sandboxName}-${webSearchProvider}-search`;
+  const webSearchApiKey = webSearchEnabled
+    ? input.getCredential(webSearchCredentialEnv) ||
+      input.normalizeCredentialValue(input.env[webSearchCredentialEnv]) ||
+      null
+    : null;
+  const reusableWebSearchProvider =
+    requiresExactOpenClawProviderBinding &&
+    webSearchEnabled &&
+    !webSearchApiKey &&
+    input.providerMatchesGatewayCredential(
+      webSearchProviderName,
+      webSearchProviderType,
+      webSearchCredentialEnv,
+    );
+  const missingWebSearchCredentialEnv =
+    webSearchEnabled && !webSearchApiKey && !reusableWebSearchProvider
+      ? webSearchCredentialEnv
+      : null;
+  if (missingWebSearchCredentialEnv) {
+    return {
+      disabledChannelNames,
+      messagingTokenDefs,
+      extraPlaceholderKeys: [],
+      hasMessagingTokens: messagingTokenDefs.some(({ token }) => !!token),
+      reusableMessagingProviders: [],
+      reusableMessagingChannels: [],
+      missingWebSearchCredentialEnv,
+    };
+  }
+
+  if (webSearchEnabled) {
+    messagingTokenDefs.push({
+      name: webSearchProviderName,
+      envKey: webSearchCredentialEnv,
+      token: webSearchApiKey,
+      providerType: webSearchProviderType,
+    });
+  }
+
+  // Messaging bridge providers: any channel that mints its outbound token
+  // gateway-side (declared by a co-located provider-profile YAML) registers a
+  // refresh-minted provider so the gateway mints the token (secret stays
+  // gateway-side) and the L7 proxy injects it. The credential value is a sentinel
+  // (minted by refresh, configured post-create in onboard's
+  // upsertMessagingProviders wrapper). Today only Google Chat uses this.
+  messagingTokenDefs.push(
+    ...collectMessagingBridgeTokenDefs({
+      sandboxName: input.sandboxName,
+      getCredential: input.getCredential,
+      env: input.env,
+      normalizeCredentialValue: input.normalizeCredentialValue,
+      enabledChannels: input.enabledChannels,
+      disabledChannelNames,
+    }),
+  );
+
+  const extraPlaceholderKeys = input.registerExtraPlaceholderProviders(
+    input.sandboxName,
+    messagingTokenDefs,
+  );
+  const hasMessagingTokens = messagingTokenDefs.some(({ token }) => !!token);
+  const reusableMessagingProviders: string[] = reusableWebSearchProvider
+    ? [webSearchProviderName]
+    : [];
+  const reusableMessagingChannels: string[] = [];
+
+  if (input.enabledChannels != null) {
+    for (const { name, envKey, token } of messagingTokenDefs) {
+      if (token) continue;
+      const channel = input.getMessagingChannelForEnvKey(envKey);
+      if (!channel || !input.enabledChannels.includes(channel)) continue;
+      const providerReusable = requiresExactOpenClawProviderBinding
+        ? input.providerMatchesGatewayCredential(name, "generic", envKey)
+        : input.providerExistsInGateway(name);
+      if (!providerReusable) continue;
+      reusableMessagingProviders.push(name);
+      if (!reusableMessagingChannels.includes(channel)) {
+        reusableMessagingChannels.push(channel);
+      }
+    }
+  }
+
+  // Bridge channels have no token def at all when their env-only secret is
+  // gone (fresh process), so the envKey loop above misses them. The gateway
+  // still holds the refresh material — reuse the provider by name instead.
+  if (input.enabledChannels != null) {
+    for (const channel of input.enabledChannels) {
+      if (disabledChannelNames.has(channel)) continue;
+      for (const name of bridgeProviderNamesForChannel(input.sandboxName, channel)) {
+        if (messagingTokenDefs.some((def) => def.name === name && def.token)) continue;
+        if (reusableMessagingProviders.includes(name)) continue;
+        if (!input.providerExistsInGateway(name)) continue;
+        reusableMessagingProviders.push(name);
+        if (!reusableMessagingChannels.includes(channel)) {
+          reusableMessagingChannels.push(channel);
+        }
+      }
+    }
+  }
+
+  return {
+    disabledChannelNames,
+    messagingTokenDefs,
+    extraPlaceholderKeys,
+    hasMessagingTokens,
+    reusableMessagingProviders,
+    reusableMessagingChannels,
+    missingWebSearchCredentialEnv,
+  };
+}

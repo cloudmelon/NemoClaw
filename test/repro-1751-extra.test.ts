@@ -17,8 +17,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import * as session from "../dist/lib/state/onboard-session";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import * as session from "../src/lib/state/onboard-session";
 
 const tmpHomes: string[] = [];
 
@@ -34,7 +34,7 @@ afterEach(() => {
   }
 });
 
-describe("Issue #1751 — GPU passthrough session persistence", () => {
+describe("GPU passthrough session persistence (#1751)", () => {
   it("filterSafeUpdates: gpuPassthrough=true is propagated to safe", () => {
     session.saveSession(session.createSession());
     session.markStepComplete("provider_selection", { gpuPassthrough: true });

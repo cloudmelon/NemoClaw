@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 import { describe, it } from "vitest";
 
-import { formatOnboardConfigSummary, formatSandboxBuildEstimateNote } from "../../../dist/lib/onboard/summary";
+import { formatOnboardConfigSummary, formatSandboxBuildEstimateNote } from "./summary";
 
 describe("onboard summary helpers", () => {
   it("formatOnboardConfigSummary renders all collected fields (#2165)", () => {
@@ -27,6 +27,7 @@ describe("onboard summary helpers", () => {
       "summary shows API key staging state without printing env var names",
     );
     assert.ok(summary.includes("enabled"), "summary includes web-search enabled");
+    assert.ok(summary.includes("Brave Search"), "legacy web-search config defaults to Brave");
     assert.ok(summary.includes("telegram, slack"), "summary lists enabled channels");
     assert.ok(summary.includes("my-assistant"), "summary shows sandbox name");
     assert.ok(
@@ -37,7 +38,7 @@ describe("onboard summary helpers", () => {
     const bareSummary = formatOnboardConfigSummary({
       provider: "nvidia-prod",
       model: "nvidia/nemotron-3-super-120b-a12b",
-      credentialEnv: "NVIDIA_API_KEY",
+      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
       webSearchConfig: null,
       enabledChannels: [],
       sandboxName: "test",
@@ -70,6 +71,48 @@ describe("onboard summary helpers", () => {
     });
     assert.ok(!orphanSummary.includes("undefined"), "null fields never render as 'undefined'");
     assert.ok(orphanSummary.includes("(unset)"), "null fields fall back to '(unset)'");
+
+    const tavilySummary = formatOnboardConfigSummary({
+      provider: "nvidia-prod",
+      model: "test-model",
+      webSearchConfig: { fetchEnabled: true, provider: "tavily" },
+      sandboxName: "tavily-agent",
+    });
+    assert.ok(tavilySummary.includes("enabled (Tavily Search)"));
+  });
+
+  it("shows resolved serving profile provenance and download estimates (#8384)", () => {
+    const summary = formatOnboardConfigSummary({
+      provider: "vllm-local",
+      model: "example/model",
+      webSearchConfig: null,
+      sandboxName: "profile-test",
+      servingProfileProvenance: {
+        schemaVersion: 1,
+        catalogDigest: `sha256:${"1".repeat(64)}`,
+        preset: {
+          id: "vllm.dgx-spark-gb10.single.example",
+          digest: `sha256:${"2".repeat(64)}`,
+          displayName: "Example Spark profile",
+          supportState: "experimental",
+        },
+        recipe: {
+          id: "vllm.dgx-spark-gb10.single.example",
+          digest: `sha256:${"3".repeat(64)}`,
+          backend: "vllm",
+        },
+        model: { id: "example/model", revision: "revision-1" },
+        runtimeImage: `example.invalid/vllm@sha256:${"4".repeat(64)}`,
+        estimatedImageDownloadBytes: 1024 ** 3,
+        estimatedModelDownloadBytes: 2 * 1024 ** 3,
+      },
+    });
+
+    assert.match(summary, /Example Spark profile.*vllm\.dgx-spark-gb10\.single\.example/u);
+    assert.match(summary, /Recipe:.*vllm\.dgx-spark-gb10\.single\.example/u);
+    assert.match(summary, /Support:.*experimental/u);
+    assert.match(summary, /Runtime image:.*example\.invalid\/vllm@sha256/u);
+    assert.match(summary, /Downloads:.*image 1\.0 GiB, model 2\.0 GiB/u);
   });
 
   it("formatSandboxBuildEstimateNote warns when runtime is under-provisioned (#2514)", () => {

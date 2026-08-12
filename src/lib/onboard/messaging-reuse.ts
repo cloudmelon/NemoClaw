@@ -1,15 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-type MessagingChannel = { name: string; envKey: string };
-type SandboxEntry = { messagingChannels?: string[] | null } | null | undefined;
+import { listMessagingProviderNamesForChannel } from "../messaging/channels";
+import type { RegistryMessagingAuthority } from "../messaging/plan-authority";
+import { getChannelsFromPlan, getDisabledChannelsFromPlan } from "./messaging-plan-session";
 
-export function getMessagingProviderNamesForChannel(sandboxName: string, channel: string): string[] {
-  if (channel === "discord") return [`${sandboxName}-discord-bridge`];
-  if (channel === "telegram") return [`${sandboxName}-telegram-bridge`];
-  if (channel === "wechat") return [`${sandboxName}-wechat-bridge`];
-  if (channel === "slack") return [`${sandboxName}-slack-bridge`, `${sandboxName}-slack-app`];
-  return [];
+type MessagingChannel = { name: string; envKey?: string };
+
+export function getMessagingProviderNamesForChannel(
+  sandboxName: string,
+  channel: string,
+): string[] {
+  return listMessagingProviderNamesForChannel(sandboxName, channel);
 }
 
 function getKnownMessagingChannels(
@@ -27,8 +29,7 @@ export function getNonInteractiveStoredMessagingChannels(
   sandboxName: string | null,
   messagingChannels: readonly MessagingChannel[],
   hasMessagingToken: (envKey: string) => boolean,
-  getSandbox: (sandboxName: string) => SandboxEntry,
-  getDisabledChannels: (sandboxName: string) => string[],
+  getRegistryMessagingAuthority: (sandboxName: string) => RegistryMessagingAuthority,
   providerExists: (providerName: string) => boolean,
   nonInteractive: boolean,
 ): string[] | null {
@@ -37,15 +38,21 @@ export function getNonInteractiveStoredMessagingChannels(
     const knownSessionChannels = getKnownMessagingChannels(sessionChannels, messagingChannels);
     return knownSessionChannels;
   }
-  if (resume || !sandboxName || messagingChannels.some((channel) => hasMessagingToken(channel.envKey))) {
+  if (
+    resume ||
+    !sandboxName ||
+    messagingChannels.some((channel) => channel.envKey && hasMessagingToken(channel.envKey))
+  ) {
     return null;
   }
 
+  const registryAuthority = getRegistryMessagingAuthority(sandboxName);
+  if (!registryAuthority.authoritative) return null;
   const configuredChannels = getKnownMessagingChannels(
-    getSandbox(sandboxName)?.messagingChannels,
+    getChannelsFromPlan(registryAuthority.plan),
     messagingChannels,
   );
-  const disabledChannels = new Set(getDisabledChannels(sandboxName));
+  const disabledChannels = new Set(getDisabledChannelsFromPlan(registryAuthority.plan));
   const reusableChannels = configuredChannels.filter((channel) => {
     if (disabledChannels.has(channel)) return false;
     const providers = getMessagingProviderNamesForChannel(sandboxName, channel);

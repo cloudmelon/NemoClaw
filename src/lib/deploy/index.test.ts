@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
+import { validateName } from "../runner";
 import {
   buildDeployEnvLines,
   executeDeploy,
@@ -9,13 +10,27 @@ import {
   inferDeployProvider,
   isBrevInstanceFailed,
   isBrevInstanceReady,
-} from "../../../dist/lib/deploy";
-import { validateName } from "../../../dist/lib/runner";
+  validateDeployInstanceName,
+} from "./index";
+
+describe("validateDeployInstanceName", () => {
+  it("preserves the Brev instance-name contract independently of sandbox limits (#8497)", () => {
+    const sixtyThreeCharacters = `a${"b".repeat(61)}z`;
+
+    expect(validateDeployInstanceName("brev--instance-name-that-exceeds-nineteen")).toBe(
+      "brev--instance-name-that-exceeds-nineteen",
+    );
+    expect(validateDeployInstanceName(sixtyThreeCharacters)).toBe(sixtyThreeCharacters);
+    expect(() => validateDeployInstanceName(`a${"b".repeat(63)}`)).toThrow(
+      /instance name too long \(max 63 chars\)/,
+    );
+  });
+});
 
 describe("inferDeployProvider", () => {
   it("prefers an explicit provider override", () => {
     const provider = inferDeployProvider("openai", {
-      NVIDIA_API_KEY: "nvapi-test",
+      NVIDIA_INFERENCE_API_KEY: "nvapi-test",
     });
 
     expect(provider).toBe("openai");
@@ -31,7 +46,7 @@ describe("inferDeployProvider", () => {
 
   it("returns null when multiple provider credentials are present without an override", () => {
     const provider = inferDeployProvider("", {
-      NVIDIA_API_KEY: "nvapi-test",
+      NVIDIA_INFERENCE_API_KEY: "nvapi-test",
       OPENAI_API_KEY: "sk-openai-test",
     });
 
@@ -49,7 +64,7 @@ describe("buildDeployEnvLines", () => {
       sandboxName: "my-assistant",
       provider: "build",
       credentials: {
-        NVIDIA_API_KEY: "nvapi-test",
+        NVIDIA_INFERENCE_API_KEY: "nvapi-test",
       },
       shellQuote: (value: string) => `'${value}'`,
     });
@@ -60,7 +75,7 @@ describe("buildDeployEnvLines", () => {
     expect(envLines).toContain("NEMOCLAW_PROVIDER='build'");
     expect(envLines).toContain("CHAT_UI_URL='https://chat.example.com'");
     expect(envLines).toContain("NEMOCLAW_POLICY_MODE='suggested'");
-    expect(envLines).toContain("NVIDIA_API_KEY='nvapi-test'");
+    expect(envLines).toContain("NVIDIA_INFERENCE_API_KEY='nvapi-test'");
   });
 
   it("passes ALLOWED_CHAT_IDS through when Telegram is configured", () => {
@@ -85,7 +100,7 @@ describe("buildDeployEnvLines", () => {
       sandboxName: "my-assistant",
       provider: "build",
       credentials: {
-        NVIDIA_API_KEY: "nvapi-test",
+        NVIDIA_INFERENCE_API_KEY: "nvapi-test",
         HF_TOKEN: "hf_abc123",
         HUGGING_FACE_HUB_TOKEN: "hf_def456",
       },
@@ -126,7 +141,7 @@ describe("executeDeploy", () => {
         NEMOCLAW_SANDBOX_NAME: "my-box",
       },
       rootDir: "/repo/root",
-      getCredential: (key: string) => (key === "NVIDIA_API_KEY" ? "nvapi-test" : null),
+      getCredential: (key: string) => (key === "NVIDIA_INFERENCE_API_KEY" ? "nvapi-test" : null),
       validateName: (value: string) => value,
       shellQuote: (value: string) => `'${value}'`,
       run: (command: readonly string[]) => {
@@ -171,7 +186,14 @@ describe("executeDeploy", () => {
       ...overrides,
     };
 
-    return { options, calls, logs, errors, interactive, setPlainBrevList: (value: string) => (plainBrevList = value) };
+    return {
+      options,
+      calls,
+      logs,
+      errors,
+      interactive,
+      setPlainBrevList: (value: string) => (plainBrevList = value),
+    };
   }
 
   it("uses the standard installer, syncs a buildable checkout, pins SSH host keys, and connects to the requested sandbox", async () => {
@@ -179,19 +201,46 @@ describe("executeDeploy", () => {
 
     await executeDeploy(fixture.options);
 
-    expect(fixture.calls.some((call) => call.command?.[0] === "brev" && call.command.includes("create") && call.command.includes("--provider") && call.command.includes("gcp"))).toBe(true);
+    expect(
+      fixture.calls.some(
+        (call) =>
+          call.command?.[0] === "brev" &&
+          call.command.includes("create") &&
+          call.command.includes("--provider") &&
+          call.command.includes("gcp"),
+      ),
+    ).toBe(true);
     const rsync = fixture.calls.find((call) => call.command?.[0] === "rsync")?.command ?? [];
     expect(rsync).toContain("/repo/root/");
     expect(rsync).toContain("--exclude");
     expect(rsync).toContain("dist");
     expect(rsync).not.toContain("src");
-    expect(fixture.calls.some((call) => call.file === "ssh-keyscan" && call.args?.includes("target.example.test"))).toBe(true);
-    const sshCommands = [...fixture.calls.flatMap((call) => call.command ?? []), ...fixture.interactive.flat()];
+    expect(
+      fixture.calls.some(
+        (call) => call.file === "ssh-keyscan" && call.args?.includes("target.example.test"),
+      ),
+    ).toBe(true);
+    const sshCommands = [
+      ...fixture.calls.flatMap((call) => call.command ?? []),
+      ...fixture.interactive.flat(),
+    ];
     expect(sshCommands).toContain("StrictHostKeyChecking=yes");
     expect(sshCommands.some((arg) => String(arg).startsWith("UserKnownHostsFile="))).toBe(true);
     expect(sshCommands).not.toContain("StrictHostKeyChecking=accept-new");
-    expect(fixture.interactive.some((command) => command.join(" ").includes("bash scripts/install.sh --non-interactive --yes-i-accept-third-party-software"))).toBe(true);
-    expect(fixture.interactive.some((command) => command.join(" ").includes("openshell sandbox connect 'my-box'"))).toBe(true);
+    expect(
+      fixture.interactive.some((command) =>
+        command
+          .join(" ")
+          .includes(
+            "bash scripts/install.sh --non-interactive --yes-i-accept-third-party-software",
+          ),
+      ),
+    ).toBe(true);
+    expect(
+      fixture.interactive.some((command) =>
+        command.join(" ").includes("openshell sandbox connect 'my-box'"),
+      ),
+    ).toBe(true);
     expect(fixture.logs.join("\n")).toContain("Skipping service startup");
   });
 
@@ -238,10 +287,10 @@ describe("executeDeploy", () => {
     await expect(executeDeploy(fixture.options)).rejects.toThrow("exit:1");
 
     const errorText = fixture.errors.join("\n");
-    expect(errorText).toContain("Invalid sandbox name: 'bad name'");
+    expect(errorText).toContain('Invalid sandbox name: "bad name"');
     expect(errorText).toContain("Sandbox names cannot contain spaces.");
     expect(errorText).toContain(
-      "Allowed format: 1-63 characters, lowercase, starts with a letter, letters/numbers/internal hyphens only, ends with letter/number.",
+      "Allowed format: 1-19 characters, lowercase, starts with a letter, letters/numbers/single internal hyphens only, ends with letter/number.",
     );
     expect(errorText).toContain(
       "Brev deploy is non-interactive and cannot prompt for a corrected sandbox name.",

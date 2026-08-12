@@ -14,6 +14,7 @@ function createDeps(overrides: Partial<AgentSetupStateOptions<Agent>["deps"]> = 
     handleAgentSetup: vi.fn(async () => undefined),
     context: vi.fn(() => ({ ctx: true })),
     ensureDashboard: vi.fn(() => 18789),
+    persistDashboardPort: vi.fn(),
     skipped: vi.fn(async (stepName: string) => {
       session.steps[stepName].status = "skipped";
       return session;
@@ -36,6 +37,7 @@ function createDeps(overrides: Partial<AgentSetupStateOptions<Agent>["deps"]> = 
       handleAgentSetup: calls.handleAgentSetup,
       agentSetupContext: calls.context,
       ensureAgentDashboardForward: calls.ensureDashboard,
+      persistDashboardPort: calls.persistDashboardPort,
       recordStepSkipped: calls.skipped,
       isOpenclawReady: calls.openclawReady,
       skippedStepMessage: calls.skippedMessage,
@@ -73,7 +75,11 @@ describe("handleAgentSetupState", () => {
     const agent = { name: "hermes", displayName: "Hermes" };
     const session = createSession();
 
-    const result = await handleAgentSetupState({ ...baseOptions(deps, agent), session, resume: true });
+    const result = await handleAgentSetupState({
+      ...baseOptions(deps, agent),
+      session,
+      resume: true,
+    });
 
     expect(calls.handleAgentSetup).toHaveBeenCalledWith(
       "my-assistant",
@@ -88,6 +94,34 @@ describe("handleAgentSetupState", () => {
     expect(calls.skipped).toHaveBeenCalledWith("openclaw");
     expect(calls.setupOpenclaw).not.toHaveBeenCalled();
     expect(result.session?.steps.openclaw.status).toBe("skipped");
+    expect(result.stateResult).toEqual({
+      type: "transition",
+      next: "policies",
+      transitionKind: "advance",
+      updates: undefined,
+      metadata: { state: "agent_setup" },
+    });
+  });
+
+  it("persists the bumped dashboard port returned by the forward (#8214)", async () => {
+    const { deps, calls } = createDeps({});
+    calls.ensureDashboard.mockReturnValue(18791);
+    const agent = { name: "hermes", displayName: "Hermes" };
+
+    await handleAgentSetupState({ ...baseOptions(deps, agent), resume: true });
+
+    expect(calls.ensureDashboard).toHaveBeenCalledWith("my-assistant", agent);
+    expect(calls.persistDashboardPort).toHaveBeenCalledWith("my-assistant", 18791);
+  });
+
+  it("does not persist a dashboard port when the agent manages no dashboard (#8214)", async () => {
+    const { deps, calls } = createDeps({});
+    calls.ensureDashboard.mockReturnValue(0);
+    const agent = { name: "hermes", displayName: "Hermes" };
+
+    await handleAgentSetupState({ ...baseOptions(deps, agent), resume: true });
+
+    expect(calls.persistDashboardPort).not.toHaveBeenCalled();
   });
 
   it("skips OpenClaw setup on resume when OpenClaw is ready", async () => {
@@ -105,9 +139,20 @@ describe("handleAgentSetupState", () => {
     expect(calls.syncConfig).toHaveBeenCalledWith("my-assistant", "provider", "model");
     expect(calls.complete).toHaveBeenCalledWith(
       "openclaw",
-      expect.objectContaining({ sandboxName: "my-assistant", provider: "provider", model: "model" }),
+      expect.objectContaining({
+        sandboxName: "my-assistant",
+        provider: "provider",
+        model: "model",
+      }),
     );
     expect(calls.skipped).toHaveBeenCalledWith("agent_setup");
+    expect(result.stateResult).toEqual({
+      type: "transition",
+      next: "policies",
+      transitionKind: "advance",
+      updates: undefined,
+      metadata: { state: "openclaw" },
+    });
     expect(result.session).toMatchObject({
       sandboxName: "my-assistant",
       provider: "provider",
@@ -143,6 +188,7 @@ describe("handleAgentSetupState", () => {
       }),
     );
     expect(calls.skipped).toHaveBeenCalledWith("agent_setup");
+    expect(result.stateResult).toMatchObject({ next: "policies", transitionKind: "advance" });
     expect(result.session).toMatchObject({
       sandboxName: "my-assistant",
       provider: "provider",

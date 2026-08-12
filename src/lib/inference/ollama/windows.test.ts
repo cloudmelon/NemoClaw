@@ -5,15 +5,19 @@ import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
-const WINDOWS_DIST_PATH = require.resolve("../../../../dist/lib/inference/ollama/windows");
-const RUNNER_PATH = require.resolve("../../../../dist/lib/runner");
+const WINDOWS_DIST_PATH = require.resolve("./windows");
+const RUNNER_PATH = require.resolve("../../runner");
 const childProcess = require("node:child_process");
+const WINDOWS_OLLAMA_TAGS_URL = "http://host.docker.internal:11434/api/tags";
 
 function commandText(command: string | string[]): string {
   return Array.isArray(command) ? command.join(" ") : String(command);
 }
 
-function loadWindowsOllamaWithMocks(run: ReturnType<typeof vi.fn>, runCapture: ReturnType<typeof vi.fn>) {
+function loadWindowsOllamaWithMocks(
+  run: ReturnType<typeof vi.fn>,
+  runCapture: ReturnType<typeof vi.fn>,
+) {
   const runner = require(RUNNER_PATH);
   const originalRun = runner.run;
   const originalRunCapture = runner.runCapture;
@@ -36,7 +40,7 @@ function loadWindowsOllamaWithMocks(run: ReturnType<typeof vi.fn>, runCapture: R
 }
 
 describe("Windows Ollama helper", () => {
-  it("falls back from a stale watcher path to the verified installed executable", () => {
+  it("falls back from a stale watcher path and checks readiness from Docker Desktop (#8127)", () => {
     const watcherPath = "C:\\Users\\tester\\AppData\\Local\\Programs\\Ollama\\ollama app.exe";
     const installedPath = "C:\\Users\\tester\\AppData\\Local\\Programs\\Ollama\\ollama.exe";
     const launchScripts: string[] = [];
@@ -59,8 +63,9 @@ describe("Windows Ollama helper", () => {
         stopCommands.push(cmd);
         return "";
       }
-      if (cmd.includes("host.docker.internal:11434/api/tags")) {
-        return launchScripts.some((script) => script.includes(installedPath))
+      if (Array.isArray(command) && command.at(-1) === WINDOWS_OLLAMA_TAGS_URL) {
+        return command[0] === "docker" &&
+          launchScripts.some((script) => script.includes(installedPath))
           ? JSON.stringify({ models: [] })
           : "";
       }
@@ -82,10 +87,25 @@ describe("Windows Ollama helper", () => {
     expect(launchScripts[0]).toContain(watcherPath);
     expect(launchScripts[1]).toContain(installedPath);
     expect(launchScripts[1]).toContain("-ArgumentList 'serve'");
-    expect(launchScripts.some((script) => script.includes("Start-Process -FilePath ollama.exe"))).toBe(
-      false,
-    );
+    expect(
+      launchScripts.some((script) => script.includes("Start-Process -FilePath ollama.exe")),
+    ).toBe(false);
     expect(stopCommands[0]).toContain("Get-Process 'ollama app'");
     expect(stopCommands[1]).toContain("Get-Process ollama");
+    expect(runCapture).toHaveBeenCalledWith(
+      [
+        "docker",
+        "run",
+        "--rm",
+        "curlimages/curl:8.10.1",
+        "-sf",
+        "--connect-timeout",
+        "2",
+        "--max-time",
+        "5",
+        "http://host.docker.internal:11434/api/tags",
+      ],
+      { ignoreError: true },
+    );
   });
 });

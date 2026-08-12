@@ -2,31 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-// Import through the compiled dist/ output (via the bin/lib shim) so
-// coverage is attributed to dist/lib/onboard/preflight.js, which is what the
-// ratchet measures.
+// Import source directly so tests cannot pass against a stale build.
 import {
   assessHost,
   checkPortAvailable,
+  dnsProbeName,
+  ensureProbeImageCached,
+  ensureSwap,
   getDockerBridgeGatewayIp,
   getMemoryInfo,
-  getNvidiaCdiSpecPath,
-  ensureSwap,
   isDockerUnderProvisioned,
+  isFatalContainerDnsProbeFailure,
   MIN_RECOMMENDED_DOCKER_CPUS,
   MIN_RECOMMENDED_DOCKER_MEM_GIB,
-  parseDockerCdiSpecDirs,
   parseDockerInfoCpus,
   parseDockerInfoMemTotalBytes,
   parseDockerStorageDriver,
   parseDockerUsesContainerdSnapshotter,
-  planHostRemediation,
-  dnsProbeName,
-  ensureProbeImageCached,
-  isFatalContainerDnsProbeFailure,
+  planHostAdvisories,
   probeContainerDns,
   probeDockerBridgeContainerStart,
-} from "../../../dist/lib/onboard/preflight";
+} from "./preflight";
 
 function requireMemoryInfo(result: ReturnType<typeof getMemoryInfo>) {
   expect(result).not.toBeNull();
@@ -34,6 +30,10 @@ function requireMemoryInfo(result: ReturnType<typeof getMemoryInfo>) {
     throw new Error("Expected memory info to be present");
   }
   return result;
+}
+
+function advisoryCommands(advisory: { commands?: readonly string[] } | undefined) {
+  return advisory?.commands ?? [];
 }
 
 describe("checkPortAvailable", () => {
@@ -163,7 +163,7 @@ describe("checkPortAvailable", () => {
 
 describe("probePortAvailability", () => {
   // Import probePortAvailability directly for targeted testing
-  const { probePortAvailability } = require("../../../dist/lib/onboard/preflight");
+  const { probePortAvailability } = require("./preflight");
 
   it("returns ok when port is free (real net probe)", async () => {
     // Use a high ephemeral port unlikely to be in use
@@ -322,8 +322,8 @@ describe("assessHost", () => {
       env: {},
       dockerInfoOutput: "Podman Engine",
       commandExistsImpl: (name: string) => name === "docker",
+      runCaptureImpl: () => "",
     });
-
     expect(result.runtime).toBe("podman");
     expect(result.isUnsupportedRuntime).toBe(true);
     expect(result.dockerReachable).toBe(true);
@@ -335,8 +335,8 @@ describe("assessHost", () => {
       env: {},
       dockerInfoOutput: "Podman Engine",
       commandExistsImpl: (name: string) => name === "docker",
+      runCaptureImpl: () => "",
     });
-
     expect(result.runtime).toBe("podman");
     expect(result.isUnsupportedRuntime).toBe(true);
     expect(result.dockerReachable).toBe(true);
@@ -640,211 +640,41 @@ describe("parseDockerUsesContainerdSnapshotter", () => {
   });
 });
 
-describe("parseDockerCdiSpecDirs", () => {
-  it("extracts the dirs from `docker info --format '{{json .}}'` output", () => {
-    const fixture = JSON.stringify({ CDISpecDirs: ["/etc/cdi", "/var/run/cdi"] });
-    expect(parseDockerCdiSpecDirs(fixture)).toEqual(["/etc/cdi", "/var/run/cdi"]);
-  });
-
-  it("returns an empty array when CDISpecDirs is absent", () => {
-    expect(parseDockerCdiSpecDirs(JSON.stringify({ ServerVersion: "27.0" }))).toEqual([]);
-  });
-
-  it("returns an empty array when CDISpecDirs is the empty list", () => {
-    expect(parseDockerCdiSpecDirs(JSON.stringify({ CDISpecDirs: [] }))).toEqual([]);
-  });
-
-  it("returns an empty array on empty input", () => {
-    expect(parseDockerCdiSpecDirs("")).toEqual([]);
-  });
-});
-
-describe("assessHost — CDI device-spec gap (#3152)", () => {
-  it("flags missing nvidia.com/gpu specs on an NVIDIA Linux host with CDI dirs configured", () => {
-    const result = assessHost({
+describe("planHostAdvisories", () => {
+  function baseAssessment(
+    overrides: Partial<Parameters<typeof planHostAdvisories>[0]> = {},
+  ): Parameters<typeof planHostAdvisories>[0] {
+    return {
       platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: () => "Linux version 6.8.0-58-generic",
-      readdirImpl: () => [],
-      dockerInfoOutput: JSON.stringify({
-        ServerVersion: "27.0",
-        OperatingSystem: "Ubuntu 24.04",
-        CDISpecDirs: ["/etc/cdi", "/var/run/cdi"],
-      }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
+      isWsl: false,
+      runtime: "unknown",
+      packageManager: "apt",
+      systemctlAvailable: true,
+      dockerServiceActive: null,
+      dockerServiceEnabled: null,
+      dockerInstalled: true,
+      dockerRunning: false,
+      dockerReachable: false,
+      nodeInstalled: true,
+      openshellInstalled: true,
+      dockerCgroupVersion: "unknown",
+      dockerDefaultCgroupnsMode: "unknown",
+      isContainerRuntimeUnderProvisioned: false,
+      hasNestedOverlayConflict: false,
+      requiresHostCgroupnsFix: false,
+      isUnsupportedRuntime: false,
+      isHeadlessLikely: false,
+      hasNvidiaGpu: false,
+      dockerCdiSpecDirs: [],
+      cdiNvidiaGpuSpecMissing: false,
+      nvidiaContainerToolkitInstalled: true,
+      notes: [],
+      ...overrides,
+    };
+  }
 
-    expect(result.dockerCdiSpecDirs).toEqual(["/etc/cdi", "/var/run/cdi"]);
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(true);
-  });
-
-  it("does not flag the host when an nvidia.com/gpu YAML spec is present", () => {
-    const result = assessHost({
-      platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: (filePath: string) =>
-        filePath.endsWith("nvidia.yaml")
-          ? "cdiVersion: 0.5.0\nkind: nvidia.com/gpu\ndevices: []\n"
-          : "Linux version 6.8.0-58-generic",
-      readdirImpl: (dir: string) => (dir === "/etc/cdi" ? ["nvidia.yaml"] : []),
-      dockerInfoOutput: JSON.stringify({
-        ServerVersion: "27.0",
-        CDISpecDirs: ["/etc/cdi", "/var/run/cdi"],
-      }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
-
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(false);
-  });
-
-  it("accepts a JSON-serialised CDI spec as well", () => {
-    const result = assessHost({
-      platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: (filePath: string) =>
-        filePath.endsWith("nvidia.json")
-          ? '{"cdiVersion":"0.5.0","kind":"nvidia.com/gpu","devices":[]}'
-          : "Linux version 6.8.0-58-generic",
-      readdirImpl: (dir: string) => (dir === "/etc/cdi" ? ["nvidia.json"] : []),
-      dockerInfoOutput: JSON.stringify({
-        ServerVersion: "27.0",
-        CDISpecDirs: ["/etc/cdi"],
-      }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
-
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(false);
-  });
-
-  it("does not flag a non-NVIDIA Linux host even with CDI dirs configured", () => {
-    const result = assessHost({
-      platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: () => "Linux version 6.8.0-58-generic",
-      readdirImpl: () => [],
-      dockerInfoOutput: JSON.stringify({
-        ServerVersion: "27.0",
-        CDISpecDirs: ["/etc/cdi"],
-      }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => false,
-    });
-
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(false);
-  });
-
-  it("does not flag a host that does not advertise CDISpecDirs", () => {
-    const result = assessHost({
-      platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: () => "Linux version 6.8.0-58-generic",
-      readdirImpl: () => [],
-      dockerInfoOutput: JSON.stringify({ ServerVersion: "24.0" }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
-
-    expect(result.dockerCdiSpecDirs).toEqual([]);
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(false);
-  });
-
-  it("does not flag macOS even when the docker info shape would otherwise match", () => {
-    const result = assessHost({
-      platform: "darwin",
-      env: {},
-      readFileImpl: () => "",
-      readdirImpl: () => [],
-      dockerInfoOutput: JSON.stringify({ CDISpecDirs: ["/etc/cdi"] }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
-
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(false);
-  });
-
-  it("does not accept a sibling device class such as nvidia.com/gpu-extra as a satisfying spec", () => {
-    const result = assessHost({
-      platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: (filePath: string) =>
-        filePath.endsWith("nvidia-extra.yaml")
-          ? "cdiVersion: 0.5.0\nkind: nvidia.com/gpu-extra\ndevices: []\n"
-          : "Linux version 6.8.0-58-generic",
-      readdirImpl: (dir: string) => (dir === "/etc/cdi" ? ["nvidia-extra.yaml"] : []),
-      dockerInfoOutput: JSON.stringify({
-        ServerVersion: "27.0",
-        CDISpecDirs: ["/etc/cdi"],
-      }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
-
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(true);
-  });
-
-  it("does not accept a sibling device class in JSON form either", () => {
-    const result = assessHost({
-      platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: (filePath: string) =>
-        filePath.endsWith("nvidia-extra.json")
-          ? '{"cdiVersion":"0.5.0","kind":"nvidia.com/gpu-extra","devices":[]}'
-          : "Linux version 6.8.0-58-generic",
-      readdirImpl: (dir: string) => (dir === "/etc/cdi" ? ["nvidia-extra.json"] : []),
-      dockerInfoOutput: JSON.stringify({
-        ServerVersion: "27.0",
-        CDISpecDirs: ["/etc/cdi"],
-      }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
-
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(true);
-  });
-
-  it("ignores spec files whose `kind` only mentions nvidia.com/gpu in a comment", () => {
-    const result = assessHost({
-      platform: "linux",
-      env: {},
-      release: "6.8.0-58-generic",
-      readFileImpl: (filePath: string) =>
-        filePath.endsWith("notes.yaml")
-          ? "# this used to declare nvidia.com/gpu; now stripped\nkind: example.com/cpu\n"
-          : "Linux version 6.8.0-58-generic",
-      readdirImpl: (dir: string) => (dir === "/etc/cdi" ? ["notes.yaml"] : []),
-      dockerInfoOutput: JSON.stringify({
-        ServerVersion: "27.0",
-        CDISpecDirs: ["/etc/cdi"],
-      }),
-      commandExistsImpl: (name: string) => name === "docker",
-      gpuProbeImpl: () => true,
-    });
-
-    expect(result.cdiNvidiaGpuSpecMissing).toBe(true);
-  });
-});
-
-describe("getNvidiaCdiSpecPath", () => {
-  it("builds the default NVIDIA CDI spec path from Docker CDI dirs", () => {
-    expect(getNvidiaCdiSpecPath({ dockerCdiSpecDirs: ["/etc/cdi/", "/var/run/cdi"] })).toBe(
-      "/etc/cdi/nvidia.yaml",
-    );
-  });
-});
-
-describe("planHostRemediation", () => {
   it("recommends starting docker when installed but unreachable and service inactive", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "unknown",
@@ -872,12 +702,48 @@ describe("planHostRemediation", () => {
     });
 
     expect(actions[0].id).toBe("start_docker");
-    expect(actions[0].blocking).toBe(true);
-    expect(actions[0].commands).toContain("sudo systemctl start docker");
+    expect(actions[0].severity).toBe("blocking");
+    expect(advisoryCommands(actions[0])).toContain("sudo systemctl start docker");
+  });
+
+  it("recommends Docker Desktop WSL integration when docker is missing inside WSL", () => {
+    const actions = planHostAdvisories(
+      baseAssessment({
+        isWsl: true,
+        dockerInstalled: false,
+        systemctlAvailable: false,
+      }),
+    );
+
+    expect(actions[0].id).toBe("enable_docker_desktop_wsl_integration");
+    expect(actions[0].title).toBe("Enable Docker Desktop WSL integration");
+    expect(actions[0].severity).toBe("blocking");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain(
+      "Docker Desktop → Settings → Resources → WSL integration",
+    );
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("wsl --shutdown");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("docker info");
+  });
+
+  it("recommends Docker Desktop WSL integration when docker is unreachable inside WSL", () => {
+    const actions = planHostAdvisories(
+      baseAssessment({
+        isWsl: true,
+        dockerInstalled: true,
+        dockerServiceActive: true,
+        systemctlAvailable: false,
+      }),
+    );
+
+    expect(actions[0].id).toBe("enable_docker_desktop_wsl_integration");
+    expect(actions[0].reason).toContain("WSL distro cannot reach the Docker daemon");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("Start Docker Desktop");
+    expect(advisoryCommands(actions[0]).join("\n")).toContain("wsl --shutdown");
+    expect(advisoryCommands(actions[0]).join("\n")).not.toContain("sudo systemctl start docker");
   });
 
   it("suggests usermod when docker service is active but daemon is unreachable", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "unknown",
@@ -906,50 +772,15 @@ describe("planHostRemediation", () => {
 
     expect(actions[0].id).toBe("docker_group_permission");
     expect(actions[0].kind).toBe("sudo");
-    expect(actions[0].blocking).toBe(true);
-    expect(actions[0].commands[0]).toBe("sudo usermod -aG docker $USER");
-    expect(actions[0].commands[1]).toContain("newgrp docker");
-    expect(actions[0].commands[2]).toBe("nemoclaw onboard");
+    expect(actions[0].severity).toBe("blocking");
+    expect(advisoryCommands(actions[0])[0]).toBe("sudo usermod -aG docker $USER");
+    expect(advisoryCommands(actions[0])[1]).toContain("newgrp docker");
+    expect(advisoryCommands(actions[0])[2]).toBe("nemoclaw onboard");
     expect(actions[0].reason).toContain("docker group");
   });
 
-  it("warns that podman is unsupported on macOS without blocking onboarding", () => {
-    const actions = planHostRemediation({
-      platform: "darwin",
-      isWsl: false,
-      runtime: "podman",
-      packageManager: "brew",
-      systemctlAvailable: false,
-      dockerServiceActive: null,
-      dockerServiceEnabled: null,
-      dockerInstalled: true,
-      dockerRunning: true,
-      dockerReachable: true,
-      nodeInstalled: true,
-      openshellInstalled: true,
-      dockerCgroupVersion: "unknown",
-      dockerDefaultCgroupnsMode: "unknown",
-      isContainerRuntimeUnderProvisioned: false,
-      hasNestedOverlayConflict: false,
-      requiresHostCgroupnsFix: false,
-      isUnsupportedRuntime: true,
-      isHeadlessLikely: false,
-      hasNvidiaGpu: false,
-      dockerCdiSpecDirs: [],
-      cdiNvidiaGpuSpecMissing: false,
-      nvidiaContainerToolkitInstalled: true,
-      notes: [],
-    });
-
-    const action = actions.find(
-      (entry: { id: string }) => entry.id === "unsupported_runtime_warning",
-    );
-    expect(action).toBeTruthy();
-    expect(action?.blocking).toBe(false);
-  });
-
   it("recommends installing Docker with a generic Linux hint when it is missing", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "unknown",
@@ -977,11 +808,11 @@ describe("planHostRemediation", () => {
     });
 
     expect(actions[0].id).toBe("install_docker");
-    expect(actions[0].commands[0]).toContain("Install Docker Engine");
+    expect(advisoryCommands(actions[0])[0]).toContain("Install Docker Engine");
   });
 
   it("recommends installing openshell when missing", () => {
-    const actions = planHostRemediation({
+    const actions = planHostAdvisories({
       platform: "linux",
       isWsl: false,
       runtime: "docker",
@@ -1009,143 +840,6 @@ describe("planHostRemediation", () => {
     });
 
     expect(actions.some((action: { id: string }) => action.id === "install_openshell")).toBe(true);
-  });
-
-  it("emits a blocking generate_nvidia_cdi_spec action when CDI dirs are configured but no nvidia.com/gpu spec exists", () => {
-    const actions = planHostRemediation({
-      platform: "linux",
-      isWsl: false,
-      runtime: "docker",
-      packageManager: "apt",
-      systemctlAvailable: true,
-      dockerServiceActive: true,
-      dockerServiceEnabled: true,
-      dockerInstalled: true,
-      dockerRunning: true,
-      dockerReachable: true,
-      nodeInstalled: true,
-      openshellInstalled: true,
-      dockerCgroupVersion: "v2",
-      dockerDefaultCgroupnsMode: "unknown",
-      isContainerRuntimeUnderProvisioned: false,
-      hasNestedOverlayConflict: false,
-      requiresHostCgroupnsFix: false,
-      isUnsupportedRuntime: false,
-      isHeadlessLikely: false,
-      hasNvidiaGpu: true,
-      dockerCdiSpecDirs: ["/etc/cdi", "/var/run/cdi"],
-      cdiNvidiaGpuSpecMissing: true,
-      nvidiaContainerToolkitInstalled: true,
-      notes: [],
-    });
-
-    const action = actions.find(
-      (entry: { id: string }) => entry.id === "generate_nvidia_cdi_spec",
-    );
-    expect(action).toBeTruthy();
-    expect(action?.kind).toBe("sudo");
-    expect(action?.blocking).toBe(true);
-    expect(action?.commands[0]).toBe("sudo mkdir -p /etc/cdi");
-    expect(action?.commands[1]).toBe(
-      "sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
-    );
-    expect(action?.commands[2]).toContain("nvidia-ctk cdi list");
-    expect(action?.commands[3]).toContain("nemoclaw onboard");
-    expect(action?.reason).toContain("nvidia.com/gpu");
-  });
-
-  it("emits an install_nvidia_container_toolkit action with apt bootstrap when nvidia-ctk is missing on apt hosts", () => {
-    const actions = planHostRemediation({
-      platform: "linux",
-      isWsl: false,
-      runtime: "docker",
-      packageManager: "apt",
-      systemctlAvailable: true,
-      dockerServiceActive: true,
-      dockerServiceEnabled: true,
-      dockerInstalled: true,
-      dockerRunning: true,
-      dockerReachable: true,
-      nodeInstalled: true,
-      openshellInstalled: true,
-      dockerCgroupVersion: "v2",
-      dockerDefaultCgroupnsMode: "unknown",
-      isContainerRuntimeUnderProvisioned: false,
-      hasNestedOverlayConflict: false,
-      requiresHostCgroupnsFix: false,
-      isUnsupportedRuntime: false,
-      isHeadlessLikely: false,
-      hasNvidiaGpu: true,
-      dockerCdiSpecDirs: ["/etc/cdi", "/var/run/cdi"],
-      cdiNvidiaGpuSpecMissing: true,
-      nvidiaContainerToolkitInstalled: false,
-      notes: [],
-    });
-
-    expect(actions.find((entry) => entry.id === "generate_nvidia_cdi_spec")).toBeUndefined();
-    const action = actions.find((entry) => entry.id === "install_nvidia_container_toolkit");
-    expect(action).toBeTruthy();
-    expect(action?.kind).toBe("sudo");
-    expect(action?.blocking).toBe(true);
-    expect(action?.title).toContain("Install NVIDIA Container Toolkit");
-    expect(action?.reason).toContain("nvidia-container-toolkit");
-    expect(action?.commands.some((c) => c.includes("nvidia-container-toolkit-keyring.gpg"))).toBe(
-      true,
-    );
-    expect(action?.commands.some((c) => c === "sudo apt-get install -y nvidia-container-toolkit")).toBe(
-      true,
-    );
-    expect(
-      action?.commands.some((c) => c.startsWith("sudo nvidia-ctk cdi generate --output=")),
-    ).toBe(true);
-    const ctkInstallIndex =
-      action?.commands.findIndex((c) => c === "sudo apt-get install -y nvidia-container-toolkit") ??
-      -1;
-    const ctkGenerateIndex =
-      action?.commands.findIndex((c) => c.startsWith("sudo nvidia-ctk cdi generate --output=")) ??
-      -1;
-    expect(ctkInstallIndex).toBeGreaterThanOrEqual(0);
-    expect(ctkGenerateIndex).toBeGreaterThan(ctkInstallIndex);
-  });
-
-  it("emits an install_nvidia_container_toolkit action with a docs pointer when nvidia-ctk is missing on unknown package managers", () => {
-    const actions = planHostRemediation({
-      platform: "linux",
-      isWsl: false,
-      runtime: "docker",
-      packageManager: "unknown",
-      systemctlAvailable: true,
-      dockerServiceActive: true,
-      dockerServiceEnabled: true,
-      dockerInstalled: true,
-      dockerRunning: true,
-      dockerReachable: true,
-      nodeInstalled: true,
-      openshellInstalled: true,
-      dockerCgroupVersion: "v2",
-      dockerDefaultCgroupnsMode: "unknown",
-      isContainerRuntimeUnderProvisioned: false,
-      hasNestedOverlayConflict: false,
-      requiresHostCgroupnsFix: false,
-      isUnsupportedRuntime: false,
-      isHeadlessLikely: false,
-      hasNvidiaGpu: true,
-      dockerCdiSpecDirs: ["/etc/cdi", "/var/run/cdi"],
-      cdiNvidiaGpuSpecMissing: true,
-      nvidiaContainerToolkitInstalled: false,
-      notes: [],
-    });
-
-    const action = actions.find((entry) => entry.id === "install_nvidia_container_toolkit");
-    expect(action).toBeTruthy();
-    expect(
-      action?.commands.some((c) =>
-        c.includes("docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide"),
-      ),
-    ).toBe(true);
-    expect(
-      action?.commands.some((c) => c.startsWith("sudo nvidia-ctk cdi generate --output=")),
-    ).toBe(true);
   });
 });
 
@@ -1315,12 +1009,13 @@ describe("probeContainerDns", () => {
     expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
   });
 
-  it("downgrades unrelated docker output (no resolver evidence) from fatal resolution_failed to inconclusive error (#3630 CodeRabbit)", () => {
+  it("downgrades unrelated docker output without resolver evidence from fatal resolution_failed to an inconclusive error per CodeRabbit review (#3630)", () => {
     // No "Server:" header — nslookup never produced a resolver response.
     // The output is some docker-side message unrelated to DNS, so we
     // must not abort onboarding with the systemd-resolved remediation.
     const result = probeContainerDns({
-      outputOverride: "docker: random unrelated diagnostic output that mentions nothing DNS related\n",
+      outputOverride:
+        "docker: random unrelated diagnostic output that mentions nothing DNS related\n",
     });
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("error");
@@ -1457,7 +1152,7 @@ describe("probeContainerDns", () => {
     expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
   });
 
-  it("classifies a wedged Docker daemon (inspect_unavailable) as fatal docker_daemon_unreachable (#3630 codex review)", () => {
+  it("classifies a wedged Docker daemon with inspect_unavailable as fatal docker_daemon_unreachable per Codex review (#3630)", () => {
     const result = probeContainerDns({
       ensureImageCachedOverride: {
         ok: false,
@@ -1470,7 +1165,7 @@ describe("probeContainerDns", () => {
     expect(isFatalContainerDnsProbeFailure(result)).toBe(true);
   });
 
-  it("does not treat a registry TCP timeout (i/o timeout on :443) as a fatal DNS failure (#3630 codex review)", () => {
+  it("does not treat a registry TCP timeout on port 443 as a fatal DNS failure per Codex review (#3630)", () => {
     // dial tcp <ip>:443 errors are TCP connectivity, NOT DNS — must not
     // be routed to UDP:53/systemd-resolved remediation.
     const result = probeContainerDns({
@@ -1577,7 +1272,7 @@ describe("probeContainerDns", () => {
     expect(seenScript).toContain("nslookup pinned-test.invalid");
   });
 
-  it("rejects shell metacharacters in probeName to prevent sh -c injection (#3630 CodeRabbit)", () => {
+  it("rejects shell metacharacters in probeName to prevent sh -c injection per CodeRabbit review (#3630)", () => {
     const injections = [
       "x; touch /tmp/pwned",
       "x && touch /tmp/pwned",
@@ -1585,7 +1280,7 @@ describe("probeContainerDns", () => {
       "x$(whoami)",
       "x|whoami",
       "x\nwhoami",
-      "x \"; rm -rf /\"",
+      'x "; rm -rf /"',
     ];
     for (const probeName of injections) {
       expect(() => probeContainerDns({ probeName })).toThrow(/probeName must be a plain DNS name/);
@@ -1596,7 +1291,8 @@ describe("probeContainerDns", () => {
     expect(() =>
       probeContainerDns({
         probeName: "nemoclaw-dns-probe-abc123.invalid",
-        runCaptureImpl: () => "Server:\t1.1.1.1\nAddress:\t1.1.1.1:53\n** server can't find x: NXDOMAIN\n",
+        runCaptureImpl: () =>
+          "Server:\t1.1.1.1\nAddress:\t1.1.1.1:53\n** server can't find x: NXDOMAIN\n",
       }),
     ).not.toThrow();
   });
@@ -1688,7 +1384,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.exitCode).toBe(125);
   });
 
-  it("does not misclassify unrelated 'veth' mentions as fatal veth_unsupported (#3630 CodeRabbit)", () => {
+  it("does not misclassify unrelated 'veth' mentions as fatal veth_unsupported per CodeRabbit review (#3630)", () => {
     // Output references "veth" in passing — without the bridge-create
     // signature, it must stay on the generic-error path, not the fatal
     // Jetson remediation path.
@@ -1705,7 +1401,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.reason).not.toBe("veth_unsupported");
   });
 
-  it("does not misclassify generic 'operation not supported' errors as veth_unsupported (#3630 CodeRabbit)", () => {
+  it("does not misclassify generic 'operation not supported' errors as veth_unsupported per CodeRabbit review (#3630)", () => {
     // Generic OS-level "operation not supported" (e.g., from a cgroup
     // mount or unrelated syscall) must not be promoted to fatal veth.
     const result = probeDockerBridgeContainerStart({
@@ -1721,7 +1417,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.reason).not.toBe("veth_unsupported");
   });
 
-  it("flags bridge container kill-by-signal (no timeout) as reason 'killed' (#3630 CodeRabbit)", () => {
+  it("flags a bridge container killed by signal without a timeout as reason 'killed' per CodeRabbit review (#3630)", () => {
     const result = probeDockerBridgeContainerStart({
       executionOverride: {
         stdout: "",
@@ -1780,7 +1476,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(seenOpts?.timeout).toBe(20_000);
   });
 
-  it("reports image_pull_failed (not bridge timeout) when the busybox pre-pull times out (#3630 codex review)", () => {
+  it("reports image_pull_failed instead of bridge timeout when the busybox pre-pull times out per Codex review (#3630)", () => {
     const result = probeDockerBridgeContainerStart({
       ensureImageCachedOverride: {
         ok: false,
@@ -1806,7 +1502,7 @@ describe("probeDockerBridgeContainerStart", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("reports a wedged Docker daemon (inspect_unavailable) as fatal docker_daemon_unreachable (#3630 codex review)", () => {
+  it("reports a wedged Docker daemon with inspect_unavailable as fatal docker_daemon_unreachable per Codex review (#3630)", () => {
     const result = probeDockerBridgeContainerStart({
       ensureImageCachedOverride: {
         ok: false,
@@ -1838,7 +1534,7 @@ describe("ensureProbeImageCached", () => {
     expect(result.alreadyCached).toBe(true);
   });
 
-  it("classifies an inspect spawn timeout (ETIMEDOUT) as inspect_unavailable without falling through to pull (#3630 CodeRabbit)", () => {
+  it("classifies an ETIMEDOUT inspect spawn as inspect_unavailable without falling through to pull per CodeRabbit review (#3630)", () => {
     const result = ensureProbeImageCached("busybox:latest", {
       inspectProbeImpl: () => ({
         stdout: "",
@@ -1857,7 +1553,7 @@ describe("ensureProbeImageCached", () => {
     expect(result.reason).toBe("inspect_unavailable");
   });
 
-  it("classifies 'Cannot connect to the Docker daemon' inspect stderr as inspect_unavailable (#3630 codex review)", () => {
+  it("classifies 'Cannot connect to the Docker daemon' inspect stderr as inspect_unavailable per Codex review (#3630)", () => {
     const result = ensureProbeImageCached("busybox:latest", {
       inspectProbeImpl: () => ({
         stdout: "",
@@ -2072,7 +1768,7 @@ describe("isDockerUnderProvisioned", () => {
   });
 });
 
-describe("assessHost — container runtime resource detection (regression #2514)", () => {
+describe("assessHost container runtime resource detection (#2514)", () => {
   it("flags default Colima (2 CPU / 2 GiB) as under-provisioned", () => {
     const result = assessHost({
       platform: "darwin",
@@ -2121,7 +1817,7 @@ describe("assessHost — container runtime resource detection (regression #2514)
   });
 });
 
-describe("planHostRemediation — under-provisioned runtime", () => {
+describe("planHostAdvisories — under-provisioned runtime", () => {
   it("emits a Colima-specific resize action when runtime is colima", () => {
     const assessment = assessHost({
       platform: "darwin",
@@ -2134,11 +1830,11 @@ describe("planHostRemediation — under-provisioned runtime", () => {
       }),
       commandExistsImpl: (name: string) => name === "docker",
     });
-    const actions = planHostRemediation(assessment);
+    const actions = planHostAdvisories(assessment);
     const action = actions.find((a) => a.id === "container_runtime_under_provisioned");
     expect(action).toBeDefined();
-    expect(action?.blocking).toBe(false);
-    expect(action?.commands.some((c) => c.startsWith("colima start"))).toBe(true);
+    expect(action?.severity).toBe("warning");
+    expect(advisoryCommands(action).some((c) => c.startsWith("colima start"))).toBe(true);
   });
 
   it("emits a Docker Desktop hint when runtime is docker-desktop", () => {
@@ -2153,10 +1849,12 @@ describe("planHostRemediation — under-provisioned runtime", () => {
       }),
       commandExistsImpl: (name: string) => name === "docker",
     });
-    const actions = planHostRemediation(assessment);
+    const actions = planHostAdvisories(assessment);
     const action = actions.find((a) => a.id === "container_runtime_under_provisioned");
     expect(action).toBeDefined();
-    expect(action?.commands.some((c) => c.toLowerCase().includes("docker desktop"))).toBe(true);
+    expect(advisoryCommands(action).some((c) => c.toLowerCase().includes("docker desktop"))).toBe(
+      true,
+    );
   });
 
   it("emits no resource action when runtime is properly sized", () => {
@@ -2171,7 +1869,7 @@ describe("planHostRemediation — under-provisioned runtime", () => {
       }),
       commandExistsImpl: (name: string) => name === "docker",
     });
-    const actions = planHostRemediation(assessment);
+    const actions = planHostAdvisories(assessment);
     expect(actions.find((a) => a.id === "container_runtime_under_provisioned")).toBeUndefined();
   });
 });

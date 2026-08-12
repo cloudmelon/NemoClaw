@@ -12,7 +12,9 @@ vi.mock("node:dns", () => ({
   promises: { lookup: (...args: unknown[]) => mockLookup(...(args as [string, { all: true }])) },
 }));
 
-const { isPrivateIp, validateEndpointUrl } = await import("./ssrf.js");
+const { isPrivateIp, safeEndpointUrlForDownstream, validateEndpointUrl } = await import(
+  "./ssrf.js"
+);
 
 // ── isPrivateIp ─────────────────────────────────────────────────
 
@@ -258,7 +260,7 @@ describe("isPrivateIp – CIDR boundary precision", () => {
     ["128.0.0.0", false], // just above 127.0.0.0/8
     ["192.167.255.255", false], // just below 192.168.0.0/16
     ["192.169.0.0", false], // just above 192.168.0.0/16
-  ])("boundary %s → private=%s", (ip, expected) => {
+  ])("classifies boundary address %s as private=%s", (ip, expected) => {
     expect(isPrivateIp(ip)).toBe(expected);
   });
 });
@@ -277,7 +279,7 @@ describe("isPrivateIp – IPv6 edge cases", () => {
     ["fd00::0", true], // first address in fd00::/8 (within fc00::/7)
     ["fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true], // last address in fc00::/7 ULA range
     ["fe00::1", false], // just above fc00::/7 (link-local starts at fe80::)
-  ])("IPv6 %s → private=%s", (ip, expected) => {
+  ])("classifies IPv6 address %s as private=%s", (ip, expected) => {
     expect(isPrivateIp(ip)).toBe(expected);
   });
 
@@ -340,10 +342,29 @@ describe("validateEndpointUrl – DNS pinning", () => {
     expect(result.url).toBe("http://attacker.com:8080/v1");
   });
 
-  it("pins HTTPS URL to resolved IP", async () => {
+  it("pins HTTPS URL to resolved IP metadata without marking it downstream-safe", async () => {
     mockPublicDns();
     const result = await validateEndpointUrl("https://api.example.com/v1");
     expect(result.pinnedUrl).toBe("https://93.184.216.34/v1");
+    expect(result).toMatchObject({
+      protocol: "https:",
+      hostname: "api.example.com",
+      resolvedAddress: "93.184.216.34",
+      resolvedFamily: 4,
+      dnsResolved: true,
+    });
+    expect(() => safeEndpointUrlForDownstream(result)).toThrow(/DNS-backed HTTPS endpoint/);
+  });
+
+  it("keeps HTTPS IP-literal endpoints downstream-safe", async () => {
+    const result = await validateEndpointUrl("https://93.184.216.34/v1");
+    expect(safeEndpointUrlForDownstream(result)).toBe("https://93.184.216.34/v1");
+  });
+
+  it("returns pinned HTTP endpoints for downstream use", async () => {
+    mockPublicDns();
+    const result = await validateEndpointUrl("http://api.example.com/v1");
+    expect(safeEndpointUrlForDownstream(result)).toBe("http://93.184.216.34/v1");
   });
 
   it("pins IPv6 address with brackets", async () => {
@@ -369,25 +390,89 @@ describe("validateEndpointUrl – URL parsing edge cases", () => {
     );
   });
 
-  it("allows URL with query parameters", async () => {
+  it("parses URL with query parameters but does not mark DNS-backed HTTPS downstream-safe", async () => {
     mockPublicDns();
     const url = "https://api.example.com/v1?key=abc&model=gpt";
     const result = await validateEndpointUrl(url);
     expect(result.url).toBe(url);
+    expect(() => safeEndpointUrlForDownstream(result)).toThrow(/DNS-backed HTTPS endpoint/);
   });
 
-  it("allows URL with fragment", async () => {
+  it("parses URL with fragment but does not mark DNS-backed HTTPS downstream-safe", async () => {
     mockPublicDns();
     const url = "https://api.example.com/v1#section";
     const result = await validateEndpointUrl(url);
     expect(result.url).toBe(url);
+    expect(() => safeEndpointUrlForDownstream(result)).toThrow(/DNS-backed HTTPS endpoint/);
   });
 
-  it("allows URL with userinfo/basic auth", async () => {
-    mockPublicDns();
-    // URL parser extracts hostname correctly even with userinfo
-    const url = "https://user:pass@api.example.com/v1";
-    const result = await validateEndpointUrl(url);
-    expect(result.url).toBe(url);
+  it("rejects URL with userinfo/basic auth credentials", async () => {
+    mockLookup.mockClear();
+    const cases = [
+      {
+        url: "https://alice:s3cret-token@api.example.com/v1",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      {
+        url: "http://alice:s3cret-token@api.example.com/v1",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      {
+        url: "https://only-alice@api.example.com/v1",
+        secrets: ["only-alice"],
+      },
+      {
+        url: "https://:only-s3cret@api.example.com/v1",
+        secrets: ["only-s3cret"],
+      },
+    ] as const;
+
+    for (const { url, secrets } of cases) {
+      let thrown: unknown;
+      try {
+        await validateEndpointUrl(url);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const message = thrown instanceof Error ? thrown.message : String(thrown);
+      expect(message).toMatch(/must not contain credentials/);
+      for (const secret of secrets) {
+        expect(message).not.toContain(secret);
+      }
+    }
+    expect(mockLookup).not.toHaveBeenCalled();
+  });
+
+  it("does not expose credentials from malformed endpoint URLs", async () => {
+    mockLookup.mockClear();
+    const cases = [
+      {
+        url: "https://alice:s3cret-token@",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      {
+        url: "https://alice:s3cret-token@/",
+        secrets: ["alice", "s3cret-token", "alice:s3cret-token"],
+      },
+      { url: "https://:only-s3cret@", secrets: ["only-s3cret"] },
+      { url: "https://only-alice@", secrets: ["only-alice"] },
+    ] as const;
+
+    for (const { url, secrets } of cases) {
+      let thrown: unknown;
+      try {
+        await validateEndpointUrl(url);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const message = thrown instanceof Error ? thrown.message : String(thrown);
+      expect(message).toMatch(/No hostname found in URL/);
+      for (const secret of secrets) {
+        expect(message).not.toContain(secret);
+      }
+    }
+    expect(mockLookup).not.toHaveBeenCalled();
   });
 });
