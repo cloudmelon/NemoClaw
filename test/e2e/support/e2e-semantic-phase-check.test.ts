@@ -101,23 +101,6 @@ describe("semantic E2E phase checker", () => {
     ]);
   });
 
-  // source-shape-contract: compatibility -- Generated policy output must precede semantic collection and remain shared with the canonical CLI build
-  test("builds the policy boundary before semantic collection and CLI compilation", () => {
-    const scripts = (
-      JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
-        scripts: Record<string, string>;
-      }
-    ).scripts;
-
-    expect(scripts["build:policy-boundary"]).toBe("tsc -p nemoclaw/tsconfig.shared.json");
-    expect(scripts["test:e2e-phases:check"]).toMatch(
-      /^npm run build:policy-boundary && node .*tools\/e2e\/check-semantic-phases\.mts$/u,
-    );
-    expect(scripts["build:cli"]).toMatch(
-      /^npm run build:policy-boundary && tsc -p tsconfig\.src\.json &&/u,
-    );
-  });
-
   test("derives coverage from registry, free-standing, shared, and forwarding workflow paths", () => {
     const modules = semanticPhaseCoverageModules(
       {
@@ -125,7 +108,10 @@ describe("semantic E2E phase checker", () => {
         testMatrix: [
           {
             id: "vllm-docker-storage",
-            file: "test/vllm-docker-storage.test.ts",
+            execution_id: "vllm-docker-storage-docker",
+            runtime_provider: "docker",
+            coverage_variant: "docker",
+            file: "test/platform/images/vllm-docker-storage.test.ts",
             project: "integration",
           },
         ],
@@ -133,7 +119,7 @@ describe("semantic E2E phase checker", () => {
       {
         liveTestToJobs: new Map([
           ["test/e2e/live/bootstrap-install-smoke.test.ts", ["bootstrap-install-smoke"]],
-          ["test/vllm-docker-storage.test.ts", ["vllm-docker-storage"]],
+          ["test/platform/images/vllm-docker-storage.test.ts", ["vllm-docker-storage"]],
         ]),
       },
       [
@@ -150,7 +136,7 @@ describe("semantic E2E phase checker", () => {
       { file: "test/e2e/live/launchable-smoke.test.ts", project: "e2e-live" },
       { file: "test/e2e/live/registry-targets.test.ts", project: "e2e-live" },
       { file: "test/e2e/live/unselected-regression.test.ts", project: "e2e-live" },
-      { file: "test/vllm-docker-storage.test.ts", project: "integration" },
+      { file: "test/platform/images/vllm-docker-storage.test.ts", project: "integration" },
     ]);
   });
 
@@ -214,7 +200,16 @@ describe("semantic E2E phase checker", () => {
     );
   });
 
-  test("accepts only the exact bootstrap forwarding alias", () => {
+  test.each([
+    { forwardedTestModules: [] },
+    { forwardedTestModules: ["test/e2e/live/other.test.ts"] },
+    {
+      forwardedTestModules: [
+        "test/e2e/live/launchable-smoke.test.ts",
+        "test/e2e/live/other.test.ts",
+      ],
+    },
+  ])("accepts only the exact bootstrap forwarding alias [case %#]", ({ forwardedTestModules }) => {
     const forwardingModule = {
       relativeModuleId: "test/e2e/live/bootstrap-install-smoke.test.ts",
       errors: [],
@@ -265,18 +260,13 @@ describe("semantic E2E phase checker", () => {
     ]);
     const expectedFailure =
       "test/e2e/live/bootstrap-install-smoke.test.ts: forwarding module must import exactly test/e2e/live/launchable-smoke.test.ts";
-    for (const forwardedTestModules of [
-      [],
-      ["test/e2e/live/other.test.ts"],
-      ["test/e2e/live/launchable-smoke.test.ts", "test/e2e/live/other.test.ts"],
-    ]) {
-      expect(
-        validateCollectedSemanticPhaseModule({
-          ...forwardingModule,
-          source: { ...forwardingModule.source, forwardedTestModules },
-        }),
-      ).toEqual([expectedFailure]);
-    }
+
+    expect(
+      validateCollectedSemanticPhaseModule({
+        ...forwardingModule,
+        source: { ...forwardingModule.source, forwardedTestModules },
+      }),
+    ).toEqual([expectedFailure]);
 
     const forwardingSource = scanLiveSourceGraph(
       path.join(REPO_ROOT, "test/e2e/live/bootstrap-install-smoke.test.ts"),

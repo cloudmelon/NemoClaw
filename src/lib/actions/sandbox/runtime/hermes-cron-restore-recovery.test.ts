@@ -6,9 +6,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   connectSandbox: vi.fn(),
   getSessionAgent: vi.fn(),
+  inspectPortableAgentReceiptDisposition: vi.fn(),
   prepareHermesCronRestoreRecovery: vi.fn(),
   recoverHermesCronRestore: vi.fn(),
-  withMcpLifecycleLock: vi.fn(
+  withSandboxLifecycleLock: vi.fn(
     async (_sandboxName: string, operation: () => Promise<void>, _options: unknown) => operation(),
   ),
 }));
@@ -18,8 +19,12 @@ vi.mock("../../../agent/runtime", async (importOriginal) => ({
   getSessionAgent: mocks.getSessionAgent,
 }));
 
-vi.mock("../../../state/mcp-lifecycle-lock", () => ({
-  withMcpLifecycleLock: mocks.withMcpLifecycleLock,
+vi.mock("../lifecycle/lock", () => ({
+  withSandboxLifecycleLock: mocks.withSandboxLifecycleLock,
+}));
+
+vi.mock("../../../onboard/experimental/portable-agent-lifecycle", () => ({
+  inspectPortableAgentReceiptDisposition: mocks.inspectPortableAgentReceiptDisposition,
 }));
 
 vi.mock("../connect", () => ({
@@ -37,6 +42,7 @@ describe("sandbox recovery with a Hermes cron restore gate", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.connectSandbox.mockResolvedValue(undefined);
+    mocks.inspectPortableAgentReceiptDisposition.mockReturnValue({ kind: "absent" });
     mocks.prepareHermesCronRestoreRecovery.mockReturnValue("not-required");
     mocks.recoverHermesCronRestore.mockReturnValue("not-required");
   });
@@ -58,13 +64,33 @@ describe("sandbox recovery with a Hermes cron restore gate", () => {
 
     await recoverSandboxWithHermesCronRestore("alpha");
 
-    expect(mocks.withMcpLifecycleLock).toHaveBeenCalledWith("alpha", expect.any(Function), {
+    expect(mocks.withSandboxLifecycleLock).toHaveBeenCalledWith("alpha", expect.any(Function), {
       timeoutMs: 30_000,
     });
     expect(events).toEqual(["prepare", "connect", "recover"]);
     expect(mocks.prepareHermesCronRestoreRecovery).toHaveBeenCalledWith("alpha");
-    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", { probeOnly: true });
+    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", {
+      probeOnly: true,
+      requireLaunchReadinessPublication: false,
+    });
     expect(mocks.recoverHermesCronRestore).toHaveBeenCalledWith("alpha");
+  });
+
+  it("routes schema-5 recovery directly to receipt-owned probe without cron mutation (#9203)", async () => {
+    mocks.inspectPortableAgentReceiptDisposition.mockReturnValue({
+      kind: "hermes",
+      phase: "active",
+    });
+    mocks.getSessionAgent.mockReturnValue({ name: "hermes" });
+
+    await recoverSandboxWithHermesCronRestore("alpha");
+
+    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", {
+      probeOnly: true,
+      requireLaunchReadinessPublication: false,
+    });
+    expect(mocks.prepareHermesCronRestoreRecovery).not.toHaveBeenCalled();
+    expect(mocks.recoverHermesCronRestore).not.toHaveBeenCalled();
   });
 
   it("does not repair the gateway when Hermes gate preparation fails", async () => {
@@ -76,7 +102,6 @@ describe("sandbox recovery with a Hermes cron restore gate", () => {
     await expect(recoverSandboxWithHermesCronRestore("alpha")).rejects.toThrow(
       "recovery authority is unsafe",
     );
-
     expect(mocks.connectSandbox).not.toHaveBeenCalled();
     expect(mocks.recoverHermesCronRestore).not.toHaveBeenCalled();
   });
@@ -89,7 +114,10 @@ describe("sandbox recovery with a Hermes cron restore gate", () => {
     await recoverSandboxWithHermesCronRestore("alpha");
 
     expect(mocks.prepareHermesCronRestoreRecovery).toHaveBeenCalledWith("alpha");
-    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", { probeOnly: true });
+    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", {
+      probeOnly: true,
+      requireLaunchReadinessPublication: false,
+    });
     expect(mocks.recoverHermesCronRestore).toHaveBeenCalledWith("alpha");
   });
 
@@ -98,7 +126,10 @@ describe("sandbox recovery with a Hermes cron restore gate", () => {
 
     await recoverSandboxWithHermesCronRestore("alpha");
 
-    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", { probeOnly: true });
+    expect(mocks.connectSandbox).toHaveBeenCalledWith("alpha", {
+      probeOnly: true,
+      requireLaunchReadinessPublication: false,
+    });
     expect(mocks.prepareHermesCronRestoreRecovery).not.toHaveBeenCalled();
     expect(mocks.recoverHermesCronRestore).not.toHaveBeenCalled();
   });

@@ -45,13 +45,20 @@ const PROFILE_ENVIRONMENT_INPUTS = {
     "NEMOCLAW_PROXY_PORT",
     "NEMOCLAW_REASONING_EFFORT",
   ],
+  pi: [
+    "NEMOCLAW_CONTEXT_WINDOW",
+    "NEMOCLAW_MAX_TOKENS",
+    "NEMOCLAW_PROXY_HOST",
+    "NEMOCLAW_PROXY_PORT",
+    "NEMOCLAW_REASONING",
+  ],
 } as const satisfies Record<ManagedStartupAgent, readonly string[]>;
 
 const HOST_NO_PROXY_INPUTS = ["NO_PROXY", "no_proxy"] as const;
 
 export interface ManagedStartupOnboardProfileInput {
   readonly agentName: string;
-  readonly inference: ManagedStartupResolvedInferenceInput;
+  readonly inference: ManagedStartupResolvedInferenceInput | null;
   readonly chatUiUrl: string;
   readonly effectiveDashboardPort: number;
   readonly manageDashboard: boolean;
@@ -101,6 +108,10 @@ function requireDashboardPort(port: number): number {
   return port;
 }
 
+function loopbackDashboardUrl(port: number): string {
+  return `http://127.0.0.1:${String(port)}`;
+}
+
 function dashboardHostname(chatUiUrl: string): string {
   try {
     return new URL(chatUiUrl).hostname;
@@ -116,6 +127,13 @@ function dashboardForInput(
   if (agent === "langchain-deepagents-code") {
     if (input.manageDashboard) {
       throw new ManagedStartupOnboardProfileError("DCode must not enable a dashboard");
+    }
+    return { agent, mode: "disabled" };
+  }
+
+  if (agent === "pi") {
+    if (input.manageDashboard) {
+      throw new ManagedStartupOnboardProfileError("Pi must not enable a dashboard");
     }
     return { agent, mode: "disabled" };
   }
@@ -147,11 +165,13 @@ function dashboardForInput(
   }
 
   const config = input.hermesDashboardState.config;
+  const effectivePort = requireDashboardPort(input.effectiveDashboardPort);
   if (!input.hermesDashboardState.enabled) {
     return {
       agent,
       mode: "disabled",
-      url: input.chatUiUrl,
+      url: loopbackDashboardUrl(effectivePort),
+      browserUrl: input.chatUiUrl,
       publicPort: null,
       internalPort: null,
       tuiEnabled: false,
@@ -162,11 +182,18 @@ function dashboardForInput(
       "Hermes dashboard is enabled without resolved configuration",
     );
   }
+  const publicPort = requireDashboardPort(config.port);
+  if (publicPort !== effectivePort) {
+    throw new ManagedStartupOnboardProfileError(
+      "Hermes dashboard state must match the allocated dashboard port",
+    );
+  }
   return {
     agent,
     mode: "loopback-forwarded",
-    url: input.chatUiUrl,
-    publicPort: requireDashboardPort(config.port),
+    url: loopbackDashboardUrl(publicPort),
+    browserUrl: input.chatUiUrl,
+    publicPort,
     internalPort: requireDashboardPort(config.internalPort),
     tuiEnabled: config.tuiEnabled,
   };
@@ -232,7 +259,7 @@ export function buildManagedStartupOnboardProfile(
     agent,
     inference: input.inference,
     dashboard,
-    webSearch: agent === "langchain-deepagents-code" ? null : input.webSearch,
+    webSearch: capabilities.webSearchProviders.length > 0 ? input.webSearch : null,
     toolDisclosure: input.toolDisclosure,
     hermesToolGateways: agent === "hermes" ? input.hermesToolGateways : [],
     messagingPlan: capabilities.supportsMessaging ? input.messagingPlan : null,

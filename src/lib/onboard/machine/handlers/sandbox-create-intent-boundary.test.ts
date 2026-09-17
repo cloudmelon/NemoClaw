@@ -67,7 +67,7 @@ describe("sandbox create intent machine boundary", () => {
         sandboxName: "same-sandbox",
         selectedMessagingChannels: ["telegram"],
       });
-      const createIntent = calls.createSandbox.mock.calls[0]?.at(-1) as unknown as {
+      const createIntent = calls.createSandbox.mock.calls[0]?.at(-2) as unknown as {
         resolved: unknown;
       };
       expect(createIntent).toMatchObject({
@@ -85,8 +85,6 @@ describe("sandbox create intent machine boundary", () => {
             options: {
               directGpu: false,
               additionalPresets: [],
-              policyTier: null,
-              baselineExclusions: [],
             },
           },
           gpuCreateArgs: [],
@@ -117,9 +115,79 @@ describe("sandbox create intent machine boundary", () => {
     expect(resolvedIntents[2]).toEqual(resolvedIntents[0]);
   });
 
+  it("does not replace current create policy input from a recorded preset selection (#9792)", async () => {
+    const session = createSession({
+      sandboxName: "saved",
+    });
+    const { deps, calls } = createDeps();
+    calls.resolveCreateIntent.mockResolvedValue({
+      sandboxName: "saved",
+      inferenceProvider: "provider",
+      activeMessagingChannels: [],
+      messagingProviderRequests: [],
+      reusableMessagingProviders: [],
+      extraProviders: [],
+      staleExtraProviders: [],
+      hermesToolGateways: [],
+      policy: {
+        basePolicyPath: "/repo/policy.yaml",
+        activeMessagingChannels: [],
+        options: {
+          directGpu: false,
+          additionalPresets: ["mcp-bridge-fake"],
+        },
+      },
+      gpuCreateArgs: [],
+      resourceCreateArgs: [],
+      gpuRoutePlan: "none",
+      sandboxGpuLogMessage: null,
+      disabledChannelNames: [],
+      extraPlaceholderKeys: [],
+    } as never);
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      authoritativeResumeConfig: true,
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
+      resolved: {
+        policy: { options: { additionalPresets: ["mcp-bridge-fake"] } },
+      },
+    });
+  });
+
+  it.each([
+    { label: "resume", authoritativeResumeConfig: false },
+    { label: "repair", authoritativeResumeConfig: true },
+  ])(
+    "suppresses stale rebuild presets at the externally managed $label create boundary (#9833)",
+    async ({ authoritativeResumeConfig }) => {
+      const session = createSession({
+        sandboxName: "saved",
+      });
+      const { deps, calls } = createDeps({}, session);
+
+      await handleSandboxState({
+        ...baseOptions(deps, session),
+        authoritativeResumeConfig,
+        resume: true,
+        sandboxName: "saved",
+      });
+
+      const createIntent = calls.createSandbox.mock.calls[0]?.at(-2);
+      expect(createIntent).not.toHaveProperty("rebuildPolicyPresets");
+      expect(createIntent).toMatchObject({
+        resolved: { policy: { options: { additionalPresets: [] } } },
+      });
+    },
+  );
+
   it("carries an explicit recreate request through a fresh sandbox decision (#8847)", async () => {
     const session = createSession({ sandboxName: "same-sandbox" });
-    const { deps, calls } = createDeps();
+    const { deps, calls } = createDeps({ getSandboxReuseState: () => "ready" });
 
     await handleSandboxState({
       ...baseOptions(deps, session),
@@ -128,7 +196,8 @@ describe("sandbox create intent machine boundary", () => {
       sandboxName: "same-sandbox",
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({ recreate: true });
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({ recreate: true });
   });
 
   it("checkpoints a known sandbox name before an interrupted web-search prompt (#6743)", async () => {
@@ -275,7 +344,7 @@ describe("sandbox create intent machine boundary", () => {
       (name: string, type: string, credentialEnvName: string) =>
         (name === "tm-brave-search" && type === "brave" && credentialEnvName === "BRAVE_API_KEY") ||
         (name === "tm-telegram-bridge" &&
-          type === "generic" &&
+          type === "nemoclaw-mcp-v1" &&
           credentialEnvName === "TELEGRAM_BOT_TOKEN"),
     );
     const stageSandboxCredentialProviders = vi
@@ -287,12 +356,17 @@ describe("sandbox create intent machine boundary", () => {
       .mockImplementationOnce(async () => {
         durableSession.stagedCredentialProviders.push("tm-telegram-bridge");
         return [
-          { name: "tm-telegram-bridge", type: "generic", credentialEnv: "TELEGRAM_BOT_TOKEN" },
+          {
+            name: "tm-telegram-bridge",
+            type: "nemoclaw-mcp-v1",
+            credentialEnv: "TELEGRAM_BOT_TOKEN",
+          },
         ];
       })
       .mockResolvedValue([]);
     const readMessagingPlanFromEnv = vi
       .fn<() => typeof messagingPlan | null>()
+      .mockReturnValueOnce(null)
       .mockReturnValueOnce(null)
       .mockReturnValueOnce(null)
       .mockReturnValueOnce(messagingPlan)
@@ -354,7 +428,7 @@ describe("sandbox create intent machine boundary", () => {
       requiredBindings: [
         {
           name: "tm-telegram-bridge",
-          type: "generic",
+          type: "nemoclaw-mcp-v1",
           credentialEnv: "TELEGRAM_BOT_TOKEN",
         },
       ],
@@ -385,7 +459,7 @@ describe("sandbox create intent machine boundary", () => {
     );
     expect(providerMatchesGatewayCredential).toHaveBeenCalledWith(
       "tm-telegram-bridge",
-      "generic",
+      "nemoclaw-mcp-v1",
       "TELEGRAM_BOT_TOKEN",
     );
     expect(calls.promptName).not.toHaveBeenCalled();
@@ -496,65 +570,66 @@ describe("sandbox create intent machine boundary", () => {
     expect(result.selectedMessagingChannels).toEqual([]);
   });
 
-  it.each(
-    resourceProfiles,
-  )("reuses %s after intent resolution is interrupted and recomputes the intent (#6743)", async (_label, selectedResourceProfile) => {
-    const messagingPlan = makeMinimalPlan("tm");
-    const durableSession = createSession({
-      sandboxName: "tm",
-      webSearchConfig: braveConfig,
-      messagingPlan,
-      resourceProfile: null,
-      sandboxPromptProgress: {
-        sandboxName: true,
-        webSearch: true,
-        messaging: true,
-        resourceProfile: false,
-      },
-    });
-    const updateSession = vi.fn((mutator: (value: typeof durableSession) => void) => {
-      mutator(durableSession);
-      return durableSession;
-    });
-    const recordStepComplete = vi.fn(async (_stepName: string, updates: object) => {
-      Object.assign(durableSession, updates);
-      return durableSession;
-    });
-    const { deps, calls } = createDeps({ updateSession, recordStepComplete });
-    calls.selectResourceProfile.mockResolvedValue(selectedResourceProfile);
-    calls.resolveCreateIntent.mockRejectedValueOnce(new Error("intent resolution interrupted"));
+  it.each(resourceProfiles)(
+    "reuses %s after intent resolution is interrupted and recomputes the intent (#6743)",
+    async (_label, selectedResourceProfile) => {
+      const messagingPlan = makeMinimalPlan("tm");
+      const durableSession = createSession({
+        sandboxName: "tm",
+        webSearchConfig: braveConfig,
+        messagingPlan,
+        resourceProfile: null,
+        sandboxPromptProgress: {
+          sandboxName: true,
+          webSearch: true,
+          messaging: true,
+          resourceProfile: false,
+        },
+      });
+      const updateSession = vi.fn((mutator: (value: typeof durableSession) => void) => {
+        mutator(durableSession);
+        return durableSession;
+      });
+      const recordStepComplete = vi.fn(async (_stepName: string, updates: object) => {
+        Object.assign(durableSession, updates);
+        return durableSession;
+      });
+      const { deps, calls } = createDeps({ updateSession, recordStepComplete });
+      calls.selectResourceProfile.mockResolvedValue(selectedResourceProfile);
+      calls.resolveCreateIntent.mockRejectedValueOnce(new Error("intent resolution interrupted"));
 
-    const options = () => ({
-      ...baseOptions(deps, durableSession),
-      resume: true,
-      sandboxName: durableSession.sandboxName,
-      webSearchConfig: durableSession.webSearchConfig,
-    });
-    await expect(handleSandboxState(options())).rejects.toThrow("intent resolution interrupted");
+      const options = () => ({
+        ...baseOptions(deps, durableSession),
+        resume: true,
+        sandboxName: durableSession.sandboxName,
+        webSearchConfig: durableSession.webSearchConfig,
+      });
+      await expect(handleSandboxState(options())).rejects.toThrow("intent resolution interrupted");
 
-    expect(durableSession.sandboxPromptProgress.resourceProfile).toBe(true);
-    expect(durableSession.resourceProfile).toEqual(selectedResourceProfile);
-    expect(calls.startStep).not.toHaveBeenCalled();
-    expect(calls.createSandbox).not.toHaveBeenCalled();
+      expect(durableSession.sandboxPromptProgress.resourceProfile).toBe(true);
+      expect(durableSession.resourceProfile).toEqual(selectedResourceProfile);
+      expect(calls.startStep).not.toHaveBeenCalled();
+      expect(calls.createSandbox).not.toHaveBeenCalled();
 
-    await handleSandboxState(options());
+      await handleSandboxState(options());
 
-    expect(calls.configureWebSearch).not.toHaveBeenCalled();
-    expect(calls.setupMessaging).not.toHaveBeenCalled();
-    expect(calls.promptName).not.toHaveBeenCalled();
-    expect(calls.selectResourceProfile).toHaveBeenCalledTimes(1);
-    expect(calls.resolveCreateIntent).toHaveBeenCalledTimes(2);
-    expect(calls.resolveCreateIntent.mock.calls[1]?.[0]).toEqual(
-      calls.resolveCreateIntent.mock.calls[0]?.[0],
-    );
-    expect(calls.resolveCreateIntent).toHaveBeenLastCalledWith(
-      expect.objectContaining({ resourceProfile: selectedResourceProfile }),
-    );
-    expect(calls.createSandbox).toHaveBeenCalledTimes(1);
-    expect((calls.createSandbox.mock.calls[0] as unknown[])[11]).toEqual(selectedResourceProfile);
+      expect(calls.configureWebSearch).not.toHaveBeenCalled();
+      expect(calls.setupMessaging).not.toHaveBeenCalled();
+      expect(calls.promptName).not.toHaveBeenCalled();
+      expect(calls.selectResourceProfile).toHaveBeenCalledTimes(1);
+      expect(calls.resolveCreateIntent).toHaveBeenCalledTimes(2);
+      expect(calls.resolveCreateIntent.mock.calls[1]?.[0]).toEqual(
+        calls.resolveCreateIntent.mock.calls[0]?.[0],
+      );
+      expect(calls.resolveCreateIntent).toHaveBeenLastCalledWith(
+        expect.objectContaining({ resourceProfile: selectedResourceProfile }),
+      );
+      expect(calls.createSandbox).toHaveBeenCalledTimes(1);
+      expect((calls.createSandbox.mock.calls[0] as unknown[])[11]).toEqual(selectedResourceProfile);
 
-    const serializedSession = JSON.stringify(durableSession);
-    expect(serializedSession).not.toContain('"resolved"');
-    expect(serializedSession).not.toContain('"resourceCreateArgs"');
-  });
+      const serializedSession = JSON.stringify(durableSession);
+      expect(serializedSession).not.toContain('"resolved"');
+      expect(serializedSession).not.toContain('"resourceCreateArgs"');
+    },
+  );
 });

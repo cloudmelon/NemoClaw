@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveAgentInferenceApi } from "../../../src/lib/inference/config.ts";
+import { execTimeout } from "../../helpers/timeouts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import { resultText } from "../fixtures/clients/index.ts";
@@ -18,6 +19,7 @@ import {
 } from "../fixtures/clients/sandbox.ts";
 import {
   type CompatibleAnthropicSwitchBinding,
+  compatibleAnthropicMockEndpointUrl,
   compatibleAnthropicSwitchBinding,
   compatibleAnthropicSwitchEnv,
   requireCompatibleAnthropicProviderAbsent,
@@ -36,9 +38,16 @@ import {
 import {
   inferenceResponseModel,
   inferenceSetAttemptCount,
+  type InferenceSwitchRetryArtifactSink,
   runInferenceSetWithRetry,
+  writeInferenceSwitchRetryEvidence,
 } from "../fixtures/inference-switch-retry.ts";
 import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
+import {
+  runBoundedRetry,
+  type RetryEvidence,
+  type RetryFailureClass,
+} from "../../../tools/e2e/retry-evidence.mts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 import { stripAnsi } from "./json-envelope.ts";
 import { isTransientProviderValidationFailure } from "./network-policy-transient-provider.ts";
@@ -77,14 +86,6 @@ export function compatibleAnthropicMetadataArgs(endpointUrl: string | null): str
   return endpointUrl
     ? ["--endpoint-url", endpointUrl, "--credential-env", "COMPATIBLE_ANTHROPIC_API_KEY"]
     : [];
-}
-
-export function mockAnthropicEndpointUrl(
-  port: number,
-  runtimeEnv: NodeJS.ProcessEnv = process.env,
-): string {
-  const host = runtimeEnv.NEMOCLAW_SWITCH_MOCK_HOST ?? "host.openshell.internal";
-  return `http://${host}:${port}`;
 }
 
 export function openAiSurfaceEndpointUrl(endpointUrl: string): string {
@@ -137,6 +138,26 @@ export function expectAuthenticatedProxyResolutionRequests(
       model: expectedModel,
     });
   }
+}
+
+export function hasAuthenticatedProxyResolutionRequest(
+  baseline: Pick<FakeOpenAiCompatibleServer, "requests"> | undefined,
+  requestOffset: number,
+  expectedModel: string,
+): boolean {
+  if (!baseline) return true;
+  return baseline
+    .requests()
+    .slice(requestOffset)
+    .some(
+      (request) =>
+        request.method === "POST" &&
+        ["/v1/chat/completions", "/chat/completions"].includes(request.path) &&
+        request.auth === "ok" &&
+        request.authorizationSent === true &&
+        request.model === expectedModel &&
+        (request.forbiddenMarkerMatches ?? 0) === 0,
+    );
 }
 
 export function hostedInstallModel(runtimeEnv: NodeJS.ProcessEnv = process.env): string {
@@ -311,50 +332,124 @@ export function chatContent(raw: string): string {
   );
 }
 
-export async function runHermesPongWithRetry(options: {
-  attempts?: number;
-  delay?: (milliseconds: number) => Promise<void>;
-  expectedModel: string;
-  run: (attempt: number) => Promise<ShellProbeResult>;
-}): Promise<ShellProbeResult> {
-  const attempts = options.attempts ?? 3;
-  const delay =
-    options.delay ??
-    ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
-  let last: ShellProbeResult | undefined;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    last = await options.run(attempt);
-    let pong = false;
-    if (last.exitCode === 0) {
-      try {
-        pong =
-          inferenceResponseModel(last.stdout) === options.expectedModel &&
-          /PONG/iu.test(chatContent(last.stdout));
-      } catch {}
-    }
-    if (pong || attempt === attempts) return last;
-    await delay(5_000);
+const TERMINAL_HERMES_PROBE_RE =
+  /authentication failed|authorization failed|unauthorized|forbidden|HTTP 40[13]\b|\b40[13]\b|denied by network policy|network policy denied|policy (?:update |validation )?failed|malformed|invalid (?:credential|api[_ -]?key|request|json)/iu;
+const TRANSIENT_HERMES_PROBE_RE =
+  /ECONNREFUSED|EAI_AGAIN|ECONNRESET|ETIMEDOUT|timed? out|gateway unavailable|network connection error|DNS error|fetch failed|inference service unavailable|rawError=503/iu;
+
+function hermesProbeFailureClass(result: ShellProbeResult): RetryFailureClass {
+  const output = resultText(result);
+  if (
+    /authentication failed|unauthorized|HTTP 401\b|\b401\b|invalid (?:credential|api[_ -]?key)/iu.test(
+      output,
+    )
+  ) {
+    return "authentication";
   }
-  throw new Error("Hermes live probe retry loop completed without running an attempt.");
+  if (/authorization failed|forbidden|HTTP 403\b|\b403\b/iu.test(output)) {
+    return "authorization";
+  }
+  if (
+    /denied by network policy|network policy denied|policy (?:update |validation )?failed/iu.test(
+      output,
+    )
+  ) {
+    return "policy-denial";
+  }
+  if (/malformed|invalid (?:request|json)/iu.test(output)) return "malformed-input";
+  if (
+    result.exitCode !== 0 &&
+    !TERMINAL_HERMES_PROBE_RE.test(output) &&
+    TRANSIENT_HERMES_PROBE_RE.test(output)
+  ) {
+    return "transient-external";
+  }
+  return "deterministic";
 }
 
-export async function runHermesCliPongWithRetry(options: {
+interface HermesProbeRetryOptions {
   attempts?: number;
   delay?: (milliseconds: number) => Promise<void>;
-  run: (attempt: number) => Promise<ShellProbeResult>;
-}): Promise<ShellProbeResult> {
-  const attempts = options.attempts ?? 3;
-  const delay =
-    options.delay ??
-    ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
-  let last: ShellProbeResult | undefined;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    last = await options.run(attempt);
-    if ((last.exitCode === 0 && /\bPONG\b/iu.test(last.stdout)) || attempt === attempts)
-      return last;
-    await delay(5_000);
-  }
-  throw new Error("Hermes CLI retry loop completed without running an attempt.");
+  onEvidence?: (evidence: RetryEvidence) => Promise<void> | void;
+}
+
+export async function runHermesPongWithRetry(
+  options: HermesProbeRetryOptions & {
+    expectedModel: string;
+    run: (attempt: number) => Promise<ShellProbeResult>;
+  },
+): Promise<ShellProbeResult> {
+  const execution = await runBoundedRetry({
+    operation: "hermes-inference-switch.pong",
+    owner: "inference-provider",
+    idempotence: "read-only",
+    maxAttempts: options.attempts ?? 3,
+    delayMs: 5_000,
+    onEvidence: options.onEvidence,
+    run: async (attempt) => {
+      const result = await options.run(attempt);
+      let passed = false;
+      if (result.exitCode === 0) {
+        try {
+          passed =
+            inferenceResponseModel(result.stdout) === options.expectedModel &&
+            /PONG/iu.test(chatContent(result.stdout));
+        } catch {}
+      }
+      return { passed, result };
+    },
+    sleep: options.delay,
+    classify: (value, error) => {
+      if (error !== undefined || !value) {
+        return { outcome: "failed", failureClass: "deterministic" };
+      }
+      if (value.passed) return { outcome: "passed" };
+      return { outcome: "failed", failureClass: hermesProbeFailureClass(value.result) };
+    },
+  });
+  if (execution.value) return execution.value.result;
+  throw new Error("Hermes live probe completed without an attempt result.");
+}
+
+export async function runHermesCliPongWithRetry(
+  options: HermesProbeRetryOptions & {
+    accept?: (result: ShellProbeResult, attempt: number) => boolean;
+    run: (attempt: number) => Promise<ShellProbeResult>;
+  },
+): Promise<ShellProbeResult> {
+  const execution = await runBoundedRetry({
+    operation: "hermes-inference-switch.cli-pong",
+    owner: "inference-provider",
+    idempotence: "read-only",
+    maxAttempts: options.attempts ?? 3,
+    delayMs: 5_000,
+    onEvidence: options.onEvidence,
+    run: async (attempt) => {
+      const result = await options.run(attempt);
+      const pong = result.exitCode === 0 && /\bPONG\b/iu.test(result.stdout);
+      const selectedRouteAccepted = pong && (options.accept?.(result, attempt) ?? true);
+      return {
+        passed: selectedRouteAccepted,
+        result,
+        selectedRoutePending: pong && !selectedRouteAccepted,
+      };
+    },
+    sleep: options.delay,
+    classify: (value, error) => {
+      if (error !== undefined || !value) {
+        return { outcome: "failed", failureClass: "deterministic" };
+      }
+      const failureClass = hermesProbeFailureClass(value.result);
+      if (failureClass !== "deterministic") return { outcome: "failed", failureClass };
+      if (value.passed) return { outcome: "passed" };
+      if (value.selectedRoutePending) {
+        return { outcome: "failed", failureClass: "transient-external" };
+      }
+      return { outcome: "failed", failureClass };
+    },
+  });
+  if (execution.value) return execution.value.result;
+  throw new Error("Hermes CLI probe completed without an attempt result.");
 }
 
 export async function cleanupHermesSwitch(
@@ -512,7 +607,7 @@ async function startMockAnthropicProvider(): Promise<MockCompatibleAnthropicProv
     throw new Error("mock Anthropic provider did not expose a TCP port");
   }
   return {
-    endpointUrl: mockAnthropicEndpointUrl((address as AddressInfo).port),
+    endpointUrl: compatibleAnthropicMockEndpointUrl((address as AddressInfo).port),
     close: () => closeServer(server),
   };
 }
@@ -550,7 +645,7 @@ export async function installHermes(
         cwd: REPO_ROOT,
         env: env(apiKey, installEnv),
         redactionValues: [apiKey],
-        timeoutMs: 25 * 60_000,
+        timeoutMs: execTimeout(25 * 60_000),
       },
     );
     const retry =
@@ -571,6 +666,7 @@ export async function runHermesInferenceSetWithRetry(
   compatibleMetadataArgs: string[],
   options: {
     attempts?: number;
+    artifacts?: InferenceSwitchRetryArtifactSink;
     compatibleBinding?: CompatibleAnthropicSwitchBinding | null;
     delay?: (milliseconds: number) => Promise<void>;
   } = {},
@@ -585,15 +681,17 @@ export async function runHermesInferenceSetWithRetry(
     SWITCH_MODEL,
     ...compatibleMetadataArgs,
   ];
+  const evidenceArtifacts = options.artifacts;
   return runInferenceSetWithRetry({
     attempts:
       options.attempts ?? inferenceSetAttemptCount(process.env.NEMOCLAW_SWITCH_SET_ATTEMPTS),
     delay: options.delay,
-    run: (attempt, verify) =>
-      host.command("node", verify ? args : [...args, "--no-verify"], {
-        artifactName: verify
-          ? `hermes-inference-set-${attempt}`
-          : "hermes-inference-set-no-verify-after-transient-failures",
+    onEvidence: evidenceArtifacts
+      ? (evidence) => writeInferenceSwitchRetryEvidence(evidenceArtifacts, evidence)
+      : undefined,
+    run: (attempt) =>
+      host.command("node", args, {
+        artifactName: `hermes-inference-set-${attempt}`,
         env: env(undefined, compatibleAnthropicSwitchEnv(options.compatibleBinding ?? null)),
         redactionValues,
         timeoutMs: 180_000,

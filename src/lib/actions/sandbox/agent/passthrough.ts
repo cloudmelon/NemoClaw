@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { type SpawnSyncOptions, type SpawnSyncReturns, spawnSync } from "node:child_process";
-
 // Source-of-truth boundary for the `nemoclaw <name> agent` passthrough.
 //
 // The wrapper enforces three host-side mirrors of upstream contracts, one
@@ -15,7 +13,7 @@ import { type SpawnSyncOptions, type SpawnSyncReturns, spawnSync } from "node:ch
 //      Forwarding to `openclaw agent` against a non-OpenClaw sandbox triggers
 //      an in-sandbox binary that does not exist (or exists with incompatible
 //      flags), and would silently bypass the host-side guard intended to
-//      redirect Hermes callers to the OpenAI-compatible API on port 8642.
+//      redirect Hermes callers to the sandbox's OpenAI-compatible API port.
 //    - Source boundary: the registry and agent manifest allowlist are
 //      NemoClaw-owned. The in-sandbox invocation, its argv contract, and its
 //      streaming behaviour are owned by the selected upstream agent command.
@@ -70,25 +68,30 @@ import { type SpawnSyncOptions, type SpawnSyncReturns, spawnSync } from "node:ch
 //      selector case is intercepted; everything else still flows through to
 //      the in-sandbox binary.
 //
-// 4. Recent shields-relock diagnostic (advisory audit mirror). Its complete
-//    source-boundary analysis lives with the focused implementation in
-//    `passthrough-shields-warning.ts`.
-//
-// 5. Ollama restart recovery (best-effort lifecycle bridge). Ollama owns model
+// 4. Ollama restart recovery (best-effort lifecycle bridge). Ollama owns model
 //    runner lifetime, while NemoClaw owns the registered route and dispatch
 //    ordering. The focused source-boundary analysis, reporting, and regression
 //    coverage live in `ollama-restart-recovery.ts` and
 //    `passthrough-ollama-recovery.ts`.
 //
+// 5. Dispatch delivery contract and stdin posture. Both captured transports
+//    fail loud when the exec returns success with no bytes on either stream,
+//    and neither hands an interactive terminal to the non-interactive
+//    dispatch. Both transports pin the sandbox's owning gateway and use the
+//    shared asynchronous exec supervisor, which forwards host termination to
+//    OpenShell before returning the signal-derived exit status. The complete
+//    source-boundary analysis and classifier live in
+//    `passthrough-dispatch.ts`; the operator-facing failure text lives beside
+//    the help copy in `passthrough-help.ts`.
+//
 // Regression tests: `passthrough.test.ts` covers the Hermes redirect, the
-// forwarded argv, the registry-miss fallback to OpenClaw, registry and
-// manifest-resolution fail-closed paths, quoted manifest command rejection,
-// the enforced `--no-tty` argv shape, the non-Ready phase recovery path, the
-// unparseable phase fail-closed path, the OpenClaw no-selector rejection, and
+// forwarded argv, SIGTERM exit status, the registry-miss fallback to OpenClaw,
+// registry and manifest-resolution fail-closed paths, quoted manifest command
+// rejection, the enforced `--no-tty` argv shape, the non-Ready phase recovery
+// path, the unparseable phase fail-closed path, the OpenClaw no-selector rejection, and
 // the `--flag=value` selector-acceptance branch, plus the OpenClaw JSON
 // captured transport path used to append failure provenance without polluting
-// machine-readable stdout. The focused shields and Ollama modules own their
-// diagnostic and recovery tests.
+// machine-readable stdout. The focused Ollama module owns its recovery tests.
 //
 // Removal conditions:
 //
@@ -103,52 +106,38 @@ import { type SpawnSyncOptions, type SpawnSyncReturns, spawnSync } from "node:ch
 //   - Drop Ollama pre-dispatch recovery when supported daemon restarts preserve
 //     loaded runners or NemoClaw manages and warms the daemon lifecycle.
 
+import { performance } from "node:perf_hooks";
+import { signalExitCode } from "../../../core/process-exit";
 import { type AgentDefinition, isTerminalAgent, listAgents, loadAgent } from "../../../agent/defs";
 import { CLI_NAME } from "../../../cli/branding";
-import { requireCuaLifecycleReadiness } from "../../../cua/lifecycle-readiness";
-import { resolveSandboxGatewayName } from "../../../gateway-runtime-action";
-import { withGatewayRouteMutationLock } from "../../../inference/gateway-route-mutation-lock";
-import type { ShieldsAutoRestoreReadResult } from "../../../shields/audit";
-import { parseSandboxPhase } from "../../../state/gateway";
-import { withMcpLifecycleLock as withSandboxMutationLock } from "../../../state/mcp-lifecycle-lock-acquisition";
+import { resolveSandboxHermesApiPort } from "../../../onboard/hermes-api-port";
 import * as registry from "../../../state/registry";
-import {
-  buildOpenshellExecArgs,
-  computeExitCode,
-  execSandbox,
-  wrapExecCommandWithRuntimeEnv,
-} from "../exec";
+import { execSandbox } from "../exec";
 import { ensureLiveSandboxOrExit } from "../gateway-state";
-import { hasAgentPassthroughHelpToken, printAgentPassthroughHelp } from "./passthrough-help";
 import {
-  type AgentJsonPassthroughProcess,
-  defaultGetOpenshellBinary,
-  runAgentJsonPassthrough,
-} from "./passthrough-json";
-import { OLLAMA_LOCAL_PROVIDER, runOllamaRestartRecovery } from "./passthrough-ollama-recovery";
-import { maybeEmitShieldsRelockWarning } from "./passthrough-shields-warning";
-
-export {
+  type OpenClawAgentDispatchDeps,
+  hasOpenClawAgentSelector,
+  requestsOpenClawJsonOutput,
+  requestsOpenClawLocalMode,
+  replaceRequestedAgentTimeoutSeconds,
+  requestedAgentTimeoutSeconds,
+  runOpenClawAgentDispatch,
+  isSilentAgentDispatch,
+  isTimedOutAgentDispatch,
+  SILENT_AGENT_DISPATCH_EXIT_CODE,
+  TIMED_OUT_AGENT_TURN_EXIT_CODE,
+} from "./passthrough-dispatch";
+import {
   hasAgentPassthroughHelpToken,
   printAgentPassthroughHelp,
+  writeSilentAgentDispatchFailure,
+  writeTimedOutAgentTurnFailure,
 } from "./passthrough-help";
+import { type AgentJsonPassthroughProcess, runAgentJsonPassthrough } from "./passthrough-json";
 
-const OPENCLAW_AGENT_VALUE_FLAGS = new Set([
-  "-a",
-  "--agent",
-  "-m",
-  "--message",
-  "--model",
-  "--provider",
-  "--reply-channel",
-  "--session-id",
-  "--session-key",
-  "--thinking",
-  "--timeout",
-  "--to",
-]);
+import { OLLAMA_LOCAL_PROVIDER, runOllamaRestartRecovery } from "./passthrough-ollama-recovery";
 
-const OPENCLAW_AGENT_BOOLEAN_FLAGS = new Set(["--deliver"]);
+export { hasAgentPassthroughHelpToken, printAgentPassthroughHelp } from "./passthrough-help";
 
 // OpenClaw can exit zero after running in embedded-fallback mode and does not
 // expose a stable machine-readable transport discriminator. These patterns mirror
@@ -159,43 +148,26 @@ const OPENCLAW_AGENT_BOOLEAN_FLAGS = new Set(["--deliver"]);
 const OPENCLAW_EMBEDDED_FALLBACK_PATTERN =
   /EMBEDDED FALLBACK|\[agent\/embedded\]|fallbackFrom[": ]+gateway|transport[": ]+embedded/i;
 
-const AGENT_NON_JSON_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+export type AgentNonJsonPassthroughDeps = OpenClawAgentDispatchDeps;
 
-function nonJsonAsText(value: string | Buffer | null | undefined): string {
-  if (Buffer.isBuffer(value)) return value.toString("utf-8");
-  return typeof value === "string" ? value : "";
-}
-
-export type AgentNonJsonPassthroughDeps = {
-  getOpenshellBinary?: () => string;
-  spawnSync?: (
-    command: string,
-    args: readonly string[],
-    options: SpawnSyncOptions,
-  ) => SpawnSyncReturns<string | Buffer>;
-};
-
-export function runAgentNonJsonPassthrough(
+export async function runAgentNonJsonPassthrough(
   sandboxName: string,
   command: readonly string[],
   proc: NonNullable<AgentPassthroughDeps["process"]>,
   deps: AgentNonJsonPassthroughDeps = {},
-): never {
-  const binary = (deps.getOpenshellBinary ?? defaultGetOpenshellBinary)();
-  const spawnSyncImpl = deps.spawnSync ?? spawnSync;
-  const result = spawnSyncImpl(
-    binary,
-    buildOpenshellExecArgs(sandboxName, wrapExecCommandWithRuntimeEnv(command), { tty: false }),
-    {
-      encoding: "utf-8",
-      maxBuffer: AGENT_NON_JSON_MAX_BUFFER_BYTES,
-      stdio: ["inherit", "pipe", "pipe"],
-    },
-  );
-  const stdout = nonJsonAsText(result.stdout);
-  const stderr = nonJsonAsText(result.stderr);
+): Promise<never> {
+  const result = await runOpenClawAgentDispatch(sandboxName, command, deps);
+  const { stderr, stdout } = result;
 
-  if (OPENCLAW_EMBEDDED_FALLBACK_PATTERN.test(`${stdout}\n${stderr}`)) {
+  if (isSilentAgentDispatch(result, stdout, stderr)) {
+    writeSilentAgentDispatchFailure(proc, sandboxName, command);
+    return proc.exit(SILENT_AGENT_DISPATCH_EXIT_CODE);
+  }
+
+  if (
+    !requestsOpenClawLocalMode(command) &&
+    OPENCLAW_EMBEDDED_FALLBACK_PATTERN.test(`${stdout}\n${stderr}`)
+  ) {
     proc.stderr.write(
       `  OpenClaw is running in embedded-fallback mode in sandbox '${sandboxName}': gateway pairing is broken or missing.\n`,
     );
@@ -214,10 +186,19 @@ export function runAgentNonJsonPassthrough(
 
   if (stdout) (proc.stdout ?? process.stdout).write(stdout);
   if (stderr) proc.stderr.write(stderr);
-  const { code, errorMessage } = computeExitCode(result);
-  if (errorMessage) {
+  const code = result.outcome.exitCode;
+  if (result.outcome.kind === "failed" && result.outcome.reason !== "transport") {
+    const errorMessage = result.outcome.message;
     proc.stderr.write(`  Failed to invoke openshell: ${errorMessage}\n`);
     proc.stderr.write("  Ensure 'openshell' is installed and on PATH.\n");
+  }
+
+  // Last, so the partial trace is already on the wire: a turn whose deadline
+  // fired must not exit 0 just because the transport did. An upstream non-zero
+  // code is preserved as-is.
+  if (code === 0 && isTimedOutAgentDispatch(stdout, stderr)) {
+    writeTimedOutAgentTurnFailure(proc, sandboxName);
+    return proc.exit(TIMED_OUT_AGENT_TURN_EXIT_CODE);
   }
   return proc.exit(code);
 }
@@ -232,17 +213,50 @@ export interface AgentPassthroughDeps {
   exec?: typeof execSandbox;
   execJson?: typeof runAgentJsonPassthrough;
   execNonJson?: typeof runAgentNonJsonPassthrough;
-  runOllamaRestartRecovery?: typeof runOllamaRestartRecovery;
-  getRecentShieldsAutoRestore?: (sandboxName: string) => ShieldsAutoRestoreReadResult;
-  requireCuaReadiness?: (entry: registry.SandboxEntry) => unknown;
-  resolveSandboxGatewayName?: typeof resolveSandboxGatewayName;
-  withGatewayRouteMutationLock?: typeof withGatewayRouteMutationLock;
-  withSandboxMutationLock?: typeof withSandboxMutationLock;
+  runOllamaRestartRecovery?: (
+    ...args: Parameters<typeof runOllamaRestartRecovery>
+  ) => ReturnType<typeof runOllamaRestartRecovery> | NodeJS.Signals | null | void;
+  now?: () => number;
   process?: {
     exit(code: number): never;
     stdout?: { write(s: string): unknown };
     stderr: { write(s: string): unknown };
   };
+}
+
+const MINIMUM_AGENT_DISPATCH_BUDGET_SECONDS = 1;
+
+function startAgentCommandDeadline(command: readonly string[], now: () => number): number | null {
+  const timeoutSeconds = requestedAgentTimeoutSeconds(command);
+  const timeoutMilliseconds = timeoutSeconds === null ? null : timeoutSeconds * 1000;
+  return timeoutMilliseconds === null || !Number.isSafeInteger(timeoutMilliseconds)
+    ? null
+    : now() + timeoutMilliseconds;
+}
+
+function remainingAgentCommandSeconds(deadline: number | null, now: () => number): number | null {
+  return deadline === null ? null : Math.max(0, (deadline - now()) / 1000);
+}
+
+function recoveryBudgetSeconds(deadline: number | null, now: () => number): number | null {
+  const remaining = remainingAgentCommandSeconds(deadline, now);
+  // Keep one second for the actual turn so best-effort recovery cannot consume
+  // the entire user-requested deadline before OpenClaw starts.
+  return remaining === null ? null : Math.max(0, remaining - MINIMUM_AGENT_DISPATCH_BUDGET_SECONDS);
+}
+
+function commandWithRemainingDeadline(
+  command: readonly string[],
+  deadline: number | null,
+  now: () => number,
+): readonly string[] {
+  const remaining = remainingAgentCommandSeconds(deadline, now);
+  return remaining === null
+    ? command
+    : replaceRequestedAgentTimeoutSeconds(
+        command,
+        Math.max(MINIMUM_AGENT_DISPATCH_BUDGET_SECONDS, Math.ceil(remaining)),
+      );
 }
 
 type RegistryReadResult =
@@ -289,11 +303,12 @@ function rejectNonOpenclawAgent(
   proc.stderr.write(
     `  The \`sandbox agent\` wrapper cannot dispatch to sandbox '${sandboxName}' because it runs '${agent}'.\n`,
   );
-  proc.stderr.write("  Hermes exposes an OpenAI-compatible API on port 8642 inside the sandbox;\n");
+  const apiPort = resolveSandboxHermesApiPort(registry.getSandbox(sandboxName) ?? {});
   proc.stderr.write(
-    `  forward it with 'openshell forward start --background 8642 ${sandboxName}'\n`,
+    `  Hermes exposes an OpenAI-compatible API on port ${apiPort} inside the sandbox;\n`,
   );
-  proc.stderr.write("  and POST to http://127.0.0.1:8642/v1/chat/completions instead.\n");
+  proc.stderr.write(`  restore its managed host forward with 'nemoclaw ${sandboxName} recover'\n`);
+  proc.stderr.write(`  and POST to http://127.0.0.1:${apiPort}/v1/chat/completions instead.\n`);
   return proc.exit(2);
 }
 
@@ -421,60 +436,6 @@ function rejectRegistryReadError(
   return proc.exit(2);
 }
 
-function requestsOpenClawJsonOutput(extraArgs: readonly string[]): boolean {
-  // Invalid state: the host wrapper must pick captured JSON transport only for
-  // the top-level OpenClaw output flag, not for a literal "--json" consumed as
-  // a value by another OpenClaw option. Source boundary: upstream OpenClaw owns
-  // the complete argv grammar; NemoClaw mirrors documented flags only to choose
-  // the host transport path. Unknown options fail conservative to normal
-  // passthrough, where OpenClaw parses argv itself. Any newly documented value
-  // flag, including a `--json-*` name, must be added to the value-flag set and
-  // its tests together. Regression tests cover each documented value flag,
-  // documented equals-form value flags, documented boolean flags, unknown flag
-  // fallback, and the `--` terminator. Removal
-  // condition: OpenClaw exposes a machine-readable argv schema or NemoClaw stops
-  // special-casing the JSON transport path.
-  let skipNextValue = false;
-  for (const arg of extraArgs) {
-    if (skipNextValue) {
-      skipNextValue = false;
-      continue;
-    }
-    if (arg === "--") return false;
-    if (arg === "--json") return true;
-    if (arg.startsWith("--json=")) {
-      return !["0", "false", "no", "off"].includes(arg.slice("--json=".length).toLowerCase());
-    }
-    if (OPENCLAW_AGENT_VALUE_FLAGS.has(arg)) {
-      skipNextValue = true;
-      continue;
-    }
-    const equalsIndex = arg.indexOf("=");
-    if (
-      equalsIndex > 0 &&
-      arg.startsWith("--") &&
-      OPENCLAW_AGENT_VALUE_FLAGS.has(arg.slice(0, equalsIndex))
-    ) {
-      continue;
-    }
-    if (OPENCLAW_AGENT_BOOLEAN_FLAGS.has(arg)) continue;
-    if (arg.startsWith("-")) return false;
-  }
-  return false;
-}
-
-const TARGET_SELECTOR_FLAGS = ["--agent", "--session-id", "--session-key", "--to"] as const;
-
-function hasTargetSelector(args: readonly string[]): boolean {
-  for (const arg of args) {
-    if (arg === "--") return false;
-    if (TARGET_SELECTOR_FLAGS.some((flag) => arg === flag || arg.startsWith(`${flag}=`))) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function rejectNoTargetSelector(proc: NonNullable<AgentPassthroughDeps["process"]>): never {
   proc.stderr.write(
     "  No target session selected. Use --agent <id>, --session-key <key>, --session-id <id>, or --to <E.164>.\n",
@@ -520,40 +481,6 @@ function rejectNotReadyForAgent(
   return proc.exit(1);
 }
 
-async function runCuaHeadlessUnderMutationLocks(
-  sandboxName: string,
-  proc: NonNullable<AgentPassthroughDeps["process"]>,
-  deps: AgentPassthroughDeps,
-): Promise<void> {
-  const lockSandbox = deps.withSandboxMutationLock ?? withSandboxMutationLock;
-  const lockGateway = deps.withGatewayRouteMutationLock ?? withGatewayRouteMutationLock;
-  const resolveGateway = deps.resolveSandboxGatewayName ?? resolveSandboxGatewayName;
-  await lockSandbox(sandboxName, async () => {
-    const lockedLookup = readSandboxAgentFromRegistry(sandboxName, deps.getSandbox);
-    if (lockedLookup.kind === "error") {
-      rejectRegistryReadError(sandboxName, lockedLookup.message, proc);
-    }
-    if (lockedLookup.kind !== "agent" || lockedLookup.agent !== "nemocua") {
-      rejectAgentResolutionError(
-        sandboxName,
-        "nemocua",
-        "NemoCUA authority changed while waiting for the sandbox mutation lock",
-        proc,
-      );
-    }
-    const gatewayName = resolveGateway(lockedLookup.entry);
-    await lockGateway(gatewayName, async () => {
-      try {
-        (deps.requireCuaReadiness ?? requireCuaLifecycleReadiness)(lockedLookup.entry);
-      } catch (error) {
-        rejectAgentResolutionError(sandboxName, "nemocua", (error as Error).message, proc);
-      }
-      const exec = deps.exec ?? execSandbox;
-      await exec(sandboxName, ["nemocua", "headless"], { tty: false });
-    });
-  });
-}
-
 export async function runAgentPassthrough(
   sandboxName: string,
   { extraArgs = [] }: AgentPassthroughOptions = {},
@@ -564,54 +491,41 @@ export async function runAgentPassthrough(
   if (lookup.kind === "error") {
     rejectRegistryReadError(sandboxName, lookup.message, proc);
   }
-  if (lookup.kind === "agent" && lookup.agent === "nemocua") {
-    if (extraArgs.length > 0) {
-      rejectAgentResolutionError(
-        sandboxName,
-        lookup.agent,
-        "NemoCUA headless execution does not accept additional arguments",
-        proc,
-      );
-    }
-  }
   const command = getPassthroughCommand(sandboxName, lookup, extraArgs, proc);
-  if (lookup.kind === "agent" && lookup.agent === "nemocua") {
-    if (command?.length !== 2 || command[0] !== "nemocua" || command[1] !== "headless") {
-      rejectAgentResolutionError(
-        sandboxName,
-        lookup.agent,
-        "NemoCUA headless command must be exactly 'nemocua headless'",
-        proc,
-      );
-    }
-  }
   if (!command) return;
   const ensureLive = deps.ensureLive ?? ensureLiveSandboxOrExit;
   const state = await ensureLive(sandboxName, { allowNonReadyPhase: true });
-  const phase = parseSandboxPhase(state?.output ?? "");
+  const phase = state?.phase ?? null;
   if (!phase) {
     rejectUnparseablePhase(sandboxName, proc);
   }
   if (phase !== "Ready" && phase !== "Running") {
     rejectNotReadyForAgent(sandboxName, phase, proc);
   }
-  if (lookup.kind === "agent" && lookup.agent === "nemocua") {
-    await runCuaHeadlessUnderMutationLocks(sandboxName, proc, deps);
-    return;
-  }
-  if (isOpenClawPassthroughCommand(command) && !hasTargetSelector(extraArgs)) {
+  if (isOpenClawPassthroughCommand(command) && hasOpenClawAgentSelector(command) === false) {
     rejectNoTargetSelector(proc);
   }
+  let dispatchCommand: readonly string[] = command;
   if (isOpenClawPassthroughCommand(command)) {
+    const now = deps.now ?? (() => performance.now());
+    const commandDeadline = startAgentCommandDeadline(command, now);
     if (lookup.kind === "agent" && lookup.provider === OLLAMA_LOCAL_PROVIDER) {
       const recoverOllama = deps.runOllamaRestartRecovery ?? runOllamaRestartRecovery;
-      recoverOllama(lookup, proc);
+      const timeoutSeconds = recoveryBudgetSeconds(commandDeadline, now);
+      const recoverySignal = await recoverOllama(
+        lookup,
+        proc,
+        timeoutSeconds === null ? {} : { timeoutSeconds },
+      );
+      if (recoverySignal) {
+        return proc.exit(signalExitCode(recoverySignal));
+      }
     }
-    maybeEmitShieldsRelockWarning(proc, sandboxName, deps.getRecentShieldsAutoRestore);
+    dispatchCommand = commandWithRemainingDeadline(command, commandDeadline, now);
   }
-  if (isOpenClawPassthroughCommand(command) && requestsOpenClawJsonOutput(extraArgs)) {
+  if (isOpenClawPassthroughCommand(command) && requestsOpenClawJsonOutput(command)) {
     const execJson = deps.execJson ?? runAgentJsonPassthrough;
-    execJson(sandboxName, command, {
+    await execJson(sandboxName, dispatchCommand, {
       exit: proc.exit.bind(proc),
       stdout: proc.stdout ?? process.stdout,
       stderr: proc.stderr,
@@ -620,7 +534,7 @@ export async function runAgentPassthrough(
   }
   if (isOpenClawPassthroughCommand(command)) {
     const execNonJson = deps.execNonJson ?? runAgentNonJsonPassthrough;
-    execNonJson(sandboxName, command, proc);
+    await execNonJson(sandboxName, dispatchCommand, proc);
     return;
   }
   const exec = deps.exec ?? execSandbox;

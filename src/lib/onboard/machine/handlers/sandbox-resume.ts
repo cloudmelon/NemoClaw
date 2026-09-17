@@ -1,12 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import {
-  type WebSearchConfig,
-  webSearchEnvFor,
-  webSearchLabelFor,
-  webSearchProviderForConfig,
-} from "../../../inference/web-search";
 import type { Session } from "../../../state/onboard-session";
 import type { SandboxEntry } from "../../../state/registry";
 import { persistedSandboxHostMountsEqual } from "../../../state/registry/host-mount";
@@ -24,13 +18,16 @@ export interface SandboxResumeSignals {
   readonly hostMountConfigChanged: boolean;
   readonly recreateSandboxRequested: boolean;
   readonly recreateJournalHandoff?: boolean;
+  readonly activeRecreateJournal?: boolean;
   readonly messagingChannelConfigChanged: boolean;
+  readonly messagingCredentialChanged: boolean;
   readonly hermesToolGatewayConfigChanged: boolean;
   readonly observabilityChanged?: boolean;
   readonly dcodeAutoApprovalChanged?: boolean;
   readonly toolDisclosureMigrationNeeded: boolean;
   readonly toolDisclosureChanged: boolean;
   readonly inferenceSelectionChanged: boolean;
+  readonly hermesPortableLifecyclePending?: boolean;
 }
 
 export function hasHostMountConfigDrift(left: unknown, right: unknown): boolean {
@@ -100,21 +97,29 @@ export function resolveToolDisclosureResumeSignals(
     toolDisclosureMigrationNeeded: migrationNeeded,
     toolDisclosureChanged: Boolean(
       registryEntry &&
-        !migrationNeeded &&
-        recorded !== toolDisclosureOrDefault(session?.toolDisclosure),
+      !migrationNeeded &&
+      recorded !== toolDisclosureOrDefault(session?.toolDisclosure),
     ),
   };
 }
 
 export type SandboxResumeDecision =
-  | { readonly kind: "create" }
+  | {
+      readonly kind: "create";
+      readonly validateMessagingCredentialsBeforeMutation?: boolean;
+      readonly continueHermesPortableLifecycle?: true;
+    }
   | { readonly kind: "reuse" }
   | {
       readonly kind: "recreate";
       readonly note: string;
       readonly removeRegistryEntry: boolean;
+      readonly validateMessagingCredentialsBeforeMutation?: boolean;
     }
-  | { readonly kind: "repair-and-recreate" };
+  | {
+      readonly kind: "repair-and-recreate";
+      readonly validateMessagingCredentialsBeforeMutation?: boolean;
+    };
 
 export function replacesSameNameSandbox(decision: SandboxResumeDecision): boolean {
   if (decision.kind === "repair-and-recreate") return true;
@@ -128,30 +133,6 @@ export function requiresSandboxRecreation(
   return explicitlyRequested || decision.kind !== "create";
 }
 
-export function mcpRegistryRemovalBlockReason(
-  decision: SandboxResumeDecision,
-  sandboxName: string | null,
-  webSearchConfig: WebSearchConfig | null,
-  getSandboxRegistryEntry: (sandboxName: string) => SandboxEntry | null,
-): string | null {
-  if (decision.kind !== "recreate" || !decision.removeRegistryEntry || !sandboxName) return null;
-  const mcpState = getSandboxRegistryEntry(sandboxName)?.mcp;
-  if (!mcpState) return null;
-
-  const selectedProvider = webSearchConfig ? webSearchProviderForConfig(webSearchConfig) : null;
-  if (selectedProvider) {
-    const credentialEnv = webSearchEnvFor(selectedProvider);
-    const collidingBridge = Object.values(mcpState.bridges).find((entry) =>
-      entry.env.includes(credentialEnv),
-    );
-    if (collidingBridge) {
-      return `  Cannot enable ${webSearchLabelFor(selectedProvider)}: MCP server '${collidingBridge.server}' already owns ${credentialEnv}. Use a distinct credential name.`;
-    }
-  }
-
-  return `  Sandbox '${sandboxName}' has managed MCP state. Use the transactional rebuild command before changing settings that recreate the sandbox.`;
-}
-
 function canReuseSandbox(signals: SandboxResumeSignals): boolean {
   return (
     !signals.resumeAgentChanged &&
@@ -163,6 +144,7 @@ function canReuseSandbox(signals: SandboxResumeSignals): boolean {
     !signals.hostMountConfigChanged &&
     !signals.recreateSandboxRequested &&
     !signals.messagingChannelConfigChanged &&
+    !signals.messagingCredentialChanged &&
     !signals.hermesToolGatewayConfigChanged &&
     !signals.observabilityChanged &&
     !signals.dcodeAutoApprovalChanged &&
@@ -265,6 +247,13 @@ function runtimeConfigurationResumeDecision(
       removeRegistryEntry: true,
     };
   }
+  if (signals.messagingCredentialChanged) {
+    return {
+      kind: "recreate",
+      note: "  [resume] Messaging credential changed; recreating sandbox after configured checks.",
+      removeRegistryEntry: true,
+    };
+  }
   if (signals.hermesToolGatewayConfigChanged) {
     return {
       kind: "recreate",
@@ -292,11 +281,14 @@ function runtimeConfigurationResumeDecision(
 }
 
 function continuesJournaledRecreate(signals: SandboxResumeSignals): boolean {
+  const sourceStateKnown = ["ready", "missing", "not_ready"].includes(signals.sandboxReuseState);
   return (
     signals.resume &&
-    (signals.sandboxReuseState === "missing" || signals.sandboxReuseState === "not_ready") &&
-    signals.recreateSandboxRequested &&
-    Boolean(signals.recreateJournalHandoff)
+    sourceStateKnown &&
+    (signals.activeRecreateJournal === true ||
+      ((signals.sandboxReuseState === "missing" || signals.sandboxReuseState === "not_ready") &&
+        signals.recreateSandboxRequested &&
+        Boolean(signals.recreateJournalHandoff)))
   );
 }
 
@@ -315,6 +307,9 @@ export function decideSandboxResume(signals: SandboxResumeSignals): SandboxResum
       note: "  [resume] Continuing journaled sandbox recreation.",
       removeRegistryEntry: false,
     };
+  }
+  if (signals.hermesPortableLifecyclePending === true) {
+    return { kind: "create", continueHermesPortableLifecycle: true };
   }
   if (!signals.resume || !signals.sandboxStepComplete) return { kind: "create" };
   if (requiresUnownedNotReadyRepair(signals)) return { kind: "repair-and-recreate" };

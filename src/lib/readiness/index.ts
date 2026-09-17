@@ -21,7 +21,6 @@ export {
   collectGatewayObservations,
   createGatewayReadinessProjection,
   projectGatewayReadiness,
-  refreshGatewayReadinessProjection,
 } from "./gateway.js";
 export type {
   CollectHostObservationsOptions,
@@ -53,11 +52,12 @@ export type {
   PlatformQualificationProjection,
   StationProfile,
 } from "./platform-qualification.js";
+export { collectPlatformIdentity, projectPlatformQualification } from "./platform-qualification.js";
 export {
-  collectPlatformIdentity,
-  projectPlatformQualification,
-} from "./platform-qualification.js";
-export { createPublicReadinessReport, renderReadinessReport } from "./presentation.js";
+  createPublicHostProbeReadinessReport,
+  createPublicReadinessReport,
+  renderReadinessReport,
+} from "./presentation.js";
 export { getSystemReadinessReferenceErrors } from "./references.js";
 export type { CollectSystemReadinessOptions } from "./system.js";
 export { composeSystemReadinessReport, createSystemReadinessReport } from "./system.js";

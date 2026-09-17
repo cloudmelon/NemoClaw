@@ -3,20 +3,6 @@
 
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 
-export const MODEL_ROUTER_PUBLIC_KEY_ENV = "NVIDIA_API_KEY";
-
-export interface ModelRouterSecrets {
-  required(name: string): string;
-}
-
-export function requireModelRouterPublicKey(secrets: ModelRouterSecrets): string {
-  const apiKey = secrets.required(MODEL_ROUTER_PUBLIC_KEY_ENV);
-  if (!apiKey.startsWith("nvapi-")) {
-    throw new Error("NVIDIA_API_KEY must be a public NVIDIA Endpoints nvapi-* key");
-  }
-  return apiKey;
-}
-
 export function buildProviderRoutedEnv(
   apiKey: string,
   sandboxName: string,
@@ -34,6 +20,7 @@ export function buildProviderRoutedEnv(
     NEMOCLAW_SANDBOX_NAME: sandboxName,
     NEMOCLAW_NON_INTERACTIVE: "1",
     NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1",
+    NEMOCLAW_POLICY_MODE: "skip",
     NEMOCLAW_POLICY_TIER: "open",
     NEMOCLAW_PROVIDER: "routed",
   };

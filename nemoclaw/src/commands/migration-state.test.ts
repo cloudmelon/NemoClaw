@@ -147,6 +147,17 @@ vi.mock("../shared/snapshot-sanitizer-boundary.cjs", () => {
     },
   };
 });
+
+vi.mock("../shared/migration-restore-boundary.cjs", () => ({
+  restoreDescriptorSnapshotReplacements: () => ({
+    ok: true,
+    phase: "commit",
+    message: "restore transaction committed",
+    rollbackFailures: [],
+    retainedArchives: [],
+    cleanupFailures: [],
+  }),
+}));
 // Mock tar to avoid real archive creation
 vi.mock("tar", () => ({
   create: vi.fn(async () => {}),
@@ -157,7 +168,6 @@ import {
   createArchiveFromDirectory,
   createSnapshotBundle,
   detectHostOpenClaw,
-  type HostOpenClawState,
   loadSnapshotManifest,
   restoreSnapshotToHost,
   type SnapshotManifest,
@@ -190,8 +200,8 @@ describe("commands/migration-state", () => {
       expect(result.configPath).toBeNull();
     });
 
-    it("detects existing state directory", () => {
-      const env = { HOME: "/home/user" };
+    it.each([undefined, "", "   ", "/home/user"])("detects state for HOME=%j", (home) => {
+      const env = { HOME: home, USERPROFILE: "/home/user" };
       addDir("/home/user/.openclaw");
       addFile("/home/user/.openclaw/openclaw.json", JSON.stringify({ version: 1 }));
       const result = detectHostOpenClaw(env);
@@ -520,13 +530,13 @@ describe("commands/migration-state", () => {
       const hostState = makeHostOpenClawState();
 
       const bundle = createSnapshotBundle(hostState, logger, { persist: true });
-      if (bundle === null) {
-        expect.unreachable("bundle should not be null");
-        return;
-      }
-      expect(bundle.manifest.version).toBe(3);
-      expect(bundle.manifest.homeDir).toBe("/home/user");
+      if (bundle === null) expect.unreachable("bundle should not be null");
+      expect(bundle.manifest).toMatchObject({ version: 3, homeDir: "/home/user" });
       expect(bundle.temporary).toBe(false);
+      // The retention reader accepts only this directory grammar and requires the
+      // manifest to name the same identity (blueprint/snapshot-management.ts).
+      expect(bundle.snapshotDir).toMatch(/^\/home\/user\/\.nemoclaw\/snapshots\/\d{8}T\d{6}Z$/);
+      expect(bundle.snapshotDir.endsWith(`/${String(bundle.manifest.timestamp)}`)).toBe(true);
     });
 
     it("snapshots external config when hasExternalConfig", () => {
@@ -1250,29 +1260,6 @@ describe("commands/migration-state", () => {
       try {
         // no blueprintDigest field
         const manifest = makeSnapshotManifest();
-        addFile("/snapshots/snap1/snapshot.json", JSON.stringify(manifest));
-        addDir("/snapshots/snap1/openclaw");
-        addFile("/snapshots/snap1/openclaw/openclaw.json", JSON.stringify({ restored: true }));
-
-        const result = restoreSnapshotToHost("/snapshots/snap1", logger);
-        expect(result).toBe(true);
-      } finally {
-        if (origHome === undefined) {
-          delete process.env.HOME;
-        } else {
-          process.env.HOME = origHome;
-        }
-      }
-    });
-
-    it("restore succeeds for v3 snapshot created without blueprintPath", () => {
-      const logger = makeLogger();
-      const origHome = process.env.HOME;
-      process.env.HOME = "/home/user";
-      try {
-        // v3 manifest with no blueprintDigest field — created without a blueprint
-        // blueprintDigest intentionally omitted
-        const manifest = makeSnapshotManifest({ version: 3 });
         addFile("/snapshots/snap1/snapshot.json", JSON.stringify(manifest));
         addDir("/snapshots/snap1/openclaw");
         addFile("/snapshots/snap1/openclaw/openclaw.json", JSON.stringify({ restored: true }));

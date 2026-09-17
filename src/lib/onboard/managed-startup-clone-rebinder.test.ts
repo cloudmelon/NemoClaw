@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from "node:crypto";
+
 import { describe, expect, it, vi } from "vitest";
 
 import type { SandboxMessagingPlan } from "../messaging/manifest";
@@ -8,12 +10,14 @@ import { PEM } from "./__test-helpers__/corporate-ca-fixtures";
 import {
   type ManagedStartupCloneCurrentState,
   ManagedStartupCloneRebindError,
+  managedStartupCloneRebinderDependencies,
   rebindManagedStartupProfileForClone,
 } from "./managed-startup/clone-rebinder";
 import {
   buildManagedStartupProfile,
   type ManagedStartupProfileBuilderInput,
 } from "./managed-startup/profile-builder";
+import { encodeManagedStartupProfile } from "./managed-startup/profile";
 
 function messagingPlan(agent: "openclaw" | "hermes", sandboxName = "source"): SandboxMessagingPlan {
   return {
@@ -111,6 +115,7 @@ function hermesInput(): ManagedStartupProfileBuilderInput {
       agent: "hermes",
       mode: "loopback-forwarded",
       url: "http://127.0.0.1:19189",
+      browserUrl: "https://secure-link.example/",
       publicPort: 19_189,
       internalPort: 29_189,
       tuiEnabled: true,
@@ -163,9 +168,9 @@ function rebind(
 ) {
   const profile = built.profile;
   const webSearch =
-    profile.agentConfig.agent === "langchain-deepagents-code"
-      ? null
-      : profile.agentConfig.webSearch;
+    profile.agentConfig.agent === "openclaw" || profile.agentConfig.agent === "hermes"
+      ? profile.agentConfig.webSearch
+      : null;
   const hermesDashboard = profile.dashboard.agent === "hermes" ? profile.dashboard : null;
   const dcodeConfig =
     profile.agentConfig.agent === "langchain-deepagents-code" ? profile.agentConfig : null;
@@ -181,19 +186,20 @@ function rebind(
     startupProfileSha256: built.startupProfileSha256,
     ...(built.corporateCaB64 === undefined ? {} : { corporateCaB64: built.corporateCaB64 }),
     currentSource: {
-      provider: profile.inference.upstreamProvider,
-      model: profile.inference.model,
-      endpointUrl: profile.inference.upstreamEndpointUrl,
-      preferredInferenceApi: profile.inference.api,
+      provider: profile.inference?.upstreamProvider,
+      model: profile.inference?.model,
+      endpointUrl: profile.inference?.upstreamEndpointUrl,
+      preferredInferenceApi: profile.inference?.api,
       compatibleEndpointReasoning:
-        profile.agent === "openclaw" && profile.inference.upstreamProvider === "compatible-endpoint"
+        profile.agent === "openclaw" &&
+        profile.inference?.upstreamProvider === "compatible-endpoint"
           ? profile.tuning.reasoning
             ? "true"
             : "false"
           : null,
       compatibleEndpointReasoningEffort:
         profile.agent === "openclaw" &&
-        profile.inference.upstreamProvider === "compatible-endpoint" &&
+        profile.inference?.upstreamProvider === "compatible-endpoint" &&
         profile.tuning.reasoningEffort !== "default"
           ? profile.tuning.reasoningEffort
           : null,
@@ -230,6 +236,25 @@ function rebind(
 }
 
 describe("rebindManagedStartupProfileForClone", () => {
+  it.each(["openclaw", "hermes"] as const)(
+    "uses the later configured route when cloning providerless %s startup state",
+    (agent) => {
+      const input = agent === "openclaw" ? openClawInput() : hermesInput();
+      const built = buildManagedStartupProfile({ ...input, inference: null });
+      vi.spyOn(
+        managedStartupCloneRebinderDependencies,
+        "resolveContextWindowForModel",
+      ).mockReturnValue(131_072);
+      const rebound = rebind(built, agent, 21_189, {
+        provider: "nvidia-prod",
+        model: "fixture/model",
+        preferredInferenceApi: "openai-completions",
+      });
+      expect(rebound.profile.inference?.model).toBe("fixture/model");
+      expect(rebound.profile.inference?.upstreamProvider).toBe("nvidia-prod");
+    },
+  );
+
   it("rebinds OpenClaw dashboard and manifest-derived provider identity without ambient tokens", () => {
     const built = buildManagedStartupProfile(openClawInput());
     vi.stubEnv("TELEGRAM_BOT_TOKEN", "ambient-token-must-not-be-read");
@@ -265,7 +290,7 @@ describe("rebindManagedStartupProfileForClone", () => {
     const built = buildManagedStartupProfile({
       ...openClawInput(),
       inference: {
-        ...openClawInput().inference,
+        ...openClawInput().inference!,
         upstreamProvider: "compatible-endpoint",
         api: "openai-completions",
       },
@@ -287,6 +312,48 @@ describe("rebindManagedStartupProfileForClone", () => {
     });
   });
 
+  it("resolves the current Ollama context window when the source provider changed", () => {
+    const built = buildManagedStartupProfile(openClawInput());
+    const resolveContextWindowForModel = vi
+      .spyOn(managedStartupCloneRebinderDependencies, "resolveContextWindowForModel")
+      .mockReturnValue(131_072);
+
+    const rebound = rebind(built, "openclaw", 20_789, {
+      provider: "ollama-local",
+      model: "qwen3.5:9b",
+    });
+
+    expect(resolveContextWindowForModel).toHaveBeenCalledWith("ollama-local", "qwen3.5:9b");
+    expect(rebound.profile.tuning.contextWindow).toBe(131_072);
+  });
+
+  it("resolves the current Ollama context window when only the source model changed", () => {
+    const input = openClawInput();
+    const ollamaSource = buildManagedStartupProfile({
+      ...input,
+      inference: {
+        ...input.inference!,
+        upstreamProvider: "ollama-local",
+        model: "qwen3:8b",
+        api: "openai-completions",
+        primaryModelRef: "inference/qwen3:8b",
+        compatibility: { supportsUsageInStreaming: true },
+      },
+      environment: { NEMOCLAW_CONTEXT_WINDOW: "65536" },
+    });
+    const resolveContextWindowForModel = vi
+      .spyOn(managedStartupCloneRebinderDependencies, "resolveContextWindowForModel")
+      .mockReturnValue(131_072);
+
+    const rebound = rebind(ollamaSource, "openclaw", 20_789, {
+      provider: "ollama-local",
+      model: "qwen3.5:9b",
+    });
+
+    expect(resolveContextWindowForModel).toHaveBeenCalledWith("ollama-local", "qwen3.5:9b");
+    expect(rebound.profile.tuning.contextWindow).toBe(131_072);
+  });
+
   it("rebinds Hermes public dashboard and provider identity while retaining its internal port", () => {
     const rebound = rebind(buildManagedStartupProfile(hermesInput()), "hermes", 21_189);
 
@@ -294,6 +361,7 @@ describe("rebindManagedStartupProfileForClone", () => {
       agent: "hermes",
       mode: "loopback-forwarded",
       url: "http://127.0.0.1:21189",
+      browserUrl: "https://secure-link.example",
       publicPort: 21_189,
       internalPort: 29_189,
       tuiEnabled: true,
@@ -302,6 +370,55 @@ describe("rebindManagedStartupProfileForClone", () => {
       sandboxName: "destination",
       credentialBindings: [{ providerName: "destination-telegram-bridge" }],
     });
+  });
+
+  it("rebinds a Hermes browser URL across the IPv4 loopback range", () => {
+    const input = hermesInput();
+    const dashboard = input.dashboard as Extract<
+      typeof input.dashboard,
+      { readonly agent: "hermes" }
+    >;
+    const rebound = rebind(
+      buildManagedStartupProfile({
+        ...input,
+        dashboard: {
+          ...dashboard,
+          browserUrl: "http://127.0.0.2:19189",
+        },
+      }),
+      "hermes",
+      21_189,
+    );
+
+    expect(rebound.profile.dashboard).toMatchObject({
+      url: "http://127.0.0.1:21189",
+      browserUrl: "http://127.0.0.2:21189",
+      publicPort: 21_189,
+      internalPort: 29_189,
+    });
+  });
+
+  it("refuses to clone an enabled Hermes dashboard without a recorded browser URL", () => {
+    const input = hermesInput();
+    const built = buildManagedStartupProfile(input);
+    const dashboard = built.profile.dashboard as Extract<
+      typeof built.profile.dashboard,
+      { readonly agent: "hermes" }
+    >;
+    expect(dashboard.agent).toBe("hermes");
+    const { browserUrl: _browserUrl, ...legacyDashboard } = dashboard;
+    const legacyProfile = { ...built.profile, dashboard: legacyDashboard };
+    const encodedProfile = encodeManagedStartupProfile(legacyProfile);
+    const legacyBuilt = {
+      ...built,
+      profile: legacyProfile,
+      encodedProfile,
+      startupProfileSha256: createHash("sha256").update(encodedProfile, "utf8").digest("hex"),
+    } as ReturnType<typeof buildManagedStartupProfile>;
+
+    expect(() => rebind(legacyBuilt, "hermes", 21_189)).toThrow(
+      "Cannot prepare managed snapshot clone: current source Hermes dashboard has no recorded browser URL; rerun onboarding before cloning the sandbox",
+    );
   });
 
   it("rebinds managed-tool Hermes inference to the destination provider identity", () => {
@@ -361,8 +478,8 @@ describe("rebindManagedStartupProfileForClone", () => {
         encodedProfile: built.encodedProfile,
         startupProfileSha256: "0".repeat(64),
         currentSource: {
-          provider: built.profile.inference.upstreamProvider,
-          model: built.profile.inference.model,
+          provider: built.profile.inference!.upstreamProvider,
+          model: built.profile.inference!.model,
         },
       }),
     ).toThrow(ManagedStartupCloneRebindError);
@@ -383,8 +500,8 @@ describe("rebindManagedStartupProfileForClone", () => {
         startupProfileSha256: built.startupProfileSha256,
         corporateCaB64: "eA==",
         currentSource: {
-          provider: built.profile.inference.upstreamProvider,
-          model: built.profile.inference.model,
+          provider: built.profile.inference!.upstreamProvider,
+          model: built.profile.inference!.model,
         },
       }),
     ).toThrow(/corporate CA transport/u);

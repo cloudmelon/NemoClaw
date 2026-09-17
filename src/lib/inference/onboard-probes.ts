@@ -26,6 +26,27 @@ const {
   resolveProviderCredential,
 } = require("../credentials/store");
 const { isWsl } = require("../platform");
+
+/**
+ * Guidance for a WSL2 host whose endpoint verification keeps timing out.
+ *
+ * Names the one lever onboarding actually honours for this failure:
+ * `withValidationTimeoutOverride` raises the connection and maximum times for
+ * standard validation probes, including the chat-completions call that times
+ * out here.
+ * Streaming event probes stay capped at five seconds regardless. The override
+ * only ever raises a probe's budget, so the suggested value has to clear every
+ * default it might meet, including the 300-second extended NVIDIA profile.
+ * Onboarding has no flag that bypasses validation, so this must not imply one.
+ *
+ * The onboarding failure path receives this text through the probe result. It
+ * prints failure summaries rather than the raw probe message, which can carry
+ * provider response bodies (#10413).
+ */
+const WSL_SLOW_VERIFICATION_ADVISORY =
+  "WSL2 detected \u2014 network verification may be slower than expected. " +
+  "Check proxy and VPN health, then run onboarding again with a longer budget: " +
+  "`NEMOCLAW_ONBOARD_VALIDATION_TIMEOUT_SECONDS=360 nemoclaw onboard`.";
 const httpProbe = require("../adapters/http/probe");
 const authConfigModule = require("../adapters/http/auth-config");
 const openrouter = require("./openrouter");
@@ -35,7 +56,11 @@ const {
   getHostDockerInternalProbeFailure,
   isHijackedDockerInternalUrl,
 } = require("./onboard-host-docker-internal");
-const { isNvcfFunctionNotFoundForAccount, nvcfFunctionNotFoundMessage } = require("../validation");
+const {
+  isNvcfFunctionNotFoundForAccount,
+  nvcfFunctionNotFoundMessage,
+  shouldSkipResponsesProbe,
+} = require("../validation");
 const { isPrivateHostname, isPrivateIp, isLoopbackHostname } = require("../private-networks");
 const { buildResolvePinArgs, isOperatorTrustablePrivateIp } = require("./endpoint-ssrf-preflight");
 const {
@@ -50,12 +75,16 @@ const { probeOpenAiLikeEndpointWithValidationSession } = require("./openai-valid
 const {
   getChatCompletionsProbePayload,
   getChatCompletionsToolProbePayload,
+  EXTENDED_NVIDIA_ENDPOINT_PROBE_POLICY,
   isDeepSeekV4ProModel,
   isKimiK26Model,
   isReasoningOnlyLengthResponse,
+  resolveOnboardingProbeReplyBudget,
   STRICT_TOOL_PROBE_INITIAL_TOKENS,
-  STRICT_TOOL_PROBE_REASONING_RETRY_MESSAGE,
-  STRICT_TOOL_PROBE_RETRY_TOKENS,
+  STRICT_TOOL_PROBE_RETRY_TOKEN_LADDER,
+  strictToolProbeReasoningRetryMessage,
+  usesNvidiaEndpointProbePayload,
+  vllmProbePolicyForModel,
 } = require("./openai-probe-models");
 const {
   buildValidationProbeTimingProfile,
@@ -66,14 +95,9 @@ const {
   getStreamingEventProbeCurlArgs,
   getCurlMaxTimeSeconds,
   getProbeProcessTimeoutMs,
+  MAX_ONBOARD_VALIDATION_TIMEOUT_SECONDS,
 } = require("./probe-http-helpers");
-
-const {
-  getCurlTimingArgs,
-  runCurlProbe,
-  runChatCompletionsStreamingProbe,
-  runStreamingEventProbe,
-} = httpProbe;
+const { runCurlProbe, runChatCompletionsStreamingProbe, runStreamingEventProbe } = httpProbe;
 const { createOpenAiLikeAuthConfig } = authConfigModule;
 
 function buildOpenAiLikeAuthConfig(apiKey, options = {}) {
@@ -106,8 +130,6 @@ function openAiLikeFailureFromError(error) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-const EXTENDED_NVIDIA_ENDPOINT_VALIDATION_MODELS = new Set(["deepseek-ai/deepseek-v4-flash"]);
 
 // Hostnames that are normally meant for the sandbox/container host boundary.
 // host.openshell.internal only resolves inside the OpenShell sandbox network,
@@ -262,6 +284,16 @@ function getProbeAuthMode(_provider) {
   return undefined;
 }
 
+function getOpenAiSelectionProbeOptions(provider) {
+  return {
+    provider,
+    useNvidiaEndpointProbePayload: usesNvidiaEndpointProbePayload(provider),
+    requireResponsesToolCalling: shouldRequireResponsesToolCalling(provider),
+    skipResponsesProbe: shouldSkipResponsesProbe(provider),
+    authMode: getProbeAuthMode(provider),
+  };
+}
+
 export function getProbeExtraHeaders(provider) {
   if (provider === openrouter.OPENROUTER_PROVIDER_NAME) {
     return openrouter.getOpenRouterCurlHeaders();
@@ -404,11 +436,21 @@ function probeChatCompletionsToolCalling(endpointUrl, model, apiKey, options = {
     const timingArgs =
       options.timingArgs ??
       getChatCompletionsProbeTimingArgs(model, getProbeTimingOptions(options));
-    const runToolProbe = (maxTokens) => {
+    // The calibrated deadline covers a 256-token generation. The final ladder
+    // rung generates up to 4096 tokens, so its request deadline doubles;
+    // otherwise a slow reasoning model turns the budget failure into curl
+    // exit 28. The connect timeout stays: the endpoint already answered the
+    // earlier rungs, and the native session doubles only the request deadline.
+    const doubledTimingArgs = timingArgs.map((arg, index) =>
+      timingArgs[index - 1] === "--max-time"
+        ? String(Math.min(Number(arg) * 2, MAX_ONBOARD_VALIDATION_TIMEOUT_SECONDS))
+        : arg,
+    );
+    const runToolProbe = (maxTokens, timing = timingArgs) => {
       const args = [
         "-sS",
         ...buildResolvePinArgs(`${baseUrl}/chat/completions`, options.pinnedAddresses),
-        ...timingArgs,
+        ...timing,
         "-H",
         "Content-Type: application/json",
         ...authConfig.args,
@@ -425,20 +467,37 @@ function probeChatCompletionsToolCalling(endpointUrl, model, apiKey, options = {
       });
     };
     let result = runToolProbe(STRICT_TOOL_PROBE_INITIAL_TOKENS);
-    if (result.ok && isReasoningOnlyLengthResponse(result.body)) {
+    let exhaustedTokens = STRICT_TOOL_PROBE_INITIAL_TOKENS;
+    for (const retryTokens of STRICT_TOOL_PROBE_RETRY_TOKEN_LADDER) {
+      if (!result.ok || !isReasoningOnlyLengthResponse(result.body)) break;
       reasoningRetryAttempted = true;
-      console.log(STRICT_TOOL_PROBE_REASONING_RETRY_MESSAGE);
+      console.log(strictToolProbeReasoningRetryMessage(exhaustedTokens, retryTokens));
       trace.addTraceEvent("tool_call_reasoning_retry", {
-        initial_max_tokens: STRICT_TOOL_PROBE_INITIAL_TOKENS,
-        retry_max_tokens: STRICT_TOOL_PROBE_RETRY_TOKENS,
+        initial_max_tokens: exhaustedTokens,
+        retry_max_tokens: retryTokens,
       });
-      result = runToolProbe(STRICT_TOOL_PROBE_RETRY_TOKENS);
+      result = runToolProbe(
+        retryTokens,
+        retryTokens === STRICT_TOOL_PROBE_RETRY_TOKEN_LADDER.at(-1)
+          ? doubledTimingArgs
+          : timingArgs,
+      );
+      exhaustedTokens = retryTokens;
     }
 
     if (!result.ok) {
       const explainedResult = explainDisabledToolParsing(result);
       return reasoningRetryAttempted
-        ? { ...explainedResult, reasoningRetryAttempted: true }
+        ? {
+            ...explainedResult,
+            diagnosticCodes: [
+              ...new Set([
+                "openai-chat-missing-structured-tool-call",
+                ...(explainedResult.diagnosticCodes ?? []),
+              ]),
+            ],
+            reasoningRetryAttempted: true,
+          }
         : explainedResult;
     }
     if (hasChatCompletionsToolCall(result.body)) {
@@ -451,6 +510,7 @@ function probeChatCompletionsToolCalling(endpointUrl, model, apiKey, options = {
         curlStatus: result.curlStatus,
         body: result.body,
         stderr: result.stderr,
+        diagnosticCodes: ["openai-chat-tool-call-leak"],
         message:
           `HTTP ${result.httpStatus}: Chat Completions leaked tool calls into plain text content. ` +
           "Use an endpoint/runtime that returns structured tool_calls (for Hermes on local inference, " +
@@ -464,7 +524,9 @@ function probeChatCompletionsToolCalling(endpointUrl, model, apiKey, options = {
       curlStatus: result.curlStatus,
       body: result.body,
       stderr: result.stderr,
-      diagnosticCodes: ["openai-chat-missing-structured-tool-call"],
+      diagnosticCodes: isReasoningOnlyLengthResponse(result.body)
+        ? ["openai-chat-missing-structured-tool-call", "openai-chat-reasoning-budget-exhausted"]
+        : ["openai-chat-missing-structured-tool-call"],
 
       message: `HTTP ${result.httpStatus}: Chat Completions did not return a tool call`,
       ...(reasoningRetryAttempted ? { reasoningRetryAttempted: true } : {}),
@@ -479,7 +541,7 @@ function probeChatCompletionsToolCalling(endpointUrl, model, apiKey, options = {
 
 // ── OpenAI-like probe ────────────────────────────────────────────
 function needsExtendedNvidiaEndpointValidationBudget(model) {
-  return EXTENDED_NVIDIA_ENDPOINT_VALIDATION_MODELS.has(String(model || "").toLowerCase());
+  return vllmProbePolicyForModel(String(model || "")) === EXTENDED_NVIDIA_ENDPOINT_PROBE_POLICY;
 }
 
 function getChatCompletionsProbeTimingArgs(model, opts) {
@@ -506,6 +568,8 @@ export function getChatCompletionsProbeCurlArgs(opts: {
   isWsl?: boolean;
   pinnedAddresses?: readonly string[];
   validationTiming?: unknown;
+  useNvidiaEndpointProbePayload?: boolean;
+  replyBudget?: number;
 }) {
   const {
     credentialArgs,
@@ -515,6 +579,8 @@ export function getChatCompletionsProbeCurlArgs(opts: {
     isWsl: isWslOverride,
     pinnedAddresses,
     validationTiming,
+    useNvidiaEndpointProbePayload,
+    replyBudget,
   } = opts;
   const platformOptions = getProbeTimingOptions({
     ...(typeof isWslOverride === "boolean" ? { isWsl: isWslOverride } : {}),
@@ -530,7 +596,9 @@ export function getChatCompletionsProbeCurlArgs(opts: {
     "Content-Type: application/json",
     ...credSlice,
     "-d",
-    JSON.stringify(getChatCompletionsProbePayload(model)),
+    JSON.stringify(
+      getChatCompletionsProbePayload(model, { useNvidiaEndpointProbePayload, replyBudget }),
+    ),
     url,
   ];
 }
@@ -544,6 +612,8 @@ function runChatCompletionsProbe({
   pinnedAddresses,
   trustedPrivateCapability,
   validationTiming,
+  useNvidiaEndpointProbePayload,
+  replyBudget,
   spawnSyncImpl,
 }) {
   const args = getChatCompletionsProbeCurlArgs({
@@ -553,6 +623,8 @@ function runChatCompletionsProbe({
     isWsl: isWslOverride,
     pinnedAddresses,
     validationTiming,
+    useNvidiaEndpointProbePayload,
+    replyBudget,
   });
   const probeOpts = {
     timeoutMs: getProbeProcessTimeoutMs(args),
@@ -570,9 +642,9 @@ function runChatCompletionsProbe({
 }
 
 // Extracted from probeOpenAiLikeEndpoint so the chat-completions retry path
-// can be tested independently. Doubles the timing args (--connect-timeout,
-// --max-time) and replays through the same backoff schedule as transient HTTP
-// statuses. See PR #5975 review note PRA-8.
+// can be tested independently. Increases the timing args (--connect-timeout,
+// --max-time) up to the validation cap and replays through the same backoff
+// schedule as transient HTTP statuses. See PR #5975 review note PRA-8.
 function runDoubledTimeoutChatCompletionsRetry({
   endpointUrl,
   model,
@@ -580,10 +652,15 @@ function runDoubledTimeoutChatCompletionsRetry({
   options,
   baseUrl,
   authConfig,
+  replyBudget,
 }) {
   const platformOptions = getProbeTimingOptions(options);
   const baseArgs = getChatCompletionsProbeTimingArgs(model, platformOptions);
-  const doubledArgs = baseArgs.map((arg) => (/^\d+$/.test(arg) ? String(Number(arg) * 2) : arg));
+  const doubledArgs = baseArgs.map((arg) =>
+    /^\d+$/.test(arg)
+      ? String(Math.min(Number(arg) * 2, MAX_ONBOARD_VALIDATION_TIMEOUT_SECONDS))
+      : arg,
+  );
   const buildRetryArgs = () => [
     "-sS",
     ...buildResolvePinArgs(`${baseUrl}/chat/completions`, options.pinnedAddresses),
@@ -592,7 +669,12 @@ function runDoubledTimeoutChatCompletionsRetry({
     "Content-Type: application/json",
     ...authConfig.args,
     "-d",
-    JSON.stringify(getChatCompletionsProbePayload(model)),
+    JSON.stringify(
+      getChatCompletionsProbePayload(model, {
+        useNvidiaEndpointProbePayload: options.useNvidiaEndpointProbePayload,
+        replyBudget,
+      }),
+    ),
     `${baseUrl}/chat/completions`,
   ];
   const runRetryProbe = () =>
@@ -619,6 +701,7 @@ function runDoubledTimeoutChatCompletionsRetry({
 }
 
 function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
+  const replyBudget = resolveOnboardingProbeReplyBudget(options);
   if (isHijackedDockerInternalUrl(endpointUrl) && options.allowHostDockerInternal !== true) {
     return getHostDockerInternalProbeFailure();
   }
@@ -850,6 +933,8 @@ function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
               pinnedAddresses,
               trustedPrivateCapability: options.trustedPrivateCapability,
               validationTiming,
+              useNvidiaEndpointProbePayload: options.useNvidiaEndpointProbePayload,
+              replyBudget,
               spawnSyncImpl: options.spawnSyncImpl,
             }),
     };
@@ -994,6 +1079,7 @@ function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
         options,
         baseUrl,
         authConfig,
+        replyBudget,
       });
       if (retryResult.ok) {
         return { ok: true, api: "openai-completions", label: "Chat Completions API" };
@@ -1005,6 +1091,8 @@ function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
           curlStatus: retryResult.curlStatus,
           message: retryResult.message,
           body: retryResult.body,
+          diagnosticCodes: retryResult.diagnosticCodes,
+          reasoningRetryAttempted: retryResult.reasoningRetryAttempted === true,
         });
       }
     }
@@ -1028,16 +1116,12 @@ function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
     const baseMessage = failures
       .map((failure) => `${failure.name}: ${failure.message}`)
       .join(" | ");
-    const wslHint =
-      isWsl({ isWsl: options.isWsl }) && retriedAfterTimeout
-        ? " · WSL2 detected \u2014 network verification may be slower than expected. " +
-          "Run `nemoclaw onboard` with the `--skip-verify` flag if this endpoint is known to be reachable."
-        : "";
-    return {
+    const result = {
       ok: false,
-      message: baseMessage + wslHint,
+      message: baseMessage,
       failures,
     };
+    return retriedAfterTimeout ? withWslSlowVerificationAdvisory(result, options) : result;
   } catch (error) {
     return openAiLikeFailureFromError(error);
   } finally {
@@ -1045,15 +1129,20 @@ function probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options = {}) {
   }
 }
 
-async function probeOpenAiLikeEndpointOptimized(endpointUrl, model, apiKey, options = {}) {
+export async function probeOpenAiLikeEndpointOptimized(endpointUrl, model, apiKey, options = {}) {
   if (options.probeFromDocker) {
     return probeOpenAiLikeEndpoint(endpointUrl, model, apiKey, options);
   }
   const normalizedKey = apiKey ? normalizeCredentialValue(apiKey) : "";
   const baseUrl = String(endpointUrl).replace(/\/+$/, "");
   const validationTiming = resolveOpenAiLikeValidationTiming(baseUrl, options);
-  const sessionProbeOptions = validationTiming ? { ...options, validationTiming } : options;
-  return probeOpenAiLikeEndpointWithValidationSession(
+  const replyBudget = resolveOnboardingProbeReplyBudget(options);
+  const sessionProbeOptions = {
+    ...options,
+    ...(validationTiming ? { validationTiming } : {}),
+    ...(replyBudget !== undefined ? { replyBudget } : {}),
+  };
+  const result = await probeOpenAiLikeEndpointWithValidationSession(
     endpointUrl,
     model,
     normalizedKey,
@@ -1063,7 +1152,11 @@ async function probeOpenAiLikeEndpointOptimized(endpointUrl, model, apiKey, opti
       hasResponsesToolCall,
       hasChatCompletionsToolCall,
       hasChatCompletionsToolCallLeak,
-      getChatPayload: getChatCompletionsProbePayload,
+      getChatPayload: (probeModel) =>
+        getChatCompletionsProbePayload(probeModel, {
+          useNvidiaEndpointProbePayload: sessionProbeOptions.useNvidiaEndpointProbePayload,
+          replyBudget: sessionProbeOptions.replyBudget,
+        }),
       getResponsesTimeoutMs: (probeOptions) =>
         getCurlMaxTimeSeconds(getValidationProbeCurlArgs(getProbeTimingOptions(probeOptions))) *
         1000,
@@ -1077,6 +1170,28 @@ async function probeOpenAiLikeEndpointOptimized(endpointUrl, model, apiKey, opti
       sessionOptions: sessionProbeOptions.validationSessionOptions,
     },
   );
+  return withWslSlowVerificationAdvisory(result, options);
+}
+
+// Callers print failure summaries rather than `message`, because a raw probe
+// message can carry provider response bodies. Attach the curated advisory in
+// one place so legacy and native failures give a WSL2 operator the same next
+// step without widening the displayed failure data (#10413).
+function withWslSlowVerificationAdvisory(result, options) {
+  if (
+    result.ok ||
+    result.advisory ||
+    !isWsl({ isWsl: options.isWsl }) ||
+    !Array.isArray(result.failures) ||
+    !result.failures.some((failure) => isTimeoutOrConnFailureStatus(failure?.curlStatus))
+  ) {
+    return result;
+  }
+  return {
+    ...result,
+    message: `${result.message} · ${WSL_SLOW_VERIFICATION_ADVISORY}`,
+    advisory: WSL_SLOW_VERIFICATION_ADVISORY,
+  };
 }
 
 // ── Anthropic probe ──────────────────────────────────────────────
@@ -1090,8 +1205,8 @@ module.exports = {
   hasChatCompletionsToolCallLeak,
   shouldRequireResponsesToolCalling,
   getProbeAuthMode,
+  getOpenAiSelectionProbeOptions,
   getProbeExtraHeaders,
-  getValidationProbeCurlArgs,
   getDeepSeekV4ProValidationProbeCurlArgs,
   getKimiK26ValidationProbeCurlArgs,
   getChatCompletionsProbePayload,
@@ -1123,7 +1238,15 @@ export function shouldSmokeOpenAiLikeOnboardRoute(
     return false;
   }
   const { REMOTE_PROVIDER_CONFIG } = require("../onboard/providers");
-  if (provider === "nvidia-nim" || provider === "nvidia-router") return true;
+  // NVIDIA Endpoints registers as OpenShell provider type "nvidia", which the
+  // providerType test below does not match, so nvidia-prod was the only
+  // OpenAI-completions remote provider whose onboarding never sent a Chat
+  // Completions request. A model that is in the NVIDIA Build catalog but not
+  // deployed for the account then onboarded clean and first failed at
+  // `status` with a bare HTTP 404 (#10879). Smoke it like its siblings.
+  if (provider === "nvidia-prod" || provider === "nvidia-nim" || provider === "nvidia-router") {
+    return true;
+  }
   return Object.values(REMOTE_PROVIDER_CONFIG).some(
     (entry) =>
       entry.providerName === provider &&
@@ -1131,7 +1254,7 @@ export function shouldSmokeOpenAiLikeOnboardRoute(
   );
 }
 
-export async function verifyOnboardInferenceSmoke(options: any) {
+export async function verifyOnboardInferenceSmoke(options: any, dependencies: any = {}) {
   if (
     !options.forceOpenAiLike &&
     !shouldSmokeOpenAiLikeOnboardRoute(options.provider, options.credentialEnv)
@@ -1160,12 +1283,16 @@ export async function verifyOnboardInferenceSmoke(options: any) {
   const apiKey = credentialEnv
     ? resolveProviderCredential(credentialEnv) || getCredential(credentialEnv) || ""
     : "";
-  const probe = await probeOpenAiLikeEndpointOptimized(endpointUrl, options.model, apiKey, {
+  const optimizedProbe =
+    dependencies.probeOpenAiLikeEndpointOptimized ?? probeOpenAiLikeEndpointOptimized;
+  const probe = await optimizedProbe(endpointUrl, options.model, apiKey, {
     authMode: getProbeAuthMode(options.provider),
     extraHeaders: getProbeExtraHeaders(options.provider),
     skipResponsesProbe: true,
+    useNvidiaEndpointProbePayload: usesNvidiaEndpointProbePayload(options.provider),
     pinnedAddresses: options.pinnedAddresses,
     trustedPrivateCapability: options.trustedPrivateCapability,
+    provider: options.provider,
   });
 
   if (probe.ok) {
@@ -1185,6 +1312,19 @@ export async function verifyOnboardInferenceSmoke(options: any) {
   console.error(
     `  Upstream error: ${compactText(redact(probe.message || "unknown inference failure"))}`,
   );
+  // #8952: tear down an unowned managed gateway before fatal exit.
+  try {
+    const teardownOrphanManagedGatewayOnAbort =
+      dependencies.teardownOrphanManagedGatewayOnAbort ??
+      (require("../onboard/gateway-destroy") as typeof import("../onboard/gateway-destroy"))
+        .teardownOrphanManagedGatewayOnAbort;
+    await teardownOrphanManagedGatewayOnAbort();
+  } catch (error) {
+    // Helper never throws; this covers require/load failures only.
+    console.error(
+      `  Gateway teardown after onboard abort failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   process.exit(1);
 }
 

@@ -2,17 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { isDeepStrictEqual } from "node:util";
+import { readCandidateQualificationReceipt } from "../../agent/candidate";
 import { cloneAndDeepFreeze } from "../../core/immutable";
 import { getVersion } from "../../core/version";
 import type { SandboxEntry } from "../../state/registry/types";
 import { cloneSandboxWorkloadReceipt } from "../../state/registry/workload";
 import type { ResolvedCorporateCa } from "../corporate-ca-types";
 import {
+  isCandidateManagedImageAgent,
   MANAGED_IMAGE_CAPABILITY_CONTRACT_VERSION,
   MANAGED_IMAGE_STARTUP_PROFILE_CONTRACT_VERSION,
+  type ManagedImageAgent,
   type ManagedImageContractV1,
   parseManagedImageContractV1,
-  type ShippedManagedImageAgent,
 } from "../managed-image/contract";
 import {
   type BuiltManagedStartupOnboardProfile,
@@ -34,8 +36,11 @@ import {
 export type { ManagedWorkloadReceipt } from "./authority";
 
 import {
+  liveE2eManagedImageCatalog,
+  liveE2eManagedImageRevision,
   type PreparedSandboxWorkloadSource,
   prepareSandboxWorkloadSource,
+  rejectManagedWorkloadBaseImageOverride,
   SandboxWorkloadPreparationError,
 } from "./preparation";
 import {
@@ -57,7 +62,7 @@ const HOST_PROXY_ENV_NAMES = [
 export interface ManagedWorkloadRebuildCatalogHandoff {
   readonly schemaVersion: 1;
   readonly providerId: string;
-  readonly agent: ShippedManagedImageAgent;
+  readonly agent: ManagedImageAgent;
   /** Exact authority retained until a replacement has become Ready. */
   readonly previousReceipt: ManagedWorkloadReceipt;
   readonly previousContract: ManagedImageContractV1;
@@ -137,19 +142,80 @@ export async function prepareManagedWorkloadRebuildHandoff(
   requireProviderBoundAuthority(authority, options.runtime, options.provider);
 
   let replacement: PreparedSandboxWorkloadSource;
-  try {
-    replacement = await managedWorkloadRebuildDependencies.prepareSandboxWorkloadSource({
-      agentName: authority.agent,
-      legacyDockerfilePath: "managed-rebuild-must-not-stage-this-dockerfile",
-      runtime: options.runtime,
-      version: options.version ?? getVersion(),
-      policy: "require-managed",
-    });
-  } catch (error) {
-    throw new ManagedWorkloadRebuildError(
-      "the current release's complete managed-image catalog is unavailable or invalid",
-      { cause: error },
-    );
+  if (isCandidateManagedImageAgent(authority.agent)) {
+    try {
+      rejectManagedWorkloadBaseImageOverride(authority.agent);
+    } catch (error) {
+      throw new ManagedWorkloadRebuildError(
+        error instanceof Error
+          ? error.message
+          : "the managed workload base-image override is invalid",
+        { cause: error },
+      );
+    }
+    // A candidate publishes outside the all-agent release cohort, so its
+    // replacement comes from the protected qualification receipt rather than
+    // the current release catalog.
+    let contract;
+    try {
+      contract = readCandidateQualificationReceipt(authority.agent);
+    } catch (error) {
+      throw new ManagedWorkloadRebuildError(
+        "the protected candidate qualification receipt is unavailable or invalid",
+        { cause: error },
+      );
+    }
+    try {
+      replacement = {
+        source: resolveSandboxWorkloadSource({
+          agentName: authority.agent,
+          legacyDockerfilePath: "managed-rebuild-must-not-stage-this-dockerfile",
+          runtime: options.runtime,
+          catalog: { [authority.agent]: contract },
+          policy: "require-managed",
+          candidateAgentsEnabled: true,
+        }),
+        release: contract.source.release,
+        fallbackDiagnostic: null,
+      };
+    } catch (error) {
+      throw new ManagedWorkloadRebuildError(
+        "the accepted candidate image is not supported by the selected runtime",
+        { cause: error },
+      );
+    }
+  } else {
+    const qualificationRevision = liveE2eManagedImageRevision(process.env);
+    const liveCatalog = liveE2eManagedImageCatalog(process.env);
+    if (qualificationRevision && liveCatalog) {
+      throw new ManagedWorkloadRebuildError(
+        "live E2E managed-image revision and catalog authority conflict",
+      );
+    }
+    try {
+      replacement = await managedWorkloadRebuildDependencies.prepareSandboxWorkloadSource({
+        agentName: authority.agent,
+        legacyDockerfilePath: "managed-rebuild-must-not-stage-this-dockerfile",
+        runtime: options.runtime,
+        version: options.version ?? getVersion(),
+        policy: "require-managed",
+        ...(liveCatalog
+          ? {
+              ...(liveCatalog.catalog ? { catalog: liveCatalog.catalog } : {}),
+              catalogPath: liveCatalog.path,
+              expectedCatalogRevision: liveCatalog.revision,
+            }
+          : {}),
+        ...(qualificationRevision ? { catalogRevision: qualificationRevision } : {}),
+      });
+    } catch (error) {
+      throw new ManagedWorkloadRebuildError(
+        error instanceof SandboxWorkloadPreparationError
+          ? error.message
+          : "the selected managed-image catalog is unavailable or invalid",
+        { cause: error },
+      );
+    }
   }
   if (replacement.source.kind !== "managed-image") {
     throw new ManagedWorkloadRebuildError(
@@ -227,7 +293,7 @@ export function managedWorkloadRebuildProfileEnvironment(
     if (reasoning !== null) result.NEMOCLAW_REASONING = String(reasoning);
     const reasoningEffort = overrides.openClawReasoningEffort ?? previous.tuning.reasoningEffort;
     if (reasoningEffort !== null) result.NEMOCLAW_REASONING_EFFORT = reasoningEffort;
-    if (previous.inference.inputModalities !== null) {
+    if (previous.inference?.inputModalities != null) {
       result.NEMOCLAW_INFERENCE_INPUTS = previous.inference.inputModalities.join(",");
     }
     result.NEMOCLAW_AGENT_TIMEOUT = String(config.agentTimeoutSeconds);
@@ -245,6 +311,16 @@ export function managedWorkloadRebuildProfileEnvironment(
     result.NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE = String(config.otel.sampleRate);
   } else if (previous.agent === "hermes" && previous.tuning.contextWindow !== null) {
     result.NEMOCLAW_CONTEXT_WINDOW = String(previous.tuning.contextWindow);
+  } else if (previous.agent === "pi") {
+    if (previous.tuning.contextWindow !== null) {
+      result.NEMOCLAW_CONTEXT_WINDOW = String(previous.tuning.contextWindow);
+    }
+    if (previous.tuning.maxTokens !== null) {
+      result.NEMOCLAW_MAX_TOKENS = String(previous.tuning.maxTokens);
+    }
+    if (previous.tuning.reasoning !== null) {
+      result.NEMOCLAW_REASONING = String(previous.tuning.reasoning);
+    }
   }
 
   if (handoff.previousReceipt.credentialProxyReplayRequired) {
@@ -332,6 +408,7 @@ export function prepareSandboxWorkloadSourceFromRebuildHandoff(
       runtime,
       catalog: { [handoff.agent]: handoff.replacement.source.contract },
       policy: "require-managed",
+      candidateAgentsEnabled: isCandidateManagedImageAgent(handoff.agent),
     });
   } catch (error) {
     throw new SandboxWorkloadPreparationError(

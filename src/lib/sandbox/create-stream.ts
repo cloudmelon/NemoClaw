@@ -20,9 +20,12 @@ export interface StreamSandboxCreateResult {
   output: string;
   sawProgress: boolean;
   forcedReady?: boolean;
+  readyTerminationTimedOut?: boolean;
 }
 
 export interface StreamSandboxCreateOptions {
+  /** Schema-owned build context. Ordinary create paths keep the repository root. */
+  cwd?: string;
   readyCheck?: (() => boolean) | null;
   // Optional poll side effect. Must be paired with failureCheck so any
   // observed side-effect error has an authoritative terminal-state classifier.
@@ -114,7 +117,7 @@ export function streamSandboxCreate(
   const spawnChild = options.spawnImpl ?? spawn;
   const ownProcessGroup = spawnChild === spawn && process.platform !== "win32";
   const child: StreamableChildProcess = spawnChild(spawnCommand, commandArgs, {
-    cwd: ROOT,
+    cwd: options.cwd ?? ROOT,
     env,
     detached: ownProcessGroup,
     stdio: ["ignore", "pipe", "pipe"],
@@ -444,7 +447,7 @@ export function streamSandboxCreate(
               readyTerminationTimer = setTimeout(() => {
                 lines.push("OpenShell create client did not exit after Ready; aborting cutover.");
                 terminateChild("SIGKILL");
-                finish(1);
+                finish(1, { readyTerminationTimedOut: true });
               }, READY_TERMINATION_TIMEOUT_MS);
               readyTerminationTimer.unref?.();
               sawProgress = true;

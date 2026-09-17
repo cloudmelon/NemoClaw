@@ -4,7 +4,15 @@
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+beforeEach(() => {
+  vi.stubEnv("DOCKER_CONTEXT", "default");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 const require = createRequire(import.meta.url);
 const PROXY_DIST = require.resolve("./proxy");
@@ -32,7 +40,7 @@ function loadProxyWithMocks(setup: MockSetup): {
   const childProcess = require(CHILD_PROCESS_DIST) as typeof import("node:child_process");
   const runner = require(RUNNER_DIST);
   const originalGetOllamaModelOptions = local.getOllamaModelOptions;
-  const originalGetOllamaWarmupCommand = local.getOllamaWarmupCommand;
+  const originalRunOllamaWarmup = local.runOllamaWarmup;
   const originalPrompt = creds.prompt;
   const originalProbeOllamaModelCapabilities = local.probeOllamaModelCapabilities;
   const originalRun = runner.run;
@@ -68,9 +76,9 @@ function loadProxyWithMocks(setup: MockSetup): {
     capabilities: ["tools"],
     supportsTools: true,
   });
-  local.getOllamaWarmupCommand = (model: string) => {
+  local.runOllamaWarmup = (model: string, runImpl: typeof runner.run) => {
     warmupModels.push(model);
-    return ["warmup", model];
+    runImpl(["warmup", model], { ignoreError: true });
   };
   local.validateOllamaModel = (...args: unknown[]) => {
     validateCalls.push(args);
@@ -95,7 +103,7 @@ function loadProxyWithMocks(setup: MockSetup): {
     restore() {
       delete require.cache[PROXY_DIST];
       local.getOllamaModelOptions = originalGetOllamaModelOptions;
-      local.getOllamaWarmupCommand = originalGetOllamaWarmupCommand;
+      local.runOllamaWarmup = originalRunOllamaWarmup;
       creds.prompt = originalPrompt;
       local.probeOllamaModelCapabilities = originalProbeOllamaModelCapabilities;
       runner.run = originalRun;
@@ -129,8 +137,9 @@ describe("promptOllamaModel installed-model fit filter", () => {
   });
 
   it("keeps a fitting installed model as the default", async () => {
+    const installed = vi.fn(() => ["qwen3.5:9b", "qwen3.6:35b"]);
     const setup = loadProxyWithMocks({
-      installed: ["qwen3.5:9b", "qwen3.6:35b"],
+      installed,
       promptValues: [""],
     });
     active = setup;
@@ -141,6 +150,7 @@ describe("promptOllamaModel installed-model fit filter", () => {
     });
     // Only qwen3.5:9b fits; the menu offers only it, Enter selects it.
     expect(result).toBe("qwen3.5:9b");
+    expect(installed).toHaveBeenCalledTimes(1);
   });
 
   it("defaults to a requested model when it is shown in the installed model menu", async () => {
@@ -161,7 +171,7 @@ describe("promptOllamaModel installed-model fit filter", () => {
     expect(setup.promptArgs).toEqual(["  Choose model [2]: "]);
   });
 
-  it("keeps the memory-based default when a requested model is not shown", async () => {
+  it("prefers the largest registered fitting model over an unregistered tag when the requested default is not shown (#10103)", async () => {
     const setup = loadProxyWithMocks({
       installed: ["qwen2.5:0.5b", "qwen3.5:9b"],
       promptValues: [""],
@@ -175,8 +185,12 @@ describe("promptOllamaModel installed-model fit filter", () => {
       },
       { defaultModel: "qwen3.6:35b" },
     );
-    expect(result).toBe("qwen2.5:0.5b");
-    expect(setup.promptArgs).toEqual(["  Choose model [1]: "]);
+    // qwen2.5:0.5b is not in the registry, so it cannot outrank the known,
+    // larger qwen3.5:9b — the menu still lists both in installed order, but
+    // the default selection is the registered model, not whichever listed
+    // first.
+    expect(result).toBe("qwen3.5:9b");
+    expect(setup.promptArgs).toEqual(["  Choose model [2]: "]);
   });
 
   it("respects unknown installed tags (not in the registry) even when nothing else fits", async () => {
@@ -372,13 +386,21 @@ describe("prepareOllamaModel post-pull discovery", () => {
 });
 
 describe("pullOllamaModel CLI-vs-HTTP dispatch", () => {
-  function loadProxyForDispatch(setup: { host: string; hasLocalCli: boolean }) {
+  function loadProxyForDispatch(setup: {
+    host: string;
+    hasLocalCli: boolean;
+    httpCloseCode?: number;
+    isolatedDockerConfig?: string;
+  }) {
     const local = require(LOCAL_DIST);
     const runner = require(RUNNER_DIST);
     const childProcess = require(CHILD_PROCESS_DIST) as typeof import("node:child_process");
     const originalRunCapture = runner.runCapture;
+    const originalPrepareOllamaApiExecution = local.prepareOllamaApiExecution;
     const cliCommands: string[][] = [];
     const httpCommands: string[][] = [];
+    const httpEnvs: NodeJS.ProcessEnv[] = [];
+    let cleanupCalls = 0;
 
     runner.runCapture = () => (setup.hasLocalCli ? "/usr/bin/ollama" : "");
 
@@ -388,21 +410,48 @@ describe("pullOllamaModel CLI-vs-HTTP dispatch", () => {
         cliCommands.push([String(file), ...(((args as string[]) ?? []) as string[]).map(String)]);
         return { status: 0, signal: null, output: [], pid: 1, stdout: "", stderr: "" } as never;
       });
-    const spawn = vi.spyOn(childProcess, "spawn").mockImplementation((file: unknown, args) => {
-      httpCommands.push([String(file), ...(((args as string[]) ?? []) as string[]).map(String)]);
-      const child = new EventEmitter() as EventEmitter & {
-        stdout: PassThrough;
-        stderr: PassThrough;
+    local.prepareOllamaApiExecution = (
+      command: readonly string[],
+      host: string,
+      _options: NonNullable<Parameters<typeof originalPrepareOllamaApiExecution>[2]>,
+    ) => {
+      const prepared = {
+        env: { DOCKER_CONFIG: setup.isolatedDockerConfig ?? "/tmp/test-docker-config" },
+        isolatedCredentialConfig: true,
+        cleanup: () => {
+          cleanupCalls += 1;
+          return { ok: true as const };
+        },
       };
-      child.stdout = new PassThrough();
-      child.stderr = new PassThrough();
-      process.nextTick(() => {
-        child.stdout.end('{"status":"success"}\n', () => {
-          setImmediate(() => child.emit("close", 0));
+      return {
+        command:
+          command[0] === "curl" ? local.getOllamaApiCommand(command.slice(1), host) : [...command],
+        env: { ...prepared.env, DOCKER_CONTEXT: "default" },
+        cleanup: () => {
+          prepared.cleanup();
+        },
+      };
+    };
+    const spawn = vi
+      .spyOn(childProcess, "spawn")
+      .mockImplementation((file: unknown, args, options) => {
+        httpCommands.push([String(file), ...(((args as string[]) ?? []) as string[]).map(String)]);
+        httpEnvs.push((options?.env ?? {}) as NodeJS.ProcessEnv);
+        const child = new EventEmitter() as EventEmitter & {
+          stdout: PassThrough;
+          stderr: PassThrough;
+        };
+        child.stdout = new PassThrough();
+        child.stderr = new PassThrough();
+        process.nextTick(() => {
+          const closeCode = setup.httpCloseCode ?? 0;
+          const output = closeCode === 0 ? '{"status":"success"}\n' : "";
+          child.stdout.end(output, () => {
+            setImmediate(() => child.emit("close", closeCode));
+          });
         });
+        return child as never;
       });
-      return child as never;
-    });
 
     local.setResolvedOllamaHost(setup.host);
     delete require.cache[PROXY_DIST];
@@ -411,9 +460,14 @@ describe("pullOllamaModel CLI-vs-HTTP dispatch", () => {
       proxy,
       cliCommands,
       httpCommands,
+      httpEnvs,
+      get cleanupCalls() {
+        return cleanupCalls;
+      },
       restore() {
         delete require.cache[PROXY_DIST];
         runner.runCapture = originalRunCapture;
+        local.prepareOllamaApiExecution = originalPrepareOllamaApiExecution;
         spawnSync.mockRestore();
         spawn.mockRestore();
         local.setResolvedOllamaHost(null);
@@ -426,17 +480,41 @@ describe("pullOllamaModel CLI-vs-HTTP dispatch", () => {
   afterEach(() => {
     active?.restore();
     active = null;
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
-  it("pulls over HTTP when the daemon resolves on the Windows host", async () => {
+  it("pulls through Docker when the daemon resolves on the Windows host (#10553)", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
-    active = loadProxyForDispatch({ host: "host.docker.internal", hasLocalCli: true });
+    active = loadProxyForDispatch({
+      host: "host.docker.internal",
+      hasLocalCli: true,
+      isolatedDockerConfig: "/tmp/credential-free-docker",
+    });
 
-    await active.proxy.pullOllamaModel("qwen3.5:9b");
+    const result = await active.proxy.pullOllamaModel("qwen3.5:9b");
 
-    expect(active.httpCommands.map((command) => command[0])).toContain("curl");
+    expect(result).toBe(true);
+    expect(active.httpCommands.map((command) => command[0])).toContain("docker");
+    const request = active.httpCommands[0];
+    expect(request).toEqual(
+      expect.arrayContaining([
+        "run",
+        "--rm",
+        "docker.io/curlimages/curl@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
+        "-X",
+        "POST",
+        "Content-Type: application/json",
+        "http://host.docker.internal:11434/api/pull",
+      ]),
+    );
+    expect(JSON.parse(request[request.indexOf("-d") + 1])).toEqual({
+      model: "qwen3.5:9b",
+      stream: true,
+    });
     expect(active.cliCommands.map((command) => command[0])).not.toContain("bash");
+    expect(active.httpEnvs[0]?.DOCKER_CONFIG).toBe("/tmp/credential-free-docker");
+    expect(active.cleanupCalls).toBe(1);
   });
 
   it("pulls over HTTP when a loopback daemon has no local ollama binary (#7472)", async () => {
@@ -459,5 +537,42 @@ describe("pullOllamaModel CLI-vs-HTTP dispatch", () => {
 
     expect(active.cliCommands.map((command) => command[0])).toContain("bash");
     expect(active.httpCommands.map((command) => command[0])).not.toContain("curl");
+  });
+
+  it("reports a Windows-host connection timeout instead of the configured pull limit (#10259)", async () => {
+    vi.stubEnv("NEMOCLAW_OLLAMA_PULL_TIMEOUT", "1800");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    active = loadProxyForDispatch({
+      host: "host.docker.internal",
+      hasLocalCli: false,
+      httpCloseCode: 28,
+    });
+    vi.spyOn(performance, "now").mockReturnValueOnce(1_000).mockReturnValueOnce(11_200);
+
+    const result = await active.proxy.pullOllamaModel("qwen3.5:9b");
+
+    const errors = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+    expect(result).toBe(false);
+    expect(errors).toContain("Model pull connection timed out after 10 seconds.");
+    expect(errors).toContain("The wall-clock limit of 30 minutes was not reached.");
+    expect(errors).not.toContain("Model pull timed out after 30 minutes.");
+  });
+
+  it("reports the configured wall-clock limit when the HTTP pull reaches it (#10259)", async () => {
+    vi.stubEnv("NEMOCLAW_OLLAMA_PULL_TIMEOUT", "1800");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    active = loadProxyForDispatch({
+      host: "host.docker.internal",
+      hasLocalCli: false,
+      httpCloseCode: 28,
+    });
+    vi.spyOn(performance, "now").mockReturnValueOnce(1_000).mockReturnValueOnce(1_801_000);
+
+    const result = await active.proxy.pullOllamaModel("qwen3.5:9b");
+
+    const errors = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
+    expect(result).toBe(false);
+    expect(errors).toContain("Model pull timed out after 30 minutes.");
+    expect(errors).not.toContain("Model pull connection timed out");
   });
 });

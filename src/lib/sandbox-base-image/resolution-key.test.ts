@@ -95,11 +95,11 @@ describe("sandbox base-image resolution key", () => {
     const root = fixture();
     const lockfile = path.join(root, "agents", "langchain-deepagents-code", "requirements.lock");
     fs.mkdirSync(path.dirname(lockfile), { recursive: true });
-    fs.writeFileSync(lockfile, "deepagents-code==0.1.34\n");
+    fs.writeFileSync(lockfile, "deepagents-code==0.1.55\n");
     const keyedOptions = { ...options(root), inputPaths: [lockfile] };
     const before = createSandboxBaseImageResolutionKey(keyedOptions);
 
-    fs.writeFileSync(lockfile, "deepagents-code==0.1.34\ntransitive-dependency==2.0.0\n");
+    fs.writeFileSync(lockfile, "deepagents-code==0.1.55\ntransitive-dependency==2.0.0\n");
 
     expect(createSandboxBaseImageResolutionKey(keyedOptions)).not.toBe(before);
   });
@@ -150,14 +150,14 @@ describe("sandbox base-image resolution key", () => {
     expect(second).not.toBe(first);
   });
 
-  it("isolates pinned-first resolution policy", () => {
+  it("isolates required pinned resolution policy", () => {
     const root = fixture();
     const base = {
       ...options(root),
       pinnedRemoteRef: "example/base@sha256:first",
     };
 
-    expect(createSandboxBaseImageResolutionKey({ ...base, preferPinnedRemoteRef: true })).not.toBe(
+    expect(createSandboxBaseImageResolutionKey({ ...base, requirePinnedRemoteRef: true })).not.toBe(
       createSandboxBaseImageResolutionKey(base),
     );
   });
@@ -166,7 +166,7 @@ describe("sandbox base-image resolution key", () => {
     const root = fixture();
     const base = options(root);
 
-    expect(createSandboxBaseImageResolutionKey({ ...base, preferPinnedRemoteRef: false })).toBe(
+    expect(createSandboxBaseImageResolutionKey({ ...base, requirePinnedRemoteRef: false })).toBe(
       createSandboxBaseImageResolutionKey(base),
     );
   });

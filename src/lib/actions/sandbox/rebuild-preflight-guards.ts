@@ -5,6 +5,7 @@ import {
   detectOpenShellStateRpcPreflightIssue,
   printOpenShellStateRpcIssue,
 } from "../../adapters/openshell/gateway-drift";
+import type { OpenShellRuntimeSelection } from "../../adapters/openshell/runtime-selection";
 import { CLI_NAME } from "../../cli/branding";
 import {
   checkGatewayRouteCompatibility,
@@ -15,6 +16,7 @@ import {
 import { normalizeInferenceSelection } from "../../inference/selection";
 import { resolveSandboxGatewayName } from "../../onboard/gateway-binding";
 import { requireRuntimeProviderBundleForSandbox } from "../../onboard/runtime-provider/access";
+import { assertHermesPortableCommandUnavailable } from "../../onboard/experimental/portable-agent-lifecycle";
 import { CURRENT_RUNTIME_PROVIDER_BUNDLES } from "../../onboard/runtime-provider/current";
 import {
   type ManagedWorkloadRebuildHandoff,
@@ -53,6 +55,10 @@ const defaultRouteDependencies: RebuildRouteRegistryDependencies = {
   load,
   save,
 };
+
+export function assertSandboxRebuildCommandAvailable(sandboxName: string): void {
+  assertHermesPortableCommandUnavailable(sandboxName, "sandbox:rebuild");
+}
 
 function normalizedRoute(entry: Partial<SandboxEntry>): GatewayInferenceRoute {
   const route = normalizeInferenceSelection(entry);
@@ -173,12 +179,6 @@ export function commitRebuildRoutePreflight(
     if (conflict) return { ok: false, message: conflict };
 
     Object.assign(currentTarget, input.targetUpdate);
-    // Rebuild and its route migration are authority changes even if a later
-    // phase restores the old values. Revoke candidate readiness atomically.
-    registry.invalidateCuaRuntimeReadinessInRegistry(sandboxRegistry, input.sandboxName);
-    for (const name of migratedSandboxNames) {
-      registry.invalidateCuaRuntimeReadinessInRegistry(sandboxRegistry, name);
-    }
     dependencies.save(sandboxRegistry);
     return {
       ok: true,
@@ -266,13 +266,21 @@ export function revalidateManagedWorkloadRebuildBeforeDelete(
   };
 }
 
-export function checkRebuildGatewaySchemaPreflight(
+export async function checkRebuildGatewaySchemaPreflight(
   sandboxName: string,
   sb: RebuildSandboxEntry,
   bail: RebuildBail,
-): boolean {
-  const issue = detectOpenShellStateRpcPreflightIssue({
-    gatewayName: resolveSandboxGatewayName(sb),
+  runtimeSelection?: OpenShellRuntimeSelection,
+): Promise<boolean> {
+  const gatewayName = resolveSandboxGatewayName(sb);
+  if (runtimeSelection && runtimeSelection.gatewayName !== gatewayName) {
+    return bail(
+      `Rebuild gateway schema target '${gatewayName}' does not match the frozen OpenShell target '${runtimeSelection.gatewayName}'.`,
+    );
+  }
+  const issue = await detectOpenShellStateRpcPreflightIssue({
+    gatewayName,
+    ...(runtimeSelection ? { runtimeSelection } : {}),
   });
   if (issue) {
     printOpenShellStateRpcIssue(issue, {
@@ -291,10 +299,10 @@ export function checkRebuildGatewaySchemaPreflight(
 }
 
 export async function runRebuildGatewayIntentPreflight<T>(options: {
-  checkGatewaySchema: () => boolean;
+  checkGatewaySchema: () => boolean | Promise<boolean>;
   confirmIntent: () => Promise<T | null>;
 }): Promise<T | null> {
-  if (!options.checkGatewaySchema()) return null;
+  if (!(await options.checkGatewaySchema())) return null;
   return options.confirmIntent();
 }
 
@@ -315,26 +323,27 @@ export function getRebuildSandboxEntryOrBail(
   return sb;
 }
 
-/** Keep the pending baseline-policy transaction guard identical at every rebuild boundary. */
-export function blockRebuildOnPendingBaselineTransition(
-  sandboxEntry: RebuildSandboxEntry,
-  sandboxName: string,
+/** Block rebuild before any live-state probe or cleanup can bypass retained recovery. */
+export function blockRebuildOnRetainedSandboxRecovery(
+  sandbox: RebuildSandboxEntry,
   bail: RebuildBail,
 ): boolean {
-  const transition = sandboxEntry.baselineExclusionTransition;
-  if (!transition) return false;
+  const sandboxName = sandbox.name;
+  onboardSession.reconstructRetainedSandboxRecoveryFromPendingCreate(sandbox);
+  const retainedRecovery = onboardSession
+    .listRetainedSandboxRecoveryRecords()
+    .find((record) => record.sandboxName === sandboxName);
+  if (!retainedRecovery) return false;
 
-  const key = transition.exclusion.key;
-  printRebuildPreflightFailure(
-    `baseline policy ${transition.operation} for '${key}' needs repair before rebuild.`,
-    `Re-run: ${CLI_NAME} ${sandboxName} policy ${transition.operation} ${key}`,
-    `Pending baseline policy ${transition.operation} for '${key}' blocks rebuild.`,
-    bail,
-    1,
+  console.error(
+    `  Rebuild cannot use retained sandbox '${sandboxName}' while recovery record '${retainedRecovery.recordId}' is unresolved. No sandbox or Docker resources were removed.`,
   );
+  console.error(
+    `  Run '${CLI_NAME} ${sandboxName} destroy --yes'. If the owning gateway reports the sandbox present or cannot determine presence, destroy removes nothing and preserves the recovery record.`,
+  );
+  bail(`Retained sandbox recovery blocks rebuild for '${sandboxName}'.`, 1);
   return true;
 }
-
 export function isSingleAgentRebuildSupported(
   sb: registry.SandboxEntry & { agents?: unknown[] },
   bail: RebuildBail,

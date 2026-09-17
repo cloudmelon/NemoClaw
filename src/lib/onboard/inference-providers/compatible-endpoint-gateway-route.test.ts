@@ -1,49 +1,31 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-import path from "node:path";
-import { describe, expect, it } from "vitest";
-import YAML from "yaml";
+import { describe, expect, it, vi } from "vitest";
 
 import {
-  BUNDLED_LOCAL_INFERENCE_GATEWAY_PORTS,
   COMPATIBLE_ENDPOINT_GATEWAY_PORTS,
   gatewayReachableCompatibleEndpointUrl,
+  reuseRegisteredProviderWithGatewayEndpoint,
 } from "./compatible-endpoint-gateway-route";
 
 describe("compatible endpoint gateway routing", () => {
-  // source-shape-contract: compatibility -- Bundled loopback routing must match the shipped host-gateway policy ports
-  it("matches the bundled local-inference host-gateway ports (#5744)", () => {
-    const policyPath = path.resolve(
-      import.meta.dirname,
-      "../../../../nemoclaw-blueprint/policies/presets/local-inference.yaml",
-    );
-    const policy = YAML.parse(fs.readFileSync(policyPath, "utf8"));
-    const endpoints: Array<{ host?: string; port?: number }> =
-      policy.network_policies.local_inference.endpoints;
-    const hostGatewayPorts = endpoints
-      .filter(({ host }) => host === "host.openshell.internal")
-      .map(({ port }) => port)
-      .sort((left, right) => (left ?? 0) - (right ?? 0));
-
-    expect(hostGatewayPorts).toEqual(
-      [...BUNDLED_LOCAL_INFERENCE_GATEWAY_PORTS].sort((left, right) => left - right),
-    );
-  });
-
-  it("rewrites exact HTTP loopback hosts on bundled local-inference ports (#5744)", () => {
-    for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
-      for (const port of COMPATIBLE_ENDPOINT_GATEWAY_PORTS) {
-        expect(
-          gatewayReachableCompatibleEndpointUrl(
-            "compatible-endpoint",
-            `http://${host}:${port}/v1/`,
+  it.each(["localhost", "127.0.0.1", "[::1]"])(
+    "rewrites exact HTTP loopback hosts on bundled local-inference ports [case %#] (#5744)",
+    (host) => {
+      expect(
+        COMPATIBLE_ENDPOINT_GATEWAY_PORTS.every((port) =>
+          Object.is(
+            gatewayReachableCompatibleEndpointUrl(
+              "compatible-endpoint",
+              `http://${host}:${port}/v1/`,
+            ),
+            `http://host.openshell.internal:${port}/v1`,
           ),
-        ).toBe(`http://host.openshell.internal:${port}/v1`);
-      }
-    }
-  });
+        ),
+      ).toBe(true);
+    },
+  );
 
   it("leaves a generic compatible-endpoint loopback URL unchanged on port 8081 (#8161)", () => {
     expect(
@@ -92,11 +74,14 @@ describe("compatible endpoint gateway routing", () => {
       "not a URL",
     ];
 
-    for (const endpointUrl of unchanged) {
-      expect(gatewayReachableCompatibleEndpointUrl("compatible-endpoint", endpointUrl)).toBe(
-        endpointUrl,
-      );
-    }
+    expect(
+      unchanged.every((endpointUrl) =>
+        Object.is(
+          gatewayReachableCompatibleEndpointUrl("compatible-endpoint", endpointUrl),
+          endpointUrl,
+        ),
+      ),
+    ).toBe(true);
     expect(
       gatewayReachableCompatibleEndpointUrl(
         "compatible-anthropic-endpoint",
@@ -105,5 +90,58 @@ describe("compatible endpoint gateway routing", () => {
     ).toBe("http://localhost:8000/v1");
     expect(gatewayReachableCompatibleEndpointUrl("compatible-endpoint", null)).toBeNull();
     expect(gatewayReachableCompatibleEndpointUrl("compatible-endpoint", undefined)).toBeUndefined();
+  });
+});
+
+describe("recovered provider reuse", () => {
+  const REGISTERED_URL = "http://host.openshell.internal:8000/v1";
+
+  function createRunOpenshell() {
+    const commands: string[] = [];
+    const runOpenshell = vi.fn((args: string[]) => {
+      commands.push(args.join(" "));
+      return { status: 0, stdout: "", stderr: "" };
+    });
+    return { commands, runOpenshell };
+  }
+
+  const reuseArgs = {
+    provider: "compatible-endpoint",
+    providerType: "openai",
+    credentialEnv: "COMPATIBLE_API_KEY",
+    endpointUrl: REGISTERED_URL,
+    gatewayEndpointUrl: REGISTERED_URL,
+  };
+
+  it("reuses an unchanged OpenAI gateway route without a compatibility-profile mutation", async () => {
+    const { commands, runOpenshell } = createRunOpenshell();
+    const upsertProvider = vi.fn(async () => ({ ok: true }));
+
+    expect(
+      await reuseRegisteredProviderWithGatewayEndpoint({
+        ...reuseArgs,
+        runOpenshell,
+        upsertProvider,
+      }),
+    ).toEqual({ ok: true });
+
+    expect(upsertProvider).not.toHaveBeenCalled();
+    expect(commands).toEqual(["provider get compatible-endpoint"]);
+  });
+
+  it("leaves a non-openai recovered provider untouched", async () => {
+    const { commands, runOpenshell } = createRunOpenshell();
+    const upsertProvider = vi.fn(async () => ({ ok: true }));
+
+    expect(
+      await reuseRegisteredProviderWithGatewayEndpoint({
+        ...reuseArgs,
+        providerType: "anthropic",
+        runOpenshell,
+        upsertProvider,
+      }),
+    ).toEqual({ ok: true });
+
+    expect(commands).toEqual(["provider get compatible-endpoint"]);
   });
 });

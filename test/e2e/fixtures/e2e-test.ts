@@ -23,6 +23,7 @@ import {
 import { DockerPrerequisite, DockerProbe } from "./docker-probe.ts";
 import { createE2EInferenceAdapter, type E2EInferenceAdapter } from "./inference-adapter.ts";
 import {
+  ConfigExportValidationPhaseFixture,
   EnvironmentPhaseFixture,
   LifecyclePhaseFixture,
   OnboardingPhaseFixture,
@@ -36,11 +37,14 @@ import {
   type TestProgress,
   type TestProgressOptions,
 } from "./progress.ts";
+import { RuntimeProviderPrerequisite } from "./runtime-provider.ts";
 import { SecretStore } from "./secrets.ts";
 import { ShellProbe } from "./shell-probe.ts";
 
-declare module "@vitest/runner" {
+declare module "vitest" {
   interface TaskMeta {
+    e2eArtifactRootId?: string;
+    e2eCleanupTimeoutMs?: number;
     e2ePhases?: readonly string[];
   }
 }
@@ -50,6 +54,7 @@ export interface E2ETargetFixtures {
   cleanup: CleanupRegistry;
   secrets: SecretStore;
   docker: DockerPrerequisite;
+  runtimeProvider: RuntimeProviderPrerequisite;
   shellProbe: ShellProbe;
   host: HostCliClient;
   gateway: GatewayClient;
@@ -62,6 +67,7 @@ export interface E2ETargetFixtures {
   lifecycle: LifecyclePhaseFixture;
   runtime: RuntimePhaseFixture;
   stateValidation: StateValidationPhaseFixture;
+  configExportValidation: ConfigExportValidationPhaseFixture;
   progress: TestProgress;
 }
 
@@ -73,9 +79,6 @@ export const E2E_TEARDOWN_PHASE = "release registered E2E resources";
 
 export function runnerComparisonSampleIntervalMs(targetId: string | null): number {
   switch (targetId) {
-    case "rebuild-hermes":
-    case "rebuild-hermes-stale-base":
-      return 15_000;
     default:
       return 60_000;
   }
@@ -140,7 +143,11 @@ export const test = base.extend<E2ETargetFixtures>({
     await use(new SecretStore(process.env, skip));
   },
   artifacts: async ({ task, secrets }, use) => {
-    const artifacts = createArtifactSink(task.name, process.cwd(), secrets.redactionValues());
+    const artifacts = createArtifactSink(
+      task.meta.e2eArtifactRootId ?? task.name,
+      process.cwd(),
+      secrets.redactionValues(),
+    );
     await artifacts.ensureRoot();
     try {
       await use(artifacts);
@@ -227,9 +234,10 @@ export const test = base.extend<E2ETargetFixtures>({
     );
     await use(new DockerPrerequisite(probe, skip));
   },
-  cleanup: async ({ artifacts, progress, secrets, signal }, use) => {
+  cleanup: async ({ artifacts, progress, secrets, signal, task }, use) => {
     const cleanup = new CleanupRegistry((text) => secrets.redact(text), progress, {
       testSignal: signal,
+      timeoutMs: task.meta.e2eCleanupTimeoutMs,
     });
     try {
       await use(cleanup);
@@ -253,14 +261,17 @@ export const test = base.extend<E2ETargetFixtures>({
   host: async ({ shellProbe }, use) => {
     await use(new HostCliClient(shellProbe));
   },
+  runtimeProvider: async ({ host, skip }, use) => {
+    await use(new RuntimeProviderPrerequisite(host, skip));
+  },
   sandbox: async ({ shellProbe }, use) => {
     await use(new SandboxClient(shellProbe));
   },
-  gateway: async ({ host, sandbox }, use) => {
+  gateway: async ({ host, runtimeProvider, sandbox }, use) => {
     // GatewayClient depends on `sandbox` for in-sandbox probes
     // (guard-chain inspection, log tailing, gateway-PID polling).
     // The fixture chain is sandbox → gateway so the dependency stays acyclic.
-    await use(new GatewayClient(host, sandbox));
+    await use(new GatewayClient(host, sandbox, runtimeProvider));
   },
   provider: async ({ shellProbe }, use) => {
     await use(new ProviderClient(shellProbe));
@@ -276,20 +287,23 @@ export const test = base.extend<E2ETargetFixtures>({
   state: async ({}, use) => {
     await use(new StateClient());
   },
-  environment: async ({ artifacts, host }, use) => {
-    await use(new EnvironmentPhaseFixture(host, artifacts));
+  environment: async ({ artifacts, host, runtimeProvider }, use) => {
+    await use(new EnvironmentPhaseFixture(host, artifacts, runtimeProvider));
   },
   onboard: async ({ artifacts, cleanup, host, secrets }, use) => {
     await use(new OnboardingPhaseFixture(host, secrets, cleanup, artifacts));
   },
-  lifecycle: async ({ cleanup, gateway, host, sandbox }, use) => {
-    await use(new LifecyclePhaseFixture(host, sandbox, cleanup, gateway));
+  lifecycle: async ({ cleanup, gateway, host, runtimeProvider, sandbox }, use) => {
+    await use(new LifecyclePhaseFixture(host, sandbox, cleanup, gateway, runtimeProvider));
   },
   runtime: async ({ provider, sandbox }, use) => {
     await use(new RuntimePhaseFixture(sandbox, provider));
   },
   stateValidation: async ({ artifacts, host, gateway, sandbox }, use) => {
     await use(new StateValidationPhaseFixture(host, gateway, sandbox, {}, artifacts));
+  },
+  configExportValidation: async ({ artifacts, cleanup, host, secrets }, use) => {
+    await use(new ConfigExportValidationPhaseFixture(host, secrets, cleanup, artifacts));
   },
 });
 

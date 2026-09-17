@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import {
-  getSandboxInferenceConfig,
+  buildGatewayInferenceGetArgs,
   parseGatewayInference,
-  resolveAgentInferenceApi,
-} from "../inference/config";
+} from "../inference/gateway/route-contract";
+export { resolveManagedStartupInferenceRoute } from "../inference/gateway/route-contract";
 import {
   type CurrentGatewayRouteCompatibilityCheck,
   type CurrentGatewayRouteDiscoveryPreflight,
@@ -16,19 +16,8 @@ import { listSandboxes } from "../state/registry";
 
 type RunCaptureOpenshell = (args: string[], options?: { ignoreError?: boolean }) => string | null;
 
-/** Resolve the exact portable inference route used by managed clone preparation. */
-export function resolveManagedStartupInferenceRoute(
-  agentName: string,
-  provider: string,
-  model: string,
-  preferredInferenceApi: string | null,
-) {
-  const api =
-    agentName === "langchain-deepagents-code"
-      ? "openai-completions"
-      : resolveAgentInferenceApi(agentName, provider, preferredInferenceApi);
-  return getSandboxInferenceConfig(model, provider, api);
-}
+/** A gateway that cannot answer is distinct from one that answers with another route. */
+export type InferenceRouteState = "matched" | "mismatched" | "unanswered";
 
 export function createInferenceRouteHelpers(
   runCaptureOpenshell: RunCaptureOpenshell,
@@ -36,7 +25,7 @@ export function createInferenceRouteHelpers(
 ) {
   function verifyInferenceRoute(gatewayName: string, provider: string, model: string): void {
     const live = parseGatewayInference(
-      runCaptureOpenshell(["inference", "get", "-g", gatewayName], { ignoreError: true }),
+      runCaptureOpenshell(buildGatewayInferenceGetArgs(gatewayName), { ignoreError: true }),
     );
     if (!live) {
       console.error("  OpenShell inference route was not configured.");
@@ -50,11 +39,20 @@ export function createInferenceRouteHelpers(
     }
   }
 
-  function isInferenceRouteReady(gatewayName: string, provider: string, model: string): boolean {
+  function readInferenceRouteState(
+    gatewayName: string,
+    provider: string,
+    model: string,
+  ): InferenceRouteState {
     const live = parseGatewayInference(
-      runCaptureOpenshell(["inference", "get", "-g", gatewayName], { ignoreError: true }),
+      runCaptureOpenshell(buildGatewayInferenceGetArgs(gatewayName), { ignoreError: true }),
     );
-    return Boolean(live && live.provider === provider && live.model === model);
+    if (!live) return "unanswered";
+    return live.provider === provider && live.model === model ? "matched" : "mismatched";
+  }
+
+  function isInferenceRouteReady(gatewayName: string, provider: string, model: string): boolean {
+    return readInferenceRouteState(gatewayName, provider, model) === "matched";
   }
 
   const checkGatewayRouteCompatibility: CurrentGatewayRouteCompatibilityCheck = (request) =>
@@ -72,6 +70,7 @@ export function createInferenceRouteHelpers(
   return {
     verifyInferenceRoute,
     isInferenceRouteReady,
+    readInferenceRouteState,
     checkGatewayRouteCompatibility,
     preflightGatewayRouteDiscovery,
   };

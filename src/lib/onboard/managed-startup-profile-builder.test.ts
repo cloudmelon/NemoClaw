@@ -91,6 +91,7 @@ function hermesInput(
       agent: "hermes",
       mode: "disabled",
       url: "http://127.0.0.1:18789",
+      browserUrl: "http://127.0.0.1:18789",
       publicPort: null,
       internalPort: null,
       tuiEnabled: false,
@@ -105,6 +106,20 @@ function hermesInput(
     corporateCa: null,
     ...overrides,
   };
+}
+
+function hermesInputWithBrowserUrl(browserUrl: string): ManagedStartupProfileBuilderInput {
+  return hermesInput({
+    dashboard: {
+      agent: "hermes",
+      mode: "disabled",
+      url: "http://127.0.0.1:18789",
+      browserUrl,
+      publicPort: null,
+      internalPort: null,
+      tuiEnabled: false,
+    },
+  });
 }
 
 function dcodeInput(
@@ -138,7 +153,96 @@ function dcodeInput(
   };
 }
 
+function piInput(
+  overrides: Partial<ManagedStartupProfileBuilderInput> = {},
+): ManagedStartupProfileBuilderInput {
+  return {
+    agent: "pi",
+    inference: {
+      routeProvider: "inference",
+      upstreamProvider: "nvidia",
+      model: "nvidia/nemotron-3-super-120b-a12b",
+      routedBaseUrl: "https://inference.local/v1",
+      upstreamEndpointUrl: null,
+      api: "openai-completions",
+      primaryModelRef: null,
+      compatibility: null,
+    },
+    dashboard: { agent: "pi", mode: "disabled" },
+    webSearch: null,
+    toolDisclosure: "progressive",
+    hermesToolGateways: [],
+    messagingPlan: null,
+    dcodeAutoApprovalMode: null,
+    observabilityEnabled: null,
+    environment: {},
+    corporateCa: null,
+    ...overrides,
+  };
+}
+
 describe("buildManagedStartupProfile", () => {
+  it.each([dcodeInput(), piInput()])("rejects absent inference for $agent", (input) => {
+    expect(() => buildManagedStartupProfile({ ...input, inference: null })).toThrow(
+      "requires inference configuration",
+    );
+  });
+  it.each([openClawInput(), hermesInput()])(
+    "rejects ambient model input when $agent inference is absent",
+    (input) => {
+      expect(() =>
+        buildManagedStartupProfile({
+          ...input,
+          inference: null,
+          environment: { NEMOCLAW_MODEL: "fixture/model" },
+        }),
+      ).toThrow("NEMOCLAW_MODEL");
+    },
+  );
+
+  it("builds Pi model tuning from the environment and leaves the effort scale unset (#7930)", () => {
+    const built = buildManagedStartupProfile(
+      piInput({
+        environment: {
+          NEMOCLAW_MODEL: "nvidia/nemotron-3-super-120b-a12b",
+          NEMOCLAW_INFERENCE_PROVIDER_ID: "inference",
+          NEMOCLAW_UPSTREAM_PROVIDER: "nvidia",
+          NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
+          NEMOCLAW_INFERENCE_API: "openai-completions",
+          NEMOCLAW_TOOL_DISCLOSURE: "progressive",
+          NEMOCLAW_CONTEXT_WINDOW: "262144",
+          NEMOCLAW_MAX_TOKENS: "32000",
+          NEMOCLAW_REASONING: "true",
+          NEMOCLAW_PROXY_HOST: "10.200.0.1",
+          NEMOCLAW_PROXY_PORT: "3128",
+        },
+      }),
+    );
+
+    expect(built.profile.tuning).toEqual({
+      contextWindow: 262_144,
+      maxTokens: 32_000,
+      reasoning: true,
+      reasoningEffort: null,
+    });
+    expect(decodeManagedStartupProfile(built.encodedProfile)).toEqual(built.profile);
+  });
+
+  it("leaves every Pi model tuning field unset when the environment supplies none (#7930)", () => {
+    expect(buildManagedStartupProfile(piInput()).profile.tuning).toEqual({
+      contextWindow: null,
+      maxTokens: null,
+      reasoning: null,
+      reasoningEffort: null,
+    });
+  });
+
+  it("refuses a Pi reasoning flag that is neither true nor false (#7930)", () => {
+    expect(() =>
+      buildManagedStartupProfile(piInput({ environment: { NEMOCLAW_REASONING: "yes" } })),
+    ).toThrow(/NEMOCLAW_REASONING must be "true" or "false"/);
+  });
+
   it("parses and hydrates messaging before exposing the validated transport handoff", () => {
     const compactPlan = {
       schemaVersion: 1,
@@ -170,6 +274,91 @@ describe("buildManagedStartupProfile", () => {
       stateUpdates: [],
       healthChecks: [],
     });
+  });
+
+  it("omits a derived package pin from the managed startup profile (#9399)", () => {
+    const built = buildManagedStartupProfile(
+      openClawInput({
+        messagingPlan: {
+          ...messagingPlan("openclaw"),
+          channels: [
+            {
+              channelId: "discord",
+              displayName: "Discord",
+              authMode: "token-paste",
+              active: true,
+              selected: true,
+              configured: true,
+              disabled: false,
+              inputs: [],
+              hooks: [],
+            },
+          ],
+          buildSteps: [
+            {
+              channelId: "discord",
+              kind: "package-install",
+              outputId: "openclawPluginPackage",
+              required: true,
+              value: {
+                manager: "openclaw-plugin",
+                spec: "npm:@openclaw/discord@2026.7.1",
+                pin: true,
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    const plan = built.profile.messaging.plan as {
+      buildSteps: Array<{ value?: Record<string, unknown> }>;
+    };
+    expect(plan.buildSteps[0]?.value).toEqual({
+      manager: "openclaw-plugin",
+      spec: "npm:@openclaw/discord@2026.7.1",
+    });
+    expect(JSON.stringify(decodeManagedStartupProfile(built.encodedProfile))).not.toContain(
+      '"pin"',
+    );
+  });
+
+  it("does not project a malformed package pin past profile validation (#9399)", () => {
+    expect(() =>
+      buildManagedStartupProfile(
+        openClawInput({
+          messagingPlan: {
+            ...messagingPlan("openclaw"),
+            channels: [
+              {
+                channelId: "discord",
+                displayName: "Discord",
+                authMode: "token-paste",
+                active: true,
+                selected: true,
+                configured: true,
+                disabled: false,
+                inputs: [],
+                hooks: [],
+              },
+            ],
+            buildSteps: [
+              {
+                channelId: "discord",
+                kind: "package-install",
+                outputId: "openclawPluginPackage",
+                required: true,
+                value: {
+                  manager: "openclaw-plugin",
+                  spec: "npm:@openclaw/discord@2026.7.1",
+                  pin: "true",
+                },
+              },
+            ],
+          },
+        }),
+      ),
+    ).toThrow(/buildSteps\[0\]\.value\.pin has a credential-shaped field name/u);
   });
 
   it.each([
@@ -311,6 +500,7 @@ describe("buildManagedStartupProfile", () => {
           agent: "hermes",
           mode: "loopback-forwarded",
           url: "http://127.0.0.1:19189",
+          browserUrl: "https://hermes.example.test:19189",
           publicPort: 19_189,
           internalPort: 29_189,
           tuiEnabled: true,
@@ -332,7 +522,7 @@ describe("buildManagedStartupProfile", () => {
           NEMOCLAW_WEB_SEARCH_ENABLED: "1",
           NEMOCLAW_WEB_SEARCH_PROVIDER: "tavily",
           NEMOCLAW_MESSAGING_PLAN_B64: encodeJson(plan),
-          CHAT_UI_URL: "http://127.0.0.1:19189",
+          CHAT_UI_URL: "https://hermes.example.test:19189",
           NEMOCLAW_DASHBOARD_PORT: "19189",
           NEMOCLAW_HERMES_DASHBOARD: "true",
           NEMOCLAW_HERMES_DASHBOARD_PORT: "19189",
@@ -362,6 +552,7 @@ describe("buildManagedStartupProfile", () => {
       agent: "hermes",
       mode: "loopback-forwarded",
       url: "http://127.0.0.1:19189",
+      browserUrl: "https://hermes.example.test:19189",
       publicPort: 19_189,
       internalPort: 29_189,
       tuiEnabled: true,
@@ -378,6 +569,26 @@ describe("buildManagedStartupProfile", () => {
     });
     expect(decodeManagedStartupProfile(built.encodedProfile)).toEqual(built.profile);
   });
+
+  it("rejects an external HTTP Hermes browser URL before persisting the profile", () => {
+    expect(() =>
+      buildManagedStartupProfile(hermesInputWithBrowserUrl("http://hermes.example.test:18789")),
+    ).toThrow(/must use HTTPS unless it is loopback/);
+  });
+
+  it.each([
+    ["https://hermes.example.test:18789", "https://hermes.example.test:18789"],
+    ["https://secure-link.example/", "https://secure-link.example"],
+    ["http://127.0.0.1:18789", "http://127.0.0.1:18789"],
+    ["http://127.0.0.2:18789", "http://127.0.0.2:18789"],
+  ])(
+    "accepts the Hermes browser URL %s at the durable profile boundary",
+    (browserUrl, expectedBrowserUrl) => {
+      expect(
+        buildManagedStartupProfile(hermesInputWithBrowserUrl(browserUrl)).profile.dashboard,
+      ).toMatchObject({ agent: "hermes", browserUrl: expectedBrowserUrl });
+    },
+  );
 
   it("builds DCode with its direct upstream, approval, and observability contract", () => {
     const built = buildManagedStartupProfile(
@@ -524,14 +735,14 @@ describe("buildManagedStartupProfile", () => {
     [
       "Hermes inference compatibility",
       hermesInput({
-        inference: { ...hermesInput().inference, compatibility: { strict: true } },
+        inference: { ...hermesInput().inference!, compatibility: { strict: true } },
       }),
       /does not support inference compatibility/,
     ],
     [
       "DCode inference compatibility",
       dcodeInput({
-        inference: { ...dcodeInput().inference, compatibility: { strict: true } },
+        inference: { ...dcodeInput().inference!, compatibility: { strict: true } },
       }),
       /does not support inference compatibility/,
     ],
@@ -607,7 +818,7 @@ describe("buildManagedStartupProfile", () => {
       "secret-shaped model",
       openClawInput({
         inference: {
-          ...openClawInput().inference,
+          ...openClawInput().inference!,
           model: "sk-proj-secret-material-1234567890",
         },
       }),
@@ -631,17 +842,20 @@ describe("buildManagedStartupProfile", () => {
       "agentConfig.extraAgents.agents[0].api_key",
       "sk-secret-material-1234567890",
     ],
-  ] as const)("rejects %s with a precise non-secret-bearing domain error", (_label, input, field, secret) => {
-    let thrown: unknown;
-    try {
-      buildManagedStartupProfile(input);
-    } catch (error) {
-      thrown = error;
-    }
-    expect(thrown).toBeInstanceOf(ManagedStartupProfileBuilderError);
-    expect(thrown).toHaveProperty("message", expect.stringContaining(field));
-    expect(thrown).toHaveProperty("message", expect.not.stringContaining(secret));
-  });
+  ] as const)(
+    "rejects %s with a precise non-secret-bearing domain error",
+    (_label, input, field, secret) => {
+      let thrown: unknown;
+      try {
+        buildManagedStartupProfile(input);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(ManagedStartupProfileBuilderError);
+      expect(thrown).toHaveProperty("message", expect.stringContaining(field));
+      expect(thrown).toHaveProperty("message", expect.not.stringContaining(secret));
+    },
+  );
 
   it.each([
     ["null", "[null]", /NEMOCLAW_EXTRA_AGENTS_JSON\[0\] must be an object/u],
@@ -662,6 +876,56 @@ describe("buildManagedStartupProfile", () => {
       ),
     ).toThrow(message);
   });
+
+  it.each([
+    [
+      "secondary-agent",
+      "raw JSON",
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON: JSON.stringify([
+          { id: "reviewer", subagents: { maxSpawnDepth: 2 } },
+        ]),
+      },
+      /NEMOCLAW_EXTRA_AGENTS_JSON\.agents\[0\]\.subagents\.maxSpawnDepth is not accepted per-agent.*defaults\.subagents\.maxSpawnDepth/,
+    ],
+    [
+      "secondary-agent",
+      "base64 JSON",
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: encodeJson({
+          agents: [{ id: "reviewer", subagents: { maxSpawnDepth: 2 } }],
+        }),
+      },
+      /NEMOCLAW_EXTRA_AGENTS_JSON\.agents\[0\]\.subagents\.maxSpawnDepth is not accepted per-agent.*defaults\.subagents\.maxSpawnDepth/,
+    ],
+    [
+      "main-agent",
+      "raw JSON",
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON: JSON.stringify({
+          agents: [],
+          main: { subagents: { maxSpawnDepth: 2 } },
+        }),
+      },
+      /NEMOCLAW_EXTRA_AGENTS_JSON\.main\.subagents\.maxSpawnDepth is not accepted per-agent.*defaults\.subagents\.maxSpawnDepth/,
+    ],
+    [
+      "main-agent",
+      "base64 JSON",
+      {
+        NEMOCLAW_EXTRA_AGENTS_JSON_B64: encodeJson({
+          agents: [],
+          main: { subagents: { maxSpawnDepth: 2 } },
+        }),
+      },
+      /NEMOCLAW_EXTRA_AGENTS_JSON\.main\.subagents\.maxSpawnDepth is not accepted per-agent.*defaults\.subagents\.maxSpawnDepth/,
+    ],
+  ])(
+    "rejects %s maxSpawnDepth from %s profile input",
+    (_agent, _encoding, environment, message) => {
+      expect(() => buildManagedStartupProfile(openClawInput({ environment }))).toThrow(message);
+    },
+  );
 
   it("rejects malformed or non-CA certificate material", () => {
     expect(() =>

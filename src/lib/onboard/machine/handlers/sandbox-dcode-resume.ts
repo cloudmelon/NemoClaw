@@ -17,7 +17,8 @@ export interface Deps {
     provider: string,
     model: string,
     preferredInferenceApi: string | null,
-  ): { changed: boolean; unknown: boolean };
+    endpointUrl: string | null,
+  ): Promise<{ changed: boolean; unknown: boolean }>;
   error(message?: string): void;
   exitProcess(code: number): never;
 }
@@ -32,6 +33,7 @@ interface SelectionOptions<Agent> {
 interface ResumeOptions<Agent> extends SelectionOptions<Agent> {
   readonly resume: boolean;
   readonly preferredInferenceApi: string | null;
+  readonly endpointUrl: string | null;
   readonly requestedDcodeAutoApprovalMode?: DcodeAutoApprovalMode | null;
 }
 
@@ -80,14 +82,14 @@ export function preserveManagedDcodeRegistryEntry<Agent>(
   return { ...decision, removeRegistryEntry: false };
 }
 
-export function resolveSignals<Agent>(
+export async function resolveSignals<Agent>(
   options: ResumeOptions<Agent>,
   state: ResumeState,
   sandboxReuseState: string,
   registryEntry: SandboxEntry | null,
   dcodeAutoApprovalMode: DcodeAutoApprovalMode,
   deps: Deps,
-): { inferenceSelectionChanged: boolean; dcodeAutoApprovalChanged: boolean } {
+): Promise<{ inferenceSelectionChanged: boolean; dcodeAutoApprovalChanged: boolean }> {
   const sandboxName = state.sandboxName;
   const dcodeAutoApprovalChanged = hasDcodeAutoApprovalDrift({
     liveExists: sandboxReuseState === "ready",
@@ -111,11 +113,12 @@ export function resolveSignals<Agent>(
     );
     return deps.exitProcess(1);
   }
-  const drift = deps.getDcodeSelectionDrift(
+  const drift = await deps.getDcodeSelectionDrift(
     sandboxName,
     options.provider,
     options.model,
     options.preferredInferenceApi,
+    options.endpointUrl,
   );
   return {
     inferenceSelectionChanged: Boolean(drift.changed || drift.unknown),

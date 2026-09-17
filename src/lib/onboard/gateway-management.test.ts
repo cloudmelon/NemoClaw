@@ -1,13 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   GATEWAY_MANAGEMENT_ENV_VAR,
   loadGatewayManagementDeclaration,
   parseGatewayManagementDeclaration,
 } from "./gateway-management";
+
+const realLstat = fs.lstatSync;
 
 function externalDeclaration(overrides: Record<string, unknown> = {}) {
   return {
@@ -160,19 +165,23 @@ describe("gateway management declaration", () => {
     ["a cloud metadata address", "http://169.254.169.254:8080"],
     ["a link-local address", "http://169.254.1.1:8080"],
     ["a non-loopback private address", "http://10.0.0.5:8080"],
-  ])("rejects an endpoint pointing at %s, which onboarding would otherwise request (#6576)", (_label, endpoint) => {
-    const result = parseGatewayManagementDeclaration(externalDeclaration({ endpoint }));
+  ])(
+    "rejects an endpoint pointing at %s, which onboarding would otherwise request (#6576)",
+    (_label, endpoint) => {
+      const result = parseGatewayManagementDeclaration(externalDeclaration({ endpoint }));
 
-    expect(result.ok === false && result.reason).toMatch(/not a supported local gateway origin/);
-  });
+      expect(result.ok === false && result.reason).toMatch(/not a supported local gateway origin/);
+    },
+  );
 
-  it("accepts only numeric loopback endpoint hosts (#6576)", () => {
-    for (const endpoint of ["http://127.0.0.1:8080", "http://[::1]:8080"]) {
+  it.each(["http://127.0.0.1:8080", "http://[::1]:8080"])(
+    "accepts only numeric loopback endpoint hosts [case %#] (#6576)",
+    (endpoint) => {
       expect(parseGatewayManagementDeclaration(externalDeclaration({ endpoint }))).toMatchObject({
         ok: true,
       });
-    }
-  });
+    },
+  );
 
   it("rejects a capability this build does not provide (#6576)", () => {
     const result = parseGatewayManagementDeclaration(
@@ -182,18 +191,24 @@ describe("gateway management declaration", () => {
     expect(result.ok === false && result.reason).toMatch(/unsupported capability/);
   });
 
-  it("does not echo malformed declaration values in errors (#6576)", () => {
+  it.each([
+    { scenario: "version" },
+    { scenario: "mode" },
+    { scenario: "endpoint" },
+    { scenario: "required capabilities" },
+  ])("does not echo malformed declaration values in errors [$scenario] (#6576)", ({ scenario }) => {
     const secret = "sk-live-not-a-real-token";
-    for (const declaration of [
-      externalDeclaration({ version: secret }),
-      externalDeclaration({ mode: secret }),
-      externalDeclaration({ endpoint: secret }),
-      externalDeclaration({ requiredCapabilities: [secret] }),
-    ]) {
-      const result = parseGatewayManagementDeclaration(declaration);
-      expect(result).toMatchObject({ ok: false });
-      expect(result.ok === false && result.reason).not.toContain(secret);
-    }
+    const declaration = (
+      {
+        version: externalDeclaration({ version: secret }),
+        mode: externalDeclaration({ mode: secret }),
+        endpoint: externalDeclaration({ endpoint: secret }),
+        "required capabilities": externalDeclaration({ requiredCapabilities: [secret] }),
+      } as const
+    )[scenario]!;
+    const result = parseGatewayManagementDeclaration(declaration);
+    expect(result).toMatchObject({ ok: false });
+    expect(result.ok === false && result.reason).not.toContain(secret);
   });
 
   it("rejects a relative state directory (#6576)", () => {
@@ -206,6 +221,12 @@ describe("gateway management declaration", () => {
 });
 
 describe("gateway management declaration loading", () => {
+  beforeEach(() => {
+    vi.spyOn(fs, "lstatSync").mockImplementation(() => {
+      throw Object.assign(new Error("no host declaration"), { code: "ENOENT" });
+    });
+  });
+
   it("returns no declaration when nothing is configured (#6576)", () => {
     expect(loadGatewayManagementDeclaration({ env: {} })).toEqual({
       ok: true,
@@ -222,7 +243,62 @@ describe("gateway management declaration loading", () => {
 
     expect(result).toMatchObject({ ok: true, source: "file" });
     expect(result.ok === true && result.declaration?.mode).toBe("externally-supervised");
+    expect(fs.lstatSync).not.toHaveBeenCalled();
   });
+
+  it.each([
+    {
+      kind: "file",
+      create: (filePath: string) =>
+        fs.writeFileSync(filePath, JSON.stringify(externalDeclaration())),
+    },
+    {
+      kind: "dangling symlink",
+      create: (filePath: string) => fs.symlinkSync(`${filePath}.missing`, filePath),
+    },
+    { kind: "directory", create: (filePath: string) => fs.mkdirSync(filePath) },
+  ])(
+    "blocks implicit managed behavior when the host declaration path contains a $kind (#11347)",
+    ({ create }) => {
+      const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gateway-declaration-"));
+      const declarationPath = path.join(directory, "gateway-management.json");
+      try {
+        create(declarationPath);
+        vi.mocked(fs.lstatSync).mockImplementation((filePath, options) => {
+          expect(filePath).toBe("/etc/nemoclaw/gateway-management.json");
+          return realLstat(declarationPath, options);
+        });
+        const readFile = vi.fn();
+
+        const result = loadGatewayManagementDeclaration({ env: {}, readFile });
+
+        expect(result).toMatchObject({ ok: false });
+        expect(result.ok === false && result.reason).toContain(
+          "NEMOCLAW_GATEWAY_MANAGEMENT=/etc/nemoclaw/gateway-management.json",
+        );
+        expect(result.ok === false && result.reason).toContain("platform owner's procedure");
+        expect(readFile).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(fs.lstatSync).mockRestore();
+        fs.rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["EACCES", "EIO", "ENOTDIR", "ELOOP"])(
+    "refuses implicit self-management when the host declaration check fails with %s (#11347)",
+    (code) => {
+      vi.mocked(fs.lstatSync).mockImplementation(() => {
+        throw Object.assign(new Error("private filesystem diagnostic"), { code });
+      });
+
+      const result = loadGatewayManagementDeclaration({ env: {} });
+
+      expect(result).toMatchObject({ ok: false });
+      expect(result.ok === false && result.reason).toContain("could not be inspected");
+      expect(result.ok === false && result.reason).not.toContain("private filesystem diagnostic");
+    },
+  );
 
   it("fails closed when the configured file is unreadable (#6576)", () => {
     const result = loadGatewayManagementDeclaration({
@@ -256,12 +332,14 @@ describe("gateway management declaration loading", () => {
     });
 
     expect(result).toMatchObject({ ok: true, source: "profile" });
+    expect(fs.lstatSync).not.toHaveBeenCalled();
   });
 });
 
 describe("supported supervisor kinds (#6576)", () => {
-  it("accepts the systemd kinds it can bind a listener to", () => {
-    for (const kind of ["systemd-system", "systemd-user"]) {
+  it.each(["systemd-system", "systemd-user"])(
+    "accepts the systemd kinds it can bind a listener to [case %#]",
+    (kind) => {
       expect(
         parseGatewayManagementDeclaration(
           externalDeclaration({
@@ -273,8 +351,8 @@ describe("supported supervisor kinds (#6576)", () => {
           }),
         ),
       ).toMatchObject({ ok: true });
-    }
-  });
+    },
+  );
 
   it("rejects the opaque 'external' kind, which could never attach", () => {
     const result = parseGatewayManagementDeclaration(

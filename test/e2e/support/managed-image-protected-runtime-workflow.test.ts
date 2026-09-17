@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, test } from "vitest";
 import YAML from "yaml";
 
 import { validateManagedImageMultiarchWorkflow } from "../../../tools/e2e/managed-image-multiarch-workflow-boundary.mts";
@@ -31,26 +31,164 @@ function multiarchJob(value: WorkflowRecord): Record<string, unknown> {
 }
 
 function namedStep(value: WorkflowRecord, name: string): Record<string, unknown> {
-  const step = (runtimeJob(value).steps as Array<Record<string, unknown>>).find(
+  return namedJobStep(value, "managed-image-protected-runtime", name);
+}
+
+function namedJobStep(value: WorkflowRecord, jobId: string, name: string): Record<string, unknown> {
+  const job = (value.jobs as Record<string, Record<string, unknown>>)[jobId];
+  const step = (job.steps as Array<Record<string, unknown>>).find((step) => step.name === name);
+  expect(step, `workflow step '${name}' is missing`).toBeDefined();
+  return step as Record<string, unknown>;
+}
+
+function namedMultiarchStep(value: WorkflowRecord, name: string): Record<string, unknown> {
+  const step = (multiarchJob(value).steps as Array<Record<string, unknown>>).find(
     (step) => step.name === name,
   );
   expect(step, `workflow step '${name}' is missing`).toBeDefined();
   return step as Record<string, unknown>;
 }
 
-describe("protected managed-image runtime workflow boundary", () => {
-  it("accepts the exact activated trusted runtime lane", () => {
+describe("protected managed-image runtime workflow", () => {
+  it("accepts the checked-in protected runtime job", () => {
     expect(validateManagedImageProtectedRuntimeWorkflow(workflow())).toEqual([]);
   });
 
-  it("accepts the exact hosted-build to protected-runtime cache handoff", () => {
+  it("rejects a runtime job that exceeds the 75 minute budget", () => {
+    const value = workflow();
+    runtimeJob(value)["timeout-minutes"] = 300;
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime must keep the 75 minute timeout",
+    );
+  });
+
+  // source-shape-contract: security -- The isolated registry must be gone before reporter-backed validations can publish passing risk evidence
+  test("cleans the protected registry before passing risk evidence", () => {
+    const steps = multiarchJob(workflow()).steps as Array<Record<string, unknown>>;
+    const names = steps.map((step) => String(step.name));
+    const cleanup = names.indexOf("Remove isolated protected managed-image registry");
+    const cohortCleanup = names.indexOf("Remove protected managed-image cohort resources");
+    const security = names.indexOf("Validate OpenClaw managed-image security boundary");
+    const glibc = names.indexOf("Validate managed-image glibc probe lifecycle");
+    expect(cleanup).toBeLessThan(names.indexOf("Validate protected managed-image evidence"));
+    expect(cleanup).toBeLessThan(security);
+    expect(cleanup).toBeLessThan(glibc);
+    expect(cohortCleanup).toBeGreaterThan(security);
+    expect(cohortCleanup).toBeGreaterThan(glibc);
+    expect(steps[cleanup]).toMatchObject({
+      if: "always()",
+      run: expect.stringMatching(
+        /if docker container inspect[\s\S]*owner=.*docker container inspect/u,
+      ),
+    });
+    expect(steps[security]).toMatchObject({
+      run: expect.stringContaining("env -u DOCKER_CONFIG -u DOCKERHUB_USERNAME -u DOCKERHUB_TOKEN"),
+    });
+    expect(steps[glibc]).toMatchObject({
+      if: "${{ !cancelled() }}",
+      run: expect.stringContaining("env -u DOCKER_CONFIG -u DOCKERHUB_USERNAME -u DOCKERHUB_TOKEN"),
+    });
+    expect(steps[cohortCleanup]).toMatchObject({ if: "always()" });
+  });
+
+  it("accepts the hosted build-cache handoff to the protected runtime job", () => {
     const value = workflow();
 
     expect(validateManagedImageMultiarchWorkflow(value)).toEqual([]);
     expect(validateManagedImageProtectedRuntimeWorkflow(value)).toEqual([]);
   });
 
-  it("binds protected risk evidence to the isolated exact candidate checkout", () => {
+  // source-shape-contract: security -- Both protected jobs must execute the shared Hermes resolver from trusted workflow code
+  it.each([
+    [
+      "managed-image-multiarch-startup",
+      "Resolve reviewed Hermes platform base image",
+      "./.trusted-hermes-resolver/.github/actions/resolve-reviewed-hermes-platform",
+      "agents/hermes/Dockerfile",
+      validateManagedImageMultiarchWorkflow,
+    ],
+    [
+      "managed-image-protected-runtime",
+      "Resolve reviewed Hermes runtime base image",
+      "./.github/actions/resolve-reviewed-hermes-platform",
+      ".candidate-runtime/agents/hermes/Dockerfile",
+      validateManagedImageProtectedRuntimeWorkflow,
+    ],
+  ] as const)(
+    "%s binds Hermes resolution to trusted workflow code",
+    (jobId, stepName, actionPath, dockerfilePath, validate) => {
+      const value = workflow();
+      const step = namedJobStep(value, jobId, stepName);
+      expect(step.uses).toBe(actionPath);
+      expect((step.with as Record<string, unknown>)["dockerfile-path"]).toBe(dockerfilePath);
+      step.uses = "./.github/actions/resolve-hermes-base-image";
+
+      expect(validate(value)).toContain(
+        `${jobId} must use the shared reviewed Hermes platform resolver`,
+      );
+
+      const changedInput = workflow();
+      const changedInputStep = namedJobStep(changedInput, jobId, stepName);
+      (changedInputStep.with as Record<string, unknown>)["dockerfile-path"] = "Dockerfile";
+      expect(validate(changedInput)).toContain(
+        `${jobId} Hermes platform resolver must bind dockerfile-path to ${dockerfilePath}`,
+      );
+    },
+  );
+
+  it("rejects a multiarch resolver from candidate source after registry authentication", () => {
+    const value = workflow();
+    namedJobStep(
+      value,
+      "managed-image-multiarch-startup",
+      "Resolve reviewed Hermes platform base image",
+    ).uses = "./.github/actions/resolve-reviewed-hermes-platform";
+
+    expect(validateManagedImageMultiarchWorkflow(value)).toContain(
+      "managed-image-multiarch-startup must use the shared reviewed Hermes platform resolver",
+    );
+    expect(validateE2eWorkflow(value)).toContain(
+      "managed-image-multiarch-startup step 'Resolve reviewed Hermes platform base image' action must be pinned to a full commit SHA",
+    );
+  });
+
+  it("requires the multiarch resolver checkout from the trusted workflow revision", () => {
+    const value = workflow();
+    const trustedCheckout = namedJobStep(
+      value,
+      "managed-image-multiarch-startup",
+      "Checkout trusted Hermes resolver",
+    );
+    (trustedCheckout.with as Record<string, unknown>).ref =
+      "${{ inputs.checkout_sha || github.sha }}";
+
+    expect(validateManagedImageMultiarchWorkflow(value)).toContain(
+      "managed-image-multiarch-startup trusted Hermes resolver checkout must bind ref to ${{ inputs.workflow_sha || github.workflow_sha }}",
+    );
+  });
+
+  // source-shape-contract: security -- Both protected jobs must reject extra resolver actions before candidate execution
+  it.each([
+    [
+      "managed-image-multiarch-startup",
+      "Resolve reviewed Hermes platform base image",
+      validateManagedImageMultiarchWorkflow,
+    ],
+    [
+      "managed-image-protected-runtime",
+      "Resolve reviewed Hermes runtime base image",
+      validateManagedImageProtectedRuntimeWorkflow,
+    ],
+  ] as const)("%s rejects duplicate Hermes resolver steps", (jobId, stepName, validate) => {
+    const value = workflow();
+    const job = (value.jobs as Record<string, Record<string, unknown>>)[jobId];
+    const step = namedJobStep(value, jobId, stepName);
+    (job.steps as Array<Record<string, unknown>>).push(structuredClone(step));
+
+    expect(validate(value)).toContain(`${jobId} must define exactly one '${stepName}' step`);
+  });
+
+  it("runs protected runtime checks from .candidate-runtime", () => {
     const value = workflow();
     const jobEnv = runtimeJob(value).env as Record<string, unknown>;
     jobEnv.NEMOCLAW_E2E_TESTED_ROOT = "${{ github.workspace }}";
@@ -70,17 +208,29 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("does not record manual PR risk signals on main pushes", () => {
+  it("records protected risk signals on main pushes", () => {
     const value = workflow();
     const jobEnv = multiarchJob(value).env as Record<string, unknown>;
-    jobEnv.NEMOCLAW_E2E_EXPECTED_SHA = "${{ inputs.checkout_sha || github.sha }}";
+    jobEnv.NEMOCLAW_E2E_EXPECTED_SHA = "${{ inputs.checkout_sha }}";
 
     expect(validateManagedImageMultiarchWorkflow(value)).toContain(
-      "managed-image-multiarch-startup env must bind NEMOCLAW_E2E_EXPECTED_SHA to ${{ inputs.checkout_sha }}",
+      "managed-image-multiarch-startup env must bind NEMOCLAW_E2E_EXPECTED_SHA to ${{ inputs.checkout_sha || github.sha }}",
     );
   });
 
-  it("binds protected candidate identity on ordinary main runs", () => {
+  // source-shape-contract: compatibility -- Main-push qualification must create the UUID consumed by reporter-backed risk evidence when workflow_dispatch inputs do not exist.
+  it("binds a correlation identity for main pushes without an input", () => {
+    const step = namedMultiarchStep(workflow(), "Bind protected E2E correlation identity");
+
+    expect(step).toMatchObject({
+      env: { REQUESTED_CORRELATION_ID: "${{ inputs.correlation_id }}" },
+      run: expect.stringMatching(
+        /if \[\[ -z "\$correlation_id" \]\][\s\S]*randomUUID[\s\S]*NEMOCLAW_E2E_CORRELATION_ID/u,
+      ),
+    });
+  });
+
+  it("uses github.sha for main pushes", () => {
     const value = workflow();
     const jobEnv = multiarchJob(value).env as Record<string, unknown>;
     jobEnv.NEMOCLAW_PROTECTED_MANAGED_IMAGE_HEAD_SHA = "${{ inputs.checkout_sha }}";
@@ -90,7 +240,7 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("ships the exact activation contract consumed by the trusted lane (#7744)", () => {
+  it("lists every supported agent and provider in the activation file (#7744)", () => {
     const activation = JSON.parse(
       fs.readFileSync(
         path.resolve(
@@ -103,11 +253,56 @@ describe("protected managed-image runtime workflow boundary", () => {
 
     expect(activation).toEqual({
       agents: ["openclaw", "hermes", "langchain-deepagents-code"],
-      contractVersion: 1,
+      contractVersion: 2,
       jobId: "managed-image-protected-runtime",
       platform: "linux/amd64",
       providers: ["ollama", "nim", "vllm"],
+      runtimeUser: "sandbox",
     });
+  });
+
+  it("rejects runtime contract selection drift", () => {
+    const value = workflow();
+    const activation = namedJobStep(
+      value,
+      "managed-image-protected-runtime",
+      "Validate protected runtime activation contract",
+    );
+    activation.run = String(activation.run).replace(
+      ".contractVersion == 2",
+      ".contractVersion == 3",
+    );
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime step 'Validate protected runtime activation contract' must include .contractVersion == 2",
+    );
+  });
+
+  it("rejects an unbound runtime contract output", () => {
+    const value = workflow();
+    namedJobStep(
+      value,
+      "managed-image-protected-runtime",
+      "Validate protected runtime activation contract",
+    ).id = "changed-runtime-contract";
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime activation step must expose the reviewed runtime contract",
+    );
+  });
+
+  it("rejects a protected build that drops the selected runtime user", () => {
+    const value = workflow();
+    const build = namedJobStep(
+      value,
+      "managed-image-protected-runtime",
+      "Build exact all-agent protected runtime images",
+    );
+    (build.env as Record<string, unknown>).RUNTIME_USER = "root";
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime protected runtime build bases must bind RUNTIME_USER to ${{ steps.runtime-contract.outputs.runtime_user }}",
+    );
   });
 
   it("rejects job-scoped NGC credentials", () => {
@@ -122,7 +317,7 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("rejects checking candidate source out over trusted qualification code", () => {
+  it("does not replace workflow code with the source under test", () => {
     const value = workflow();
     const candidateCheckout = namedStep(value, "Checkout exact protected runtime candidate source");
     (candidateCheckout.with as Record<string, unknown>).path = ".";
@@ -132,7 +327,7 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("rejects exposing the NGC credential to candidate-controlled steps", () => {
+  it("passes the NGC credential only to the qualification step", () => {
     const value = workflow();
     namedStep(value, "Validate protected runtime activation contract").env = {
       NVIDIA_API_KEY: "${{ secrets.NVIDIA_API_KEY }}",
@@ -143,7 +338,24 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("rejects executing candidate checkout paths in the secret-bearing qualification step", () => {
+  it("rejects an unguarded qualification credential", () => {
+    const value = workflow();
+    const qualification = namedStep(
+      value,
+      "Run all-agent GPU, local inference, rollback, and cleanup qualification",
+    );
+    qualification.env = { NVIDIA_API_KEY: "${{ secrets.NVIDIA_API_KEY }}" };
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          "managed-image-protected-runtime qualification env must bind NVIDIA_API_KEY",
+        ),
+      ]),
+    );
+  });
+
+  it("prevents the credentialed qualification step from executing .candidate-runtime files", () => {
     const value = workflow();
     const qualification = namedStep(
       value,
@@ -156,7 +368,7 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("rejects removing NIM from the activation contract", () => {
+  it("requires NIM in the activation file", () => {
     const value = workflow();
     const step = namedStep(value, "Validate protected runtime activation contract");
     step.run = String(step.run).replace(
@@ -169,7 +381,7 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("rejects qualification before exact all-agent image construction", () => {
+  it("runs qualification only after every agent image is built", () => {
     const value = workflow();
     const job = runtimeJob(value);
     const workflowSteps = job.steps as Array<Record<string, unknown>>;
@@ -189,7 +401,43 @@ describe("protected managed-image runtime workflow boundary", () => {
     runtimeJob(value).needs = ["generate-matrix"];
 
     expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
-      "managed-image-protected-runtime must depend on generate-matrix and managed-image-multiarch-startup",
+      "managed-image-protected-runtime must depend on base-image-publication, generate-matrix, and managed-image-multiarch-startup",
+    );
+  });
+
+  it("keeps protected audit production in trusted workflow code", () => {
+    const value = workflow();
+    const audit = namedStep(
+      value,
+      "Reuse or refresh reviewed audit evidence before the offline build",
+    );
+    audit.uses = "./.candidate-runtime/.github/actions/ci-reviewed-npm-audit";
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime must execute the trusted reviewed npm audit action",
+    );
+  });
+
+  it("audits the selected candidate before the protected build", () => {
+    const value = workflow();
+    const audit = namedStep(
+      value,
+      "Reuse or refresh reviewed audit evidence before the offline build",
+    );
+    (audit.with as Record<string, unknown>)["target-root"] = "${{ github.workspace }}";
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime audit action must bind target-root to ${{ github.workspace }}/.candidate-runtime",
+    );
+  });
+
+  it("rejects a mutable DCode base in protected runtime qualification", () => {
+    const value = workflow();
+    const bases = namedStep(value, "Resolve digest-pinned amd64 runtime base images");
+    bases.run = `${String(bases.run)}\nghcr.io/nvidia/nemoclaw/langchain-deepagents-code-sandbox-base:latest`;
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime must not resolve the DCode base from a mutable alias",
     );
   });
 
@@ -202,7 +450,7 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
-  it("rejects removing the exact protected runtime cache download", () => {
+  it("requires one protected runtime cache download", () => {
     const value = workflow();
     const job = runtimeJob(value);
     job.steps = (job.steps as Array<Record<string, unknown>>).filter(
@@ -230,7 +478,7 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   }, 15_000);
 
-  it("rejects a GPU rebuild that omits the exact hosted cache import", () => {
+  it("requires GPU rebuilds to import the hosted build cache", () => {
     const value = workflow();
     const build = namedStep(value, "Build exact all-agent protected runtime images");
     build.run = String(build.run).replace(
@@ -243,17 +491,71 @@ describe("protected managed-image runtime workflow boundary", () => {
     );
   });
 
+  it("keeps the protected build controller in the trusted checkout", () => {
+    const value = workflow();
+    const build = namedStep(value, "Build exact all-agent protected runtime images");
+    build.run = String(build.run).replace(
+      "scripts/checks/build-protected-managed-images.sh",
+      '"$GITHUB_WORKSPACE/.candidate-runtime/scripts/checks/build-protected-managed-images.sh"',
+    );
+
+    expect(validateManagedImageProtectedRuntimeWorkflow(value)).toContain(
+      "managed-image-protected-runtime build controller must execute trusted workflow code",
+    );
+  });
+
   it("rejects a hosted producer that is not selected with protected runtime", () => {
     const value = workflow();
     multiarchJob(value).if =
       "${{ contains(format(',{0},', inputs.jobs), ',managed-image-multiarch-startup,') || contains(format(',{0},', inputs.targets), ',managed-image-multiarch-startup,') }}";
 
     expect(validateManagedImageMultiarchWorkflow(value)).toContain(
-      "managed-image-multiarch-startup must run on main pushes and retain manual selectors",
+      "managed-image-multiarch-startup must use the trusted execution plan",
     );
   });
 
-  it("rejects removing the exact amd64 build cache publication", () => {
+  it("requires the validated base publication before protected multiarch startup", () => {
+    const value = workflow();
+    multiarchJob(value).needs = "generate-matrix";
+
+    expect(validateManagedImageMultiarchWorkflow(value)).toContain(
+      "managed-image-multiarch-startup must depend on base-image-publication and generate-matrix",
+    );
+  });
+
+  it("selects each protected DCode base from the validated platform contract", () => {
+    const value = workflow();
+    const bases = namedMultiarchStep(value, "Resolve digest-pinned platform base images");
+    (bases.env as Record<string, unknown>).DCODE_BASE_CONTRACT = "${{ inputs.base_contract }}";
+
+    expect(validateManagedImageMultiarchWorkflow(value)).toContain(
+      "managed-image-multiarch-startup exact base resolution must bind DCODE_BASE_CONTRACT to ${{ needs.base-image-publication.outputs.dcode_base_contract }}",
+    );
+  });
+
+  it("rejects a mutable DCode base in protected multiarch startup", () => {
+    const value = workflow();
+    const bases = namedMultiarchStep(value, "Resolve digest-pinned platform base images");
+    bases.run = `${String(bases.run)}\nghcr.io/nvidia/nemoclaw/langchain-deepagents-code-sandbox-base:latest`;
+
+    expect(validateManagedImageMultiarchWorkflow(value)).toContain(
+      "managed-image-multiarch-startup must not resolve the DCode base from a mutable alias",
+    );
+  });
+
+  it.each([
+    ["Validate OpenClaw managed-image security boundary", "run", "true"],
+    ["Validate OpenClaw managed-image security boundary", "continue-on-error", true],
+    ["Validate managed-image glibc probe lifecycle", "if", "always()"],
+    ["Validate managed-image glibc probe lifecycle", "continue-on-error", true],
+  ] as const)("rejects weakened protected consumer step %s %s", (name, key, value) => {
+    const candidate = workflow();
+    namedMultiarchStep(candidate, name)[key] = value;
+
+    expect(validateManagedImageMultiarchWorkflow(candidate)).not.toEqual([]);
+  });
+
+  it("requires one amd64 build-cache upload", () => {
     const value = workflow();
     const job = multiarchJob(value);
     job.steps = (job.steps as Array<Record<string, unknown>>).filter(

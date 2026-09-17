@@ -2,15 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import path from "node:path";
-import { buildValidatedCurlCommandArgs } from "../../adapters/http/curl-args";
 import { stripAnsi } from "../../adapters/openshell/client";
 import { CLI_NAME } from "../../cli/branding";
-import { GATEWAY_PORT, OLLAMA_PORT } from "../../core/ports";
+import { GATEWAY_PORT } from "../../core/ports";
+import { gatewayStartGuidance } from "../../gateway-start-guidance";
+import {
+  type OllamaHostInventoryProbeOptions,
+  probeOllamaHostInventory,
+} from "../../inference/health";
 import {
   CURRENT_RUNTIME_PROVIDER_BUNDLES,
   resolveCurrentRuntimeProviderBundle,
   resolveRuntimeProviderBundle,
 } from "../../onboard/runtime-provider/access";
+import { qualifyPortableAgentLifecycleAuthority } from "../../onboard/experimental/portable-agent-lifecycle";
+import { withSandboxLifecycleLock } from "./lifecycle/lock";
 import type { SandboxEntry } from "../../state/registry";
 import { readCloudflaredState } from "../../tunnel/services";
 import {
@@ -19,6 +25,19 @@ import {
 } from "./doctor-gateway-fallback";
 import { captureHostCommand } from "./doctor-host-command";
 import type { DoctorCheck } from "./doctor-report";
+
+export const withSandboxDoctorLifecycleLock = withSandboxLifecycleLock;
+
+export function gatewayDoctorStartHint(gatewayName: string): string {
+  return `${gatewayStartGuidance(gatewayName)} Then retry this command.`;
+}
+
+export function inspectSandboxDoctorPortableAuthority(
+  sandboxName: string,
+  readRegistry: (sandboxName: string) => SandboxEntry | null,
+) {
+  return qualifyPortableAgentLifecycleAuthority(sandboxName, { readRegistry });
+}
 
 export function oneLine(value = ""): string {
   return String(value).replace(/\s+/g, " ").trim();
@@ -39,9 +58,7 @@ function gatewayContainerCheck(
     label: "Docker container",
     status: running && healthy ? "ok" : "fail",
     detail: `${containerName} ${running ? "running" : "stopped"} (${health}; ${image})`,
-    hint: running
-      ? undefined
-      : `restart the gateway with \`openshell gateway start --name ${options.gatewayName ?? "nemoclaw"}\``,
+    hint: running ? undefined : gatewayStartGuidance(options.gatewayName ?? "nemoclaw"),
   };
 }
 
@@ -159,36 +176,29 @@ export function cloudflaredDoctorCheck(sandboxName: string): DoctorCheck {
   }
 }
 
-export function ollamaDoctorCheck(currentProvider: string): DoctorCheck {
-  const endpoint = `http://127.0.0.1:${OLLAMA_PORT}/api/tags`;
-  const result = captureHostCommand(
-    "curl",
-    buildValidatedCurlCommandArgs(["-sS", "--connect-timeout", "2", "--max-time", "4", endpoint]),
-    6000,
-  );
+export type OllamaDoctorCheckDeps = OllamaHostInventoryProbeOptions;
+
+export function ollamaDoctorCheck(
+  currentProvider: string,
+  deps: OllamaDoctorCheckDeps = {},
+): DoctorCheck {
+  const { endpoint, inventory } = probeOllamaHostInventory(deps);
   const required = currentProvider === "ollama-local";
-  if (result.status !== 0) {
+  if (inventory === null) {
     return {
       group: "Local services",
       label: "Ollama",
       status: required ? "fail" : "info",
-      detail: `not reachable at ${endpoint}`,
+      detail: `not reachable or invalid response at ${endpoint}`,
       hint: required ? "start Ollama or change the sandbox inference provider" : undefined,
     };
   }
 
-  let modelCount = "unknown model count";
-  try {
-    const parsed = JSON.parse(result.stdout);
-    if (Array.isArray(parsed.models)) modelCount = `${parsed.models.length} model(s)`;
-  } catch {
-    /* keep generic detail */
-  }
   return {
     group: "Local services",
     label: "Ollama",
     status: "ok",
-    detail: `reachable at ${endpoint} (${modelCount})`,
+    detail: `reachable at ${endpoint} (${inventory.length} model(s))`,
   };
 }
 

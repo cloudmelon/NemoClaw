@@ -2,7 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { checkSystemReadinessSchemaVersion } from "../../readiness/compatibility.js";
+import {
+  evaluateOnboardReadinessAdmission,
+  ONBOARD_READINESS_FINDING_IDS,
+} from "../../readiness/onboard-admission.js";
 import { getSystemReadinessReferenceErrors } from "../../readiness/references.js";
+import {
+  hasRemediableStorageConflict,
+  STORAGE_COMPATIBLE_CAPABILITY,
+} from "../../readiness/storage-remediation.js";
+import type { SystemReadinessReport } from "../../readiness/types.js";
 import {
   getManagedInferenceMaterializerDescriptor,
   getManagedInferenceRecipeRegistrationError,
@@ -16,7 +25,6 @@ import { loadManagedInferenceCatalog } from "./catalog-loader.js";
 import type {
   CompiledManagedInferenceCatalog,
   ManagedInferenceFactRequirement,
-  ManagedInferencePresetRequirement,
   ManagedInferenceReadinessRequirement,
   ManagedInferenceReadinessSource,
   ManagedInferenceResolution,
@@ -24,11 +32,8 @@ import type {
   ManagedInferenceRuntimeServingRecipe,
   ManagedInferenceSelectionIntent,
   ManagedInferenceServingPreset,
-  ManagedInferenceServingRecipe,
   ManagedInferenceTopologyQualification,
   ManagedInferenceTopologyRequirement,
-  ResolvedHostLocalInferenceSelection,
-  ResolvedManagedInferenceSelection,
   ServingReadinessComparison,
 } from "./types.js";
 
@@ -57,6 +62,13 @@ interface MatchingCandidate<TOutput> {
   readonly topologyQualification?: ManagedInferenceTopologyQualification<TOutput>;
 }
 
+interface RuntimeRequirementFailure {
+  readonly outcome: "runtime-unmet";
+  readonly message: string;
+  readonly presetId: string;
+  readonly priority: number;
+}
+
 function hasText(value: string | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -65,47 +77,78 @@ function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function explicitIntentWithoutPreset(intent: ManagedInferenceSelectionIntent): boolean {
+function compareRuntimeRequirementFailures(
+  left: RuntimeRequirementFailure,
+  right: RuntimeRequirementFailure,
+): number {
+  return right.priority - left.priority || compareStrings(left.presetId, right.presetId);
+}
+
+function unmanagedExplicitIntent(intent: ManagedInferenceSelectionIntent): boolean {
+  return intent.vllmExtraArguments?.some(hasText) ?? false;
+}
+
+function recipeMatchesModelIntent(
+  recipe: ManagedInferenceRuntimeServingRecipe,
+  model: string,
+): boolean {
+  const normalizedModel = model.toLowerCase();
   return (
-    hasText(intent.provider) ||
-    hasText(intent.vllmModel) ||
-    (intent.vllmExtraArguments?.length ?? 0) > 0
+    normalizedModel === recipe.spec.model.id.toLowerCase() ||
+    normalizedModel === recipe.spec.model.servedName.toLowerCase() ||
+    ("environmentValue" in recipe.spec.model &&
+      normalizedModel === recipe.spec.model.environmentValue.toLowerCase())
   );
 }
 
-const STORAGE_COMPATIBLE_CAPABILITY = "host.docker.storage_compatible";
-const STORAGE_REMEDIATION_CAPABILITY = "host.docker.storage_remediation_available";
-const STORAGE_INCOMPATIBLE_FINDING = "host.docker.storage_incompatible";
-
-function capabilityState(
-  report: ManagedInferenceReadinessSource["report"],
-  id: string,
-): "present" | "absent" | "unknown" | undefined {
-  const matches = report.capabilities.filter((capability) => capability.id === id);
-  return matches.length === 1 ? matches[0]!.state : undefined;
+function hasManagedVllmIntent(
+  intent: ManagedInferenceSelectionIntent,
+  catalog: CompiledManagedInferenceCatalog,
+): boolean {
+  if (intent.provider === "vllm" || hasText(intent.vllmModel)) return true;
+  if (!hasText(intent.preset)) return false;
+  const presets = catalog.presets.filter(({ metadata }) => metadata.id === intent.preset);
+  return presets.length === 1 && presets[0]!.spec.plan.backend === "vllm";
 }
 
-function hasRemediableStorageConflict(report: ManagedInferenceReadinessSource["report"]): boolean {
-  const blocking = report.findings.filter(
-    ({ severity }) => severity === "fatal" || severity === "blocking",
+function hasRemediableStorageFinding(report: SystemReadinessReport): boolean {
+  const storageFindings = report.findings.filter(
+    ({ id, severity }) =>
+      id === ONBOARD_READINESS_FINDING_IDS.storageIncompatible && severity === "blocking",
   );
   return (
-    report.status === "incompatible" &&
-    report.exitCode === 2 &&
-    blocking.length === 1 &&
-    blocking[0]!.id === STORAGE_INCOMPATIBLE_FINDING &&
-    blocking[0]!.severity === "blocking" &&
-    blocking[0]!.capabilityIds?.length === 1 &&
-    blocking[0]!.capabilityIds[0] === STORAGE_COMPATIBLE_CAPABILITY &&
-    capabilityState(report, STORAGE_COMPATIBLE_CAPABILITY) === "absent" &&
-    capabilityState(report, STORAGE_REMEDIATION_CAPABILITY) === "present"
+    storageFindings.length === 1 &&
+    hasRemediableStorageConflict({ ...report, findings: storageFindings })
   );
+}
+
+function hasAdmittedReadinessException(
+  report: SystemReadinessReport,
+  allowDeferredN1xManagedVllm: boolean,
+): boolean {
+  if (report.status !== "incompatible" || report.exitCode !== 2) return false;
+  const remediableStorage = hasRemediableStorageFinding(report);
+  const admission = evaluateOnboardReadinessAdmission(report, {
+    explicitlyOptedOutGpuPassthrough: false,
+    allowUnsupportedRuntime: false,
+    allowStorageRemediation: remediableStorage,
+    allowDeferredN1xManagedVllm,
+  });
+  if (!admission.admitted || admission.waivedFindingIds.length === 0) return false;
+  const waivedFindingIds = new Set(admission.waivedFindingIds);
+  if (waivedFindingIds.size !== admission.waivedFindingIds.length) return false;
+  const allowedFindingIds = new Set<string>([
+    ONBOARD_READINESS_FINDING_IDS.storageIncompatible,
+    ...(allowDeferredN1xManagedVllm ? [ONBOARD_READINESS_FINDING_IDS.n1xValidationPending] : []),
+  ]);
+  return admission.waivedFindingIds.every((id) => allowedFindingIds.has(id));
 }
 
 function readinessError(
   source: ManagedInferenceReadinessSource,
   nowMs: number,
   maxAgeMs: number,
+  allowDeferredN1xManagedVllm: boolean,
 ): string | undefined {
   const { nodeId, report } = source;
   if (!hasText(nodeId)) return "readiness node ID is empty";
@@ -125,13 +168,16 @@ function readinessError(
   }
   const referenceErrors = getSystemReadinessReferenceErrors(report);
   if (referenceErrors.length > 0) return `${nodeId}: ${referenceErrors[0]}`;
-  const remediableStorage = hasRemediableStorageConflict(report);
-  if ((report.status !== "supported" || report.exitCode !== 0) && !remediableStorage) {
+  const admittedReadinessException = hasAdmittedReadinessException(
+    report,
+    allowDeferredN1xManagedVllm,
+  );
+  if ((report.status !== "supported" || report.exitCode !== 0) && !admittedReadinessException) {
     return `${nodeId}: readiness status is ${report.status}`;
   }
   if (
     report.findings.some(({ severity }) => severity === "fatal" || severity === "blocking") &&
-    !remediableStorage
+    !admittedReadinessException
   ) {
     return `${nodeId}: readiness report contains a blocking finding`;
   }
@@ -142,13 +188,14 @@ function readinessReportsError(
   sources: readonly ManagedInferenceReadinessSource[],
   nowMs: number,
   maxAgeMs: number,
+  allowDeferredN1xManagedVllm: boolean,
 ): string | undefined {
   const nodeIds = sources.map(({ nodeId }) => nodeId);
   if (new Set(nodeIds).size !== nodeIds.length) {
     return "readiness reports contain duplicate node IDs";
   }
   for (const source of sources) {
-    const error = readinessError(source, nowMs, maxAgeMs);
+    const error = readinessError(source, nowMs, maxAgeMs, allowDeferredN1xManagedVllm);
     if (error) return error;
   }
   return undefined;
@@ -258,7 +305,7 @@ function readinessRequirementMatches(
       requirement.kind === "capability" &&
       requirement.id === STORAGE_COMPATIBLE_CAPABILITY &&
       requirement.state === "present" &&
-      hasRemediableStorageConflict(report)
+      hasRemediableStorageFinding(report)
     );
   });
 }
@@ -372,6 +419,36 @@ function evaluateRequirements<TOutput>(
   return { outcome: "matched", topologyQualifications: matchedTopologies };
 }
 
+function runtimeMemoryRequirementError(
+  recipe: ManagedInferenceRuntimeServingRecipe,
+  reports: readonly ManagedInferenceReadinessSource[],
+): string | undefined {
+  const minimum =
+    recipe.spec.runtime && "minimumGpuMemoryBytes" in recipe.spec.runtime
+      ? recipe.spec.runtime.minimumGpuMemoryBytes
+      : undefined;
+  if (minimum === undefined) return undefined;
+  for (const { nodeId, report } of reports) {
+    const observationValue = (id: string): unknown => {
+      const matches = report.observations.filter((observation) => observation.id === id);
+      return matches.length === 1 && matches[0]!.state === "present"
+        ? matches[0]!.value
+        : undefined;
+    };
+    const unified = observationValue("host.gpu.unified_memory") === true;
+    const available = observationValue(
+      unified ? "host.gpu.memory_total_bytes" : "host.gpu.memory_per_device_bytes",
+    );
+    if (typeof available !== "number") {
+      return `${nodeId}: GPU memory capacity could not be determined.`;
+    }
+    if (available < minimum) {
+      return `${nodeId}: GPU memory capacity ${String(available)} is below the recipe minimum ${String(minimum)} bytes.`;
+    }
+  }
+  return undefined;
+}
+
 function intentCompatibilityError(
   intent: ManagedInferenceSelectionIntent,
   preset: ManagedInferenceServingPreset,
@@ -380,14 +457,10 @@ function intentCompatibilityError(
   if (hasText(intent.provider) && intent.provider !== recipe.spec.backend) {
     return `provider ${intent.provider} conflicts with preset ${preset.metadata.id}`;
   }
-  if (
-    hasText(intent.vllmModel) &&
-    intent.vllmModel !== recipe.spec.model.id &&
-    intent.vllmModel !== recipe.spec.model.servedName
-  ) {
+  if (hasText(intent.vllmModel) && !recipeMatchesModelIntent(recipe, intent.vllmModel)) {
     return `model ${intent.vllmModel} conflicts with preset ${preset.metadata.id}`;
   }
-  if ((intent.vllmExtraArguments?.length ?? 0) > 0) {
+  if (unmanagedExplicitIntent(intent)) {
     return `extra vLLM arguments conflict with preset ${preset.metadata.id}`;
   }
   return undefined;
@@ -436,6 +509,7 @@ function matchingCandidate<TOutput>(
       readonly outcome: "matched";
       readonly candidate: MatchingCandidate<TOutput>;
     }
+  | RuntimeRequirementFailure
   | { readonly outcome: "unmet"; readonly message: string }
   | { readonly outcome: "invalid-topology"; readonly message: string }
   | { readonly outcome: "incompatible-intent"; readonly message: string } {
@@ -450,6 +524,15 @@ function matchingCandidate<TOutput>(
     input.topologyQualifications,
   );
   if (requirements.outcome !== "matched") return requirements;
+  const memoryError = runtimeMemoryRequirementError(recipe, input.readinessReports);
+  if (memoryError) {
+    return {
+      outcome: "runtime-unmet",
+      message: memoryError,
+      presetId: preset.metadata.id,
+      priority: presetPriority(preset),
+    };
+  }
   const materializer = getManagedInferenceMaterializerDescriptor(
     recipe.spec.execution.materializerRef,
   );
@@ -523,7 +606,8 @@ export function resolveManagedInferenceServing<TOutput>(
 ): ManagedInferenceResolution<TOutput> {
   const intent = input.intent ?? {};
   const explicitPresetId = hasText(intent.preset) ? intent.preset : undefined;
-  if (!explicitPresetId && explicitIntentWithoutPreset(intent)) {
+  const explicitModel = hasText(intent.vllmModel) ? intent.vllmModel : undefined;
+  if (!explicitPresetId && unmanagedExplicitIntent(intent)) {
     return {
       outcome: "no-match",
       code: "explicit-intent",
@@ -540,7 +624,12 @@ export function resolveManagedInferenceServing<TOutput>(
       message: "Readiness freshness policy is invalid.",
     };
   }
-  const reportsError = readinessReportsError(input.readinessReports, nowMs, maxAgeMs);
+  const reportsError = readinessReportsError(
+    input.readinessReports,
+    nowMs,
+    maxAgeMs,
+    hasManagedVllmIntent(intent, catalog),
+  );
   if (reportsError) {
     return {
       outcome: "rejected",
@@ -583,14 +672,77 @@ export function resolveManagedInferenceServing<TOutput>(
     };
   }
 
+  if (explicitModel) {
+    const modelPresets = catalog.presets.filter((preset) => {
+      if (preset.spec.selection === "disabled") return false;
+      return recipeMatchesModelIntent(recipeForPreset(catalog, preset), explicitModel);
+    });
+    if (modelPresets.length === 0) {
+      return {
+        outcome: "rejected",
+        code: "requirements-not-met",
+        message: `No managed vLLM profile defines model ${explicitModel}.`,
+      };
+    }
+
+    const matching: MatchingCandidate<TOutput>[] = [];
+    let runtimeFailure: RuntimeRequirementFailure | undefined;
+    let firstFailure:
+      | Exclude<
+          ReturnType<typeof matchingCandidate<TOutput>>,
+          { readonly outcome: "matched" } | RuntimeRequirementFailure
+        >
+      | undefined;
+    for (const compiledPreset of modelPresets) {
+      const evaluated = matchingCandidate(catalog, compiledPreset, input);
+      if (evaluated.outcome === "matched") matching.push(evaluated.candidate);
+      else if (evaluated.outcome === "runtime-unmet") {
+        if (!runtimeFailure || compareRuntimeRequirementFailures(evaluated, runtimeFailure) < 0) {
+          runtimeFailure = evaluated;
+        }
+      } else firstFailure ??= evaluated;
+    }
+    if (matching.length === 0) {
+      const failure = runtimeFailure ?? firstFailure;
+      return {
+        outcome: "rejected",
+        code: failure?.outcome === "invalid-topology" ? "invalid-topology" : "requirements-not-met",
+        message:
+          failure?.message ?? `No compatible managed vLLM profile defines model ${explicitModel}.`,
+      };
+    }
+    matching.sort(
+      (left, right) =>
+        right.priority - left.priority ||
+        compareStrings(left.preset.metadata.id, right.preset.metadata.id),
+    );
+    const highestPriority = matching[0]!.priority;
+    const tied = matching.filter(({ priority }) => priority === highestPriority);
+    if (tied.length !== 1) {
+      return {
+        outcome: "rejected",
+        code: "ambiguous-selection",
+        message: `Managed vLLM model ${explicitModel} is ambiguous at priority ${String(
+          highestPriority,
+        )}: ${tied.map(({ preset }) => preset.metadata.id).join(", ")}.`,
+      };
+    }
+    return selectedResolution(catalog, tied[0]!, "explicit");
+  }
+
   const matching: MatchingCandidate<TOutput>[] = [];
+  let runtimeFailure: RuntimeRequirementFailure | undefined;
   let firstInvalidTopology: string | undefined;
   for (const compiledPreset of catalog.presets) {
     const preset = compiledPreset;
     if (preset.spec.selection !== "automatic") continue;
     const evaluated = matchingCandidate(catalog, compiledPreset, input);
     if (evaluated.outcome === "matched") matching.push(evaluated.candidate);
-    else if (evaluated.outcome === "invalid-topology") firstInvalidTopology ??= evaluated.message;
+    else if (evaluated.outcome === "runtime-unmet") {
+      if (!runtimeFailure || compareRuntimeRequirementFailures(evaluated, runtimeFailure) < 0) {
+        runtimeFailure = evaluated;
+      }
+    } else if (evaluated.outcome === "invalid-topology") firstInvalidTopology ??= evaluated.message;
   }
   if (firstInvalidTopology) {
     return {
@@ -603,7 +755,7 @@ export function resolveManagedInferenceServing<TOutput>(
     return {
       outcome: "no-match",
       code: "requirements-not-met",
-      message: "No automatic managed inference preset matched.",
+      message: runtimeFailure?.message ?? "No automatic managed inference preset matched.",
     };
   }
   matching.sort(

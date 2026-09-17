@@ -3,11 +3,13 @@
 
 import { CLI_DISPLAY_NAME, CLI_NAME } from "../../cli/branding";
 import { D, R } from "../../cli/terminal-style";
+import { deferSandboxLifecycleExit } from "../../core/process-exit";
+import { gatewayStartGuidance } from "../../gateway-start-guidance";
 import { isTerminalSandboxPhase } from "../../state/gateway";
 import { getSandboxDockerRuntime } from "./docker-health";
 import { isDockerRuntimeDown, printDockerRuntimeDownGuidance } from "./gateway-failure-classifier";
 import type { SandboxGatewayState } from "./gateway-state";
-import { printGatewayLifecycleHint, printWrongGatewayActiveGuidance } from "./gateway-state";
+import { printSandboxGatewayStateHint, printWrongGatewayActiveGuidance } from "./gateway-state";
 import { getSandboxTargetGatewayName } from "./gateway-target";
 import {
   printGatewayFailureLayerHeader,
@@ -16,6 +18,8 @@ import {
 
 type SandboxGatewayLookupStatusContext = {
   sandboxName: string;
+  /** Whether the local registry holds `sandboxName`, as the status snapshot read it. */
+  registered: boolean;
   lookup: SandboxGatewayState;
   phase: string | null;
   dockerRuntime: ReturnType<typeof getSandboxDockerRuntime> | null;
@@ -34,10 +38,14 @@ export async function printSandboxGatewayLookupStatus(
       return;
     case "gateway_schema_mismatch":
       console.log(context.lookup.output);
-      process.exit(1);
+      return deferSandboxLifecycleExit(1);
     case "missing":
-      printMissingLiveSandboxStatusGuidance(context.sandboxName, context.lookup);
-      process.exit(1);
+      if (context.effectivePreflight.intentionalStopConfirmed) {
+        printConfirmedStoppedSandboxStatus(context.sandboxName);
+        return;
+      }
+      printMissingLiveSandboxStatusGuidance(context);
+      deferSandboxLifecycleExit(1);
     case "identity_drift":
       printIdentityDriftLookupStatus(context);
       return;
@@ -50,9 +58,20 @@ export async function printSandboxGatewayLookupStatus(
     case "sandbox_recovery_failed":
       printSandboxRecoveryFailedLookupStatus(context);
       return;
+    case "stop_intent_update_failed":
+      printStopIntentUpdateFailedLookupStatus(context);
+      return;
     default:
       await printUnknownGatewayLookupStatus(context);
   }
+}
+
+function printConfirmedStoppedSandboxStatus(sandboxName: string): void {
+  console.log("");
+  console.log("  Phase: Stopped");
+  console.log(`  Sandbox '${sandboxName}' is stopped.`);
+  console.log("  Workspace state is preserved.");
+  console.log(`  Start it again with \`${CLI_NAME} ${sandboxName} start\`.`);
 }
 
 function printSandboxRecoveryFailedLookupStatus({
@@ -70,14 +89,36 @@ function printSandboxRecoveryFailedLookupStatus({
   console.log(
     `  Retry \`${CLI_NAME} ${sandboxName} recover\` after addressing the reported layer.`,
   );
-  process.exit(1);
+  deferSandboxLifecycleExit(1);
 }
 
-function printMissingLiveSandboxStatusGuidance(
-  sandboxName: string,
-  lookup: SandboxGatewayState,
-): void {
+function printStopIntentUpdateFailedLookupStatus({
+  sandboxName,
+  lookup,
+}: SandboxGatewayLookupStatusContext): void {
   console.log("");
+  if (lookup.output) console.log(lookup.output);
+  console.log(
+    `  Repair access to NemoClaw's local state, then retry \`${CLI_NAME} ${sandboxName} status\`.`,
+  );
+  deferSandboxLifecycleExit(1);
+}
+
+function printMissingLiveSandboxStatusGuidance({
+  sandboxName,
+  registered,
+  lookup,
+}: SandboxGatewayLookupStatusContext): void {
+  console.log("");
+  // A gateway NotFound cannot distinguish a deleted sandbox from a name the
+  // local registry never held. Without `registered` the guidance below claims a
+  // local registration that `sandbox start` and `sandbox stop` deny (#9425).
+  if (!registered) {
+    console.log(
+      `  Sandbox '${sandboxName}' is not registered. Run '${CLI_NAME} list' to see registered sandboxes.`,
+    );
+    return;
+  }
   console.log(
     `  Sandbox '${sandboxName}' is registered locally, but is not present in the live OpenShell gateway.`,
   );
@@ -119,7 +160,12 @@ function printPresentSandboxGatewayLookupStatus({
     );
     console.log("");
   }
-  console.log(lookup.output);
+  const isStopped = phase === "Stopped";
+  const renderedOutput =
+    isStopped && lookup.output
+      ? lookup.output.replace(/^(\s*Phase:\s*)\S+\s*$/gmu, "$1Stopped")
+      : lookup.output;
+  if (renderedOutput) console.log(renderedOutput);
   printNonReadySandboxPhaseGuidance({ sandboxName, phase, dockerRuntime });
 }
 
@@ -133,7 +179,7 @@ function printWrongGatewayActiveLookupStatus({
       : undefined;
   console.log("");
   printWrongGatewayActiveGuidance(sandboxName, activeGateway, console.log);
-  process.exit(1);
+  deferSandboxLifecycleExit(1);
 }
 
 function printIdentityDriftLookupStatus({
@@ -153,7 +199,7 @@ function printIdentityDriftLookupStatus({
   console.log(
     `  Recreate this sandbox with \`${CLI_NAME} onboard\` once the gateway runtime is stable.`,
   );
-  process.exit(1);
+  deferSandboxLifecycleExit(1);
 }
 
 async function printGatewayUnreachableAfterRestartLookupStatus({
@@ -170,12 +216,12 @@ async function printGatewayUnreachableAfterRestartLookupStatus({
     console.log(lookup.output);
   }
   console.log(
-    `  Retry \`openshell gateway start --name ${getSandboxTargetGatewayName(sandboxName)}\` and verify \`openshell status\` is healthy before reconnecting.`,
+    `  ${gatewayStartGuidance(getSandboxTargetGatewayName(sandboxName))} Check that \`openshell status\` reports the gateway healthy before reconnecting.`,
   );
   console.log(
     "  If the gateway never becomes healthy, rebuild the gateway and then recreate the affected sandbox.",
   );
-  process.exit(1);
+  deferSandboxLifecycleExit(1);
 }
 
 async function printGatewayMissingAfterRestartLookupStatus({
@@ -191,13 +237,11 @@ async function printGatewayMissingAfterRestartLookupStatus({
   if (lookup.output) {
     console.log(lookup.output);
   }
-  console.log(
-    `  Start the gateway again with \`openshell gateway start --name ${getSandboxTargetGatewayName(sandboxName)}\` before retrying.`,
-  );
+  console.log(`  ${gatewayStartGuidance(getSandboxTargetGatewayName(sandboxName))}`);
   console.log(
     "  If the gateway had to be rebuilt from scratch, recreate the affected sandbox afterward.",
   );
-  process.exit(1);
+  deferSandboxLifecycleExit(1);
 }
 
 async function printUnknownGatewayLookupStatus({
@@ -211,8 +255,8 @@ async function printUnknownGatewayLookupStatus({
     console.log(lookup.output);
   }
   await printGatewayFailureLayerHeader(sandboxName, effectivePreflight.failureLayer);
-  printGatewayLifecycleHint(lookup.output, sandboxName, console.log);
-  process.exit(1);
+  printSandboxGatewayStateHint(lookup, sandboxName, console.log);
+  deferSandboxLifecycleExit(1);
 }
 
 function printNonReadySandboxPhaseGuidance({
@@ -225,6 +269,16 @@ function printNonReadySandboxPhaseGuidance({
   dockerRuntime: ReturnType<typeof getSandboxDockerRuntime> | null;
 }): void {
   if (!phase || phase === "Ready") return;
+  if (
+    phase === "Stopped" ||
+    (dockerRuntime?.containerName && !dockerRuntime.running && !dockerRuntime.paused)
+  ) {
+    console.log("");
+    console.log(`  Sandbox '${sandboxName}' is stopped.`);
+    console.log("  Workspace state is preserved.");
+    console.log(`  Start it again with \`${CLI_NAME} ${sandboxName} start\`.`);
+    return;
+  }
   // A non-ready, non-terminal phase can mean two very different things. If
   // the Docker daemon is down, OpenShell can still return a present-but-
   // Provisioning sandbox (cached/transitional state); steering the user
@@ -236,7 +290,7 @@ function printNonReadySandboxPhaseGuidance({
   if (!isTerminalSandboxPhase(phase) && isDockerRuntimeDown(sandboxName)) {
     console.log("");
     printDockerRuntimeDownGuidance(sandboxName, { writer: console.log });
-    process.exit(1);
+    deferSandboxLifecycleExit(1);
   }
   // A paused Docker-driver container can surface upstream as `Phase: Error`
   // (e.g. GPU passthrough on Ubuntu 24.04) even though the sandbox is

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { testTimeoutOptions } from "../../test/helpers/timeouts";
 
 const mocks = vi.hoisted(() => {
   class GatewayTokenCommandError extends Error {
@@ -31,19 +32,27 @@ const mocks = vi.hoisted(() => {
     buildVersionedUninstallUrl: vi.fn(
       (version: string) => `https://example.test/${version}/uninstall.sh`,
     ),
-    fetchGatewayAuthTokenFromSandbox: vi.fn(() => "token"),
+    fetchGatewayAuthTokenFromSandbox: vi.fn(async () => "token"),
     getVersion: vi.fn(() => "1.2.3"),
     captureOpenshellCommand: vi.fn(() => ({ status: 0, output: "alpha\n" })),
     listSandboxes: vi.fn(() => ({ sandboxes: [] })),
     resolveOpenshell: vi.fn(() => "/usr/bin/openshell"),
     runDebugCommandWithOptions: vi.fn(),
-    runDeployAction: vi.fn().mockResolvedValue(undefined),
-    runDashboardUrlCommand: vi.fn(() => undefined),
-    runGatewayTokenCommand: vi.fn(() => undefined),
+    runDashboardUrlCommand: vi.fn(async () => undefined),
+    runGatewayTokenCommand: vi.fn(async () => undefined),
     runStartCommand: vi.fn().mockResolvedValue(undefined),
     runStopCommand: vi.fn(),
     runUninstallCommand: vi.fn(),
+    resolveDefaultSandboxName: vi.fn((listSandboxes: () => unknown) => {
+      listSandboxes();
+      return "resolved-sandbox";
+    }),
+    assertHermesPortableCommandUnavailable: vi.fn(),
+    withMcpLifecycleLock: vi.fn(async (_sandboxName: string, operation: () => unknown) =>
+      operation(),
+    ),
     showRootHelp: vi.fn(),
+    showStatus: vi.fn(),
     showVersion: vi.fn(),
     spawnSync: vi.fn(),
     startAll: vi.fn(),
@@ -67,7 +76,6 @@ vi.mock("../lib/dashboard-url-command", () => ({
   runDashboardUrlCommand: mocks.runDashboardUrlCommand,
 }));
 vi.mock("../lib/actions/global", () => ({
-  runDeployAction: mocks.runDeployAction,
   showRootHelp: mocks.showRootHelp,
   showVersion: mocks.showVersion,
 }));
@@ -76,8 +84,13 @@ vi.mock("../lib/adapters/openshell/client", () => ({
 }));
 vi.mock("../lib/state/registry", () => ({ listSandboxes: mocks.listSandboxes }));
 vi.mock("../lib/adapters/openshell/resolve", () => ({ resolveOpenshell: mocks.resolveOpenshell }));
-vi.mock("../lib/tunnel/services", () => ({ startAll: mocks.startAll, stopAll: mocks.stopAll }));
+vi.mock("../lib/tunnel/services", () => ({
+  showStatus: mocks.showStatus,
+  startAll: mocks.startAll,
+  stopAll: mocks.stopAll,
+}));
 vi.mock("../lib/tunnel/service-command", () => ({
+  resolveDefaultSandboxName: mocks.resolveDefaultSandboxName,
   runStartCommand: mocks.runStartCommand,
   runStopCommand: mocks.runStopCommand,
 }));
@@ -86,10 +99,17 @@ vi.mock("../lib/uninstall-command", () => ({
   runUninstallCommand: mocks.runUninstallCommand,
 }));
 vi.mock("../lib/core/version", () => ({ getVersion: mocks.getVersion }));
+vi.mock("../lib/onboard/experimental/portable-agent-lifecycle", async (importOriginal) => ({
+  ...(await importOriginal()),
+  assertHermesPortableCommandUnavailable: mocks.assertHermesPortableCommandUnavailable,
+}));
+vi.mock("../lib/state/mcp-lifecycle-lock-acquisition", async (importOriginal) => ({
+  ...(await importOriginal()),
+  withMcpLifecycleLock: mocks.withMcpLifecycleLock,
+}));
 
 import { log } from "../lib/cli/logger";
 import DebugCliCommand from "./debug";
-import DeployCliCommand from "./deploy";
 import RootHelpCommand from "./root/help";
 import VersionCommand from "./root/version";
 import DashboardUrlCliCommand, {
@@ -101,12 +121,13 @@ import GatewayTokenCliCommand, {
 import DeprecatedStartCommand from "./start";
 import DeprecatedStopCommand from "./stop";
 import TunnelStartCommand from "./tunnel/start";
+import TunnelStatusCommand from "./tunnel/status";
 import TunnelStopCommand from "./tunnel/stop";
 import UninstallCliCommand from "./uninstall";
 
 const rootDir = process.cwd();
 
-describe("simple global oclif adapters", () => {
+describe("simple global oclif adapters", testTimeoutOptions(30_000), () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -115,12 +136,11 @@ describe("simple global oclif adapters", () => {
     vi.restoreAllMocks();
   });
 
-  it("maps debug and deploy parser output to actions", async () => {
+  it("maps debug parser output to its action", async () => {
     await DebugCliCommand.run(
       ["--quick", "--output", "/tmp/debug.tar.gz", "--sandbox", "alpha"],
       rootDir,
     );
-    await DeployCliCommand.run(["gpu-alpha"], rootDir);
 
     expect(mocks.runDebugCommandWithOptions).toHaveBeenCalledWith(
       { quick: true, output: "/tmp/debug.tar.gz", sandboxName: "alpha" },
@@ -129,7 +149,6 @@ describe("simple global oclif adapters", () => {
         runDebug: expect.any(Function),
       }),
     );
-    expect(mocks.runDeployAction).toHaveBeenCalledWith("gpu-alpha");
   });
 
   it("keeps debug -q scoped to quick diagnostics instead of global quiet mode", async () => {
@@ -148,17 +167,121 @@ describe("simple global oclif adapters", () => {
   it("builds debug defaults from the sandbox registry and OpenShell liveness", async () => {
     mocks.listSandboxes.mockReturnValue({
       defaultSandbox: "alpha",
-      sandboxes: [{ name: "alpha" }],
+      sandboxes: [{ name: "alpha", gatewayPort: 18080 }],
     } as never);
     await DebugCliCommand.run(["--quick"], rootDir);
 
     const deps = mocks.runDebugCommandWithOptions.mock.calls[0][1];
-    expect(deps.getDefaultSandbox()).toBe("alpha");
+    await expect(deps.getDefaultSandbox()).resolves.toEqual({
+      name: "alpha",
+      gatewayName: "nemoclaw-18080",
+    });
     expect(mocks.captureOpenshellCommand).toHaveBeenCalledWith(
       "/usr/bin/openshell",
-      ["sandbox", "list"],
-      expect.objectContaining({ cwd: rootDir, ignoreError: true }),
+      ["sandbox", "list", "-g", "nemoclaw-18080"],
+      expect.objectContaining({
+        cwd: rootDir,
+        ignoreError: true,
+        includeStderr: true,
+        includeStreams: true,
+      }),
     );
+  });
+
+  it("rejects a registered debug sandbox missing from a successful OpenShell observation", async () => {
+    mocks.listSandboxes.mockReturnValue({
+      defaultSandbox: "alpha",
+      sandboxes: [{ name: "alpha" }],
+    } as never);
+    mocks.captureOpenshellCommand.mockReturnValue({ status: 0, output: "beta\n" });
+
+    await DebugCliCommand.run(["--quick"], rootDir);
+
+    const deps = mocks.runDebugCommandWithOptions.mock.calls[0][1];
+    await expect(deps.getDefaultSandbox()).resolves.toBeNull();
+    await expect(deps.getSandboxAvailability("alpha")).resolves.toEqual({ state: "missing" });
+  });
+
+  it("rejects a fallback registered sandbox missing from OpenShell", async () => {
+    mocks.listSandboxes.mockReturnValue({
+      defaultSandbox: null,
+      sandboxes: [{ name: "alpha" }],
+    } as never);
+    mocks.captureOpenshellCommand.mockReturnValue({ status: 0, output: "beta\n" });
+
+    await DebugCliCommand.run(["--quick"], rootDir);
+
+    const deps = mocks.runDebugCommandWithOptions.mock.calls[0][1];
+    await expect(deps.getDefaultSandbox()).resolves.toBeNull();
+  });
+
+  it("keeps a fallback registered sandbox when OpenShell observation fails", async () => {
+    mocks.listSandboxes.mockReturnValue({
+      defaultSandbox: null,
+      sandboxes: [{ name: "alpha" }],
+    } as never);
+    mocks.captureOpenshellCommand.mockReturnValue({ status: 1, output: "unavailable" });
+
+    await DebugCliCommand.run(["--quick"], rootDir);
+
+    const deps = mocks.runDebugCommandWithOptions.mock.calls[0][1];
+    await expect(deps.getDefaultSandbox()).resolves.toEqual({
+      name: "alpha",
+      gatewayName: "nemoclaw",
+    });
+  });
+
+  it("rejects an explicit sandbox when OpenShell authentication fails", async () => {
+    mocks.listSandboxes.mockReturnValue({
+      defaultSandbox: "alpha",
+      sandboxes: [{ name: "alpha" }],
+    } as never);
+    mocks.captureOpenshellCommand.mockReturnValue({
+      status: 1,
+      output: "authentication failed",
+    });
+
+    await DebugCliCommand.run(["--quick"], rootDir);
+
+    const deps = mocks.runDebugCommandWithOptions.mock.calls[0][1];
+    await expect(deps.getSandboxAvailability("alpha")).resolves.toEqual({
+      state: "observation_denied",
+    });
+  });
+
+  it("rejects an explicit sandbox with an invalid gateway binding", async () => {
+    mocks.listSandboxes.mockReturnValue({
+      defaultSandbox: "alpha",
+      sandboxes: [{ name: "alpha", gatewayName: "untrusted" }],
+    } as never);
+
+    await DebugCliCommand.run(["--quick"], rootDir);
+
+    const deps = mocks.runDebugCommandWithOptions.mock.calls[0][1];
+    await expect(deps.getSandboxAvailability("alpha")).resolves.toEqual({
+      state: "invalid_gateway",
+    });
+    expect(mocks.captureOpenshellCommand).not.toHaveBeenCalled();
+  });
+
+  it("keeps registered debug sandboxes when OpenShell observation fails", async () => {
+    mocks.listSandboxes.mockReturnValue({
+      defaultSandbox: "alpha",
+      sandboxes: [{ name: "alpha" }],
+    } as never);
+    mocks.captureOpenshellCommand.mockReturnValue({ status: 1, output: "unavailable" });
+
+    await DebugCliCommand.run(["--quick"], rootDir);
+
+    const deps = mocks.runDebugCommandWithOptions.mock.calls[0][1];
+    await expect(deps.getDefaultSandbox()).resolves.toEqual({
+      name: "alpha",
+      gatewayName: "nemoclaw",
+    });
+    await expect(deps.getSandboxAvailability("alpha")).resolves.toEqual({
+      state: "available",
+      gatewayName: "nemoclaw",
+    });
   });
 
   it("maps gateway-token flags to the gateway token action", async () => {
@@ -178,6 +301,26 @@ describe("simple global oclif adapters", () => {
       { quiet: true },
       { fetchToken, getSandboxAgent, agentExposesToken },
     );
+    expect(mocks.withMcpLifecycleLock).toHaveBeenCalledWith("alpha", expect.any(Function));
+  });
+
+  it("rejects schema-5 gateway-token before fetching or printing credentials (#9203)", async () => {
+    const fetchToken = vi.fn(async () => "must-not-print");
+    setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
+      fetchToken,
+      getSandboxAgent: () => "hermes",
+      agentExposesToken: () => true,
+    }));
+    mocks.assertHermesPortableCommandUnavailable.mockImplementationOnce(() => {
+      throw new Error("schema-5 token rejected");
+    });
+
+    await expect(GatewayTokenCliCommand.run(["alpha", "--quiet"], rootDir)).rejects.toThrow(
+      "schema-5 token rejected",
+    );
+
+    expect(fetchToken).not.toHaveBeenCalled();
+    expect(mocks.runGatewayTokenCommand).not.toHaveBeenCalled();
   });
 
   it("maps dashboard-url flags to the dashboard URL action", async () => {
@@ -206,7 +349,7 @@ describe("simple global oclif adapters", () => {
     // NCQ #3180: legacy dispatch did not catch the @oclif/core ExitError
     // thrown by this.exit(1), surfacing a raw JS stack trace to the user.
     // The adapter must signal failure via process.exitCode instead.
-    mocks.runGatewayTokenCommand.mockImplementationOnce(() => {
+    mocks.runGatewayTokenCommand.mockImplementationOnce(async () => {
       throw new mocks.GatewayTokenCommandError("not applicable");
     });
     setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
@@ -234,7 +377,7 @@ describe("simple global oclif adapters", () => {
       "  For Hermes dashboard access, run: nemohermes hermes dashboard-url",
       "  Hermes dashboard auth is read from the in-sandbox config (~/.hermes/config.yaml), not a gateway token.",
     ];
-    mocks.runGatewayTokenCommand.mockImplementationOnce(() => {
+    mocks.runGatewayTokenCommand.mockImplementationOnce(async () => {
       throw new mocks.GatewayTokenCommandError(hermesLines, 1);
     });
     setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
@@ -249,9 +392,9 @@ describe("simple global oclif adapters", () => {
     try {
       await expect(GatewayTokenCliCommand.run(["hermes"], rootDir)).resolves.toBeUndefined();
       expect(process.exitCode).toBe(1);
-      for (const line of hermesLines) {
+      hermesLines.forEach((line) => {
         expect(errorSpy).toHaveBeenCalledWith(line);
-      }
+      });
       const combined = errorSpy.mock.calls.map((args) => args.join(" ")).join("\n");
       expect(combined).not.toMatch(/ExitError|@oclif\/core|at Object\.exit/);
     } finally {
@@ -263,7 +406,7 @@ describe("simple global oclif adapters", () => {
   it("clears a stale non-zero process.exitCode on a successful gateway-token run", async () => {
     // CodeRabbit #3182: if a prior run() left process.exitCode = 1, a later
     // successful invocation must still report success. Always overwrite.
-    mocks.runGatewayTokenCommand.mockReturnValueOnce(undefined);
+    mocks.runGatewayTokenCommand.mockResolvedValueOnce(undefined);
     setGatewayTokenRuntimeBridgeFactoryForTest(() => ({
       fetchToken: mocks.fetchGatewayAuthTokenFromSandbox,
       getSandboxAgent: () => "openclaw",
@@ -289,15 +432,20 @@ describe("simple global oclif adapters", () => {
 
   it("maps tunnel and deprecated service commands to service actions", async () => {
     await TunnelStartCommand.run([], rootDir);
+    expect(mocks.runStartCommand).toHaveBeenCalledTimes(1);
     await TunnelStopCommand.run([], rootDir);
+    await TunnelStatusCommand.run([], rootDir);
     await DeprecatedStartCommand.run([], rootDir);
+    expect(mocks.runStartCommand).toHaveBeenCalledTimes(1);
     await DeprecatedStopCommand.run([], rootDir);
 
-    expect(mocks.runStartCommand).toHaveBeenCalledTimes(2);
     expect(mocks.runStopCommand).toHaveBeenCalledTimes(2);
     expect(mocks.runStartCommand).toHaveBeenCalledWith(
       expect.objectContaining({ listSandboxes: expect.any(Function), startAll: mocks.startAll }),
     );
+    expect(mocks.resolveDefaultSandboxName).toHaveBeenCalledTimes(1);
+    expect(mocks.listSandboxes).toHaveBeenCalledTimes(1);
+    expect(mocks.showStatus).toHaveBeenCalledWith({ sandboxName: "resolved-sandbox" });
     expect(mocks.runStopCommand).toHaveBeenCalledWith(
       expect.objectContaining({ listSandboxes: expect.any(Function), stopAll: mocks.stopAll }),
     );

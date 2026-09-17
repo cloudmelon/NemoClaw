@@ -22,9 +22,12 @@ from urllib.parse import urljoin, urlparse, urlsplit
 _MANAGED_STATE_DIR = Path("/sandbox/.deepagents/.state")
 _AUTH_FILE = _MANAGED_STATE_DIR / "auth.json"
 _CODEX_AUTH_FILE = _MANAGED_STATE_DIR / "chatgpt-auth.json"
-_MCP_CONFIG_FILE = Path("/sandbox/.deepagents/.nemoclaw-mcp.json")
+_MCP_CONFIG_FILE = Path("/sandbox/.deepagents/.mcp.json")
 _INFERENCE_BASE_URL_FILE = Path(
     "/usr/local/share/nemoclaw/dcode-inference-base-url"
+)
+_UPSTREAM_PROVIDER_FILE = Path(
+    "/usr/local/share/nemoclaw/dcode-upstream-provider"
 )
 _MANAGED_PROXY_HOST_FILE = Path(
     "/usr/local/share/nemoclaw/dcode-proxy-host"
@@ -114,7 +117,7 @@ _DISPLAY_PROVIDER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # Match the launchers' root-owned, image-baked proxy validator. Its deliberate
 # RFC 1123 deviation permits underscores only for controlled internal/container
 # aliases such as `proxy_name`; the cross-boundary cases in
-# test/langchain-deepagents-code-proxy-launcher.test.ts prevent validator drift.
+# test/agents/deepagents/langchain-deepagents-code-proxy-launcher.test.ts prevent validator drift.
 _MANAGED_PROXY_HOST = re.compile(r"[A-Za-z0-9._-]+")
 _MCP_SERVER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 _MCP_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
@@ -171,10 +174,10 @@ _MANAGED_MCP_READY = False
 # SECURITY -- Source boundary: this isolated Python runtime cannot import the
 # canonical TypeScript groups in src/lib/security/secret-patterns.ts, so these
 # expressions deliberately mirror their secret-shape behavior.
-# Regression gate: test/langchain-deepagents-code-secret-pattern-parity.test.ts
+# Regression gate: test/agents/deepagents/langchain-deepagents-code-secret-pattern-parity.test.ts
 # fingerprints all canonical groups and runs one shared positive corpus through
 # both those groups and _contains_secret_shape; the Bash wrapper consumes the
-# same corpus in test/langchain-deepagents-code-image-credentials.test.ts.
+# same corpus in test/agents/deepagents/langchain-deepagents-code-image-credentials.test.ts.
 # Removal condition: delete this mirror only when the managed runtime can consume
 # the canonical patterns directly or upstream rejects these shapes before boot.
 _SECRET_PATTERNS = tuple(
@@ -231,11 +234,11 @@ def _is_openshell_placeholder_for_name(name: str, value: str) -> bool:
     if name == "OPENSHELL_TLS_KEY" or not _MCP_ENV_NAME.fullmatch(name):
         return False
     canonical = f"{_OPENSHELL_ENV_PLACEHOLDER_PREFIX}{name}"
-    versioned = re.fullmatch(
-        rf"{re.escape(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)}v[0-9]{{1,20}}_{re.escape(name)}",
+    generation_scoped = re.fullmatch(
+        rf"{re.escape(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)}(?:v[0-9]{{1,20}}|s[a-f0-9]{{64}})_{re.escape(name)}",
         value,
     )
-    return value == canonical or versioned is not None
+    return value == canonical or generation_scoped is not None
 
 
 def _is_managed_value(name: str, value: str) -> bool:
@@ -457,7 +460,10 @@ def _validate_managed_mcp_entry(
     if not placeholder.startswith(_OPENSHELL_ENV_PLACEHOLDER_PREFIX):
         raise RuntimeError(f"managed MCP server {server} must use an OpenShell placeholder")
     suffix = placeholder.removeprefix(_OPENSHELL_ENV_PLACEHOLDER_PREFIX)
-    match = re.fullmatch(r"(?:v[0-9]{1,20}_)?([A-Za-z_][A-Za-z0-9_]{0,127})", suffix)
+    match = re.fullmatch(
+        r"(?:(?:v[0-9]{1,20}|s[a-f0-9]{64})_)?([A-Za-z_][A-Za-z0-9_]{0,127})",
+        suffix,
+    )
     if match is None or not _is_openshell_placeholder_for_name(match.group(1), placeholder):
         raise RuntimeError(f"managed MCP server {server} has an invalid OpenShell placeholder")
     return {
@@ -1115,21 +1121,21 @@ def managed_fetch_proxy_url() -> str | None:
     return value
 
 
-def _read_managed_proxy_value(path: Path, label: str) -> str:
-    """Read one immutable proxy component from the managed image."""
+def _read_managed_file_value(path: Path, label: str) -> str:
+    """Read one root-owned, read-only value from the managed image."""
     if not path.is_file() or path.is_symlink():
-        raise RuntimeError(f"managed proxy {label} file is missing or unsafe")
+        raise RuntimeError(f"managed {label} file is missing or unsafe")
     try:
         metadata = path.stat()
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise RuntimeError(f"managed proxy {label} file is unreadable") from exc
+        raise RuntimeError(f"managed {label} file is unreadable") from exc
     if (
         metadata.st_uid != _MANAGED_FILE_OWNER_UID
         or stat.S_IMODE(metadata.st_mode) != 0o444
     ):
         raise RuntimeError(
-            f"managed proxy {label} file has unsafe ownership or mode"
+            f"managed {label} file has unsafe ownership or mode"
         )
     value = raw.rstrip("\n")
     if (
@@ -1139,14 +1145,14 @@ def _read_managed_proxy_value(path: Path, label: str) -> str:
         or value != value.strip()
         or any(ord(character) < 32 for character in value)
     ):
-        raise RuntimeError(f"managed proxy {label} file has invalid contents")
+        raise RuntimeError(f"managed {label} file has invalid contents")
     return value
 
 
 def _managed_fetch_proxy_url_from_files() -> str:
     """Derive the trusted proxy URL independently from root-owned files."""
-    host = _read_managed_proxy_value(_MANAGED_PROXY_HOST_FILE, "host")
-    port = _read_managed_proxy_value(_MANAGED_PROXY_PORT_FILE, "port")
+    host = _read_managed_file_value(_MANAGED_PROXY_HOST_FILE, "proxy host")
+    port = _read_managed_file_value(_MANAGED_PROXY_PORT_FILE, "proxy port")
     if _MANAGED_PROXY_HOST.fullmatch(host) is None:
         raise RuntimeError("managed proxy host file has invalid contents")
     if (
@@ -1155,6 +1161,16 @@ def _managed_fetch_proxy_url_from_files() -> str:
     ):
         raise RuntimeError("managed proxy port file has invalid contents")
     return f"http://{host}:{port}"
+
+
+def _managed_upstream_provider() -> str:
+    """Return the root-owned upstream provider."""
+    value = _read_managed_file_value(
+        _UPSTREAM_PROVIDER_FILE, "upstream provider"
+    )
+    if _DISPLAY_PROVIDER_NAME.fullmatch(value) is None:
+        raise RuntimeError("managed upstream provider file has invalid contents")
+    return value
 
 
 def _managed_fetch_ca_bundle() -> tuple[int, str]:
@@ -1472,6 +1488,7 @@ def assert_safe_runtime() -> None:
     """Reject unmanaged runtime credentials before dcode bootstraps settings."""
     _assert_safe_environment()
     _assert_safe_auth_state()
+    os.environ[_UPSTREAM_PROVIDER_ENV] = _managed_upstream_provider()
     managed_fetch_proxy_url()
     base_url = managed_inference_base_url()
     os.environ["OPENAI_BASE_URL"] = base_url

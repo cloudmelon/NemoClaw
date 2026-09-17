@@ -98,7 +98,7 @@ gh_api() {
   local url="$1"
   local -a auth=()
   [[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-  curl -fsSL --retry 3 --retry-delay 1 --retry-all-errors \
+  curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 1 --retry-all-errors \
     --connect-timeout 10 --max-time 60 \
     -H "Accept: application/vnd.github+json" "${auth[@]}" "$url"
 }
@@ -198,12 +198,11 @@ installed_copy_schema_error() {
     for item in \
       "validate-hermes-env-secret-boundary.py" \
       "seed-hermes-dashboard-config.py" \
-      "COPY agents/hermes/build-mcp-digest.py /usr/local/lib/nemoclaw/build-hermes-mcp-digest.py" \
-      "/opt/hermes/.venv/bin/python -I /usr/local/lib/nemoclaw/build-hermes-mcp-digest.py --guard /usr/local/lib/nemoclaw/hermes-runtime-config-guard.py" \
+      "sha256sum /sandbox/.hermes/config.yaml /sandbox/.hermes/.env" \
       "hermes-mcp-config-transaction.py" \
-      "openshell-child-visible-credentials.v0.0.101.json" \
+      "openshell-child-visible-credentials.v0.0.116.json" \
       "HERMES_HOME=/sandbox/.hermes /usr/local/bin/hermes doctor --fix" \
-      "node --experimental-strip-types /opt/nemoclaw-hermes-config/generate-config.ts" \
+      "node /opt/nemoclaw-hermes-config/generate-config.ts" \
       "/sandbox/.hermes/profiles/dashboard-home"; do
       grep -Fq "$item" "$dockerfile" || missing+=("marker ${item}")
     done
@@ -327,7 +326,7 @@ trap 'rm -rf "$WORKDIR_TMP"' EXIT
 TARBALL="${WORKDIR_TMP}/hermes-${TAG}.tar.gz"
 TARBALL_URL="https://github.com/${GITHUB_REPO}/archive/refs/tags/${TAG}.tar.gz"
 echo "Downloading ${TARBALL_URL}"
-curl -fsSL --retry 3 --retry-delay 1 --retry-all-errors \
+curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 1 --retry-all-errors \
   --connect-timeout 10 --max-time 300 \
   -o "$TARBALL" "$TARBALL_URL"
 

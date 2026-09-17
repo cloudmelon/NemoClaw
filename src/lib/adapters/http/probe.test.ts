@@ -552,49 +552,44 @@ describe("http-probe helpers", () => {
     expect(spawnedEnv?.MY_SECRET_TOKEN).toBeUndefined();
   });
 
-  it("bypasses ambient proxies when --resolve pins the validated origin (#6293)", () => {
-    let spawnedEnv: NodeJS.ProcessEnv | undefined;
-    runCurlProbe(
-      ["-sS", "--resolve", "example.test:443:93.184.216.34", "https://example.test/models"],
-      {
-        pinnedAddresses: ["93.184.216.34"],
-        replaceEnv: true,
-        env: {
-          PATH: "/usr/bin",
-          HTTP_PROXY: "http://proxy.internal:3128",
-          HTTPS_PROXY: "http://proxy.internal:3128",
-          ALL_PROXY: "socks5://proxy.internal:1080",
-          http_proxy: "http://proxy.internal:3128",
-          https_proxy: "http://proxy.internal:3128",
-          all_proxy: "socks5://proxy.internal:1080",
+  it.each(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"])(
+    "bypasses ambient proxies when --resolve pins the validated origin [%s] (#6293)",
+    (name) => {
+      let spawnedEnv: NodeJS.ProcessEnv | undefined;
+      runCurlProbe(
+        ["-sS", "--resolve", "example.test:443:93.184.216.34", "https://example.test/models"],
+        {
+          pinnedAddresses: ["93.184.216.34"],
+          replaceEnv: true,
+          env: {
+            PATH: "/usr/bin",
+            HTTP_PROXY: "http://proxy.internal:3128",
+            HTTPS_PROXY: "http://proxy.internal:3128",
+            ALL_PROXY: "socks5://proxy.internal:1080",
+            http_proxy: "http://proxy.internal:3128",
+            https_proxy: "http://proxy.internal:3128",
+            all_proxy: "socks5://proxy.internal:1080",
+          },
+          spawnSyncImpl: (_command, _args, options) => {
+            spawnedEnv = options.env as NodeJS.ProcessEnv;
+            return {
+              pid: 1,
+              output: [],
+              stdout: "200",
+              stderr: "",
+              status: 0,
+              signal: null,
+            };
+          },
         },
-        spawnSyncImpl: (_command, _args, options) => {
-          spawnedEnv = options.env as NodeJS.ProcessEnv;
-          return {
-            pid: 1,
-            output: [],
-            stdout: "200",
-            stderr: "",
-            status: 0,
-            signal: null,
-          };
-        },
-      },
-    );
+      );
 
-    for (const name of [
-      "HTTP_PROXY",
-      "HTTPS_PROXY",
-      "ALL_PROXY",
-      "http_proxy",
-      "https_proxy",
-      "all_proxy",
-    ]) {
       expect(spawnedEnv?.[name]).toBeUndefined();
-    }
-    expect(spawnedEnv?.NO_PROXY).toBe("*");
-    expect(spawnedEnv?.no_proxy).toBe("*");
-  });
+
+      expect(spawnedEnv?.NO_PROXY).toBe("*");
+      expect(spawnedEnv?.no_proxy).toBe("*");
+    },
+  );
 
   it.each([
     "http://127.0.0.1:8000/v1/models",
@@ -626,16 +621,11 @@ describe("http-probe helpers", () => {
       },
     });
 
-    for (const name of [
-      "HTTP_PROXY",
-      "HTTPS_PROXY",
-      "ALL_PROXY",
-      "http_proxy",
-      "https_proxy",
-      "all_proxy",
-    ]) {
-      expect(spawnedEnv?.[name]).toBeUndefined();
-    }
+    expect(
+      ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"].every(
+        (name) => spawnedEnv?.[name] === undefined,
+      ),
+    ).toBe(true);
     expect(spawnedEnv?.NO_PROXY).toBe("*");
     expect(spawnedEnv?.no_proxy).toBe("*");
   });
@@ -1031,6 +1021,75 @@ describe("runAnthropicStreamingEventProbe", () => {
     expect(result.missingEvents).toEqual([]);
     expect(result.duplicateEvents).toEqual([]);
     expect(result.sequenceErrors).toEqual([]);
+    expect(result.toolCallErrors).toEqual([]);
+  });
+
+  it("passes when the stream emits the required native tool call", () => {
+    const nativeToolStream = [
+      "event: message_start",
+      'data: {"type":"message_start","message":{"id":"msg_1"}}',
+      "",
+      "event: content_block_start",
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"emit_ok","input":{}}}',
+      "",
+      "event: content_block_delta",
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"value\\":\\"OK\\"}"}}',
+      "",
+      "event: content_block_stop",
+      'data: {"type":"content_block_stop","index":0}',
+      "",
+      "event: message_delta",
+      'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+      "",
+      "event: message_stop",
+      'data: {"type":"message_stop"}',
+      "",
+    ].join("\n");
+
+    const result = runAnthropicStreamingEventProbe(
+      ["-sS", "--max-time", "15", "https://example.test/v1/messages"],
+      { spawnSyncImpl: mockStreaming(nativeToolStream) },
+      { expectedToolName: "emit_ok" },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.toolCallErrors).toEqual([]);
+  });
+
+  it("rejects JSON-shaped assistant text instead of a native tool call (#7967)", () => {
+    const flattenedToolStream = [
+      "event: message_start",
+      'data: {"type":"message_start","message":{"id":"msg_1"}}',
+      "",
+      "event: content_block_start",
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      "",
+      "event: content_block_delta",
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"{\\"name\\":\\"emit_ok\\",\\"arguments\\":{\\"value\\":\\"OK\\"}}"}}',
+      "",
+      "event: content_block_stop",
+      'data: {"type":"content_block_stop","index":0}',
+      "",
+      "event: message_delta",
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+      "",
+      "event: message_stop",
+      'data: {"type":"message_stop"}',
+      "",
+    ].join("\n");
+
+    const result = runAnthropicStreamingEventProbe(
+      ["-sS", "--max-time", "15", "https://example.test/v1/messages"],
+      { spawnSyncImpl: mockStreaming(flattenedToolStream) },
+      { expectedToolName: "emit_ok" },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.toolCallErrors).toEqual([
+      "missing-expected-tool-use",
+      "missing-tool-use-stop-reason",
+    ]);
+    expect(result.message).toContain("required structured tool_use content block");
   });
 
   it("rejects a non-2xx response even when its body looks like valid SSE", () => {

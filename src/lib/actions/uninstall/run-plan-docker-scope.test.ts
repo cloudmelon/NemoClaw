@@ -14,8 +14,8 @@ function ok(stdout = ""): RunResult {
   return { status: 0, stdout, stderr: "" };
 }
 
-function runUninstallPlan(options: UninstallRunOptions, deps: UninstallRunDeps) {
-  return runUninstallPlanBase(options, {
+async function runUninstallPlan(options: UninstallRunOptions, deps: UninstallRunDeps) {
+  return await runUninstallPlanBase(options, {
     resolveGatewayTeardownAuthority: ({ gatewayName, gatewayPort }) => ({
       gatewayName,
       gatewayPort,
@@ -41,15 +41,19 @@ const PS_OUTPUT = [
   // leaves a randomly named container that only its image identifies.
   "c-probe nemoclaw-hermes-sandbox-base-local:image-abc nostalgic_curie",
   "c-openclaw ghcr.io/openclaw/openclaw:latest my-openclaw-test",
+  "c-registry registry.example.com/nemoclaw/tool:1 registry-tool",
   "c-unrelated redis:7 cache",
 ].join("\n");
 
 const IMAGES_OUTPUT = [
   "i-nemoclaw ghcr.io/nvidia/nemoclaw:test",
+  "i-managed ghcr.io/nvidia/nemoclaw/openclaw-sandbox:latest",
   // The gateway builds sandbox images under this repository, so the `openshell`
   // half of the filter selects real resources and must stay covered.
   "i-openshell openshell/sandbox-from:1780294581",
   "i-openclaw ghcr.io/openclaw/openclaw:latest",
+  "i-tag python:3.12-nemoclaw",
+  "i-registry registry.example.com/nemoclaw/tool:1",
   "i-unrelated redis:7",
 ].join("\n");
 
@@ -66,7 +70,7 @@ function collectDockerCalls(): { calls: string[][]; runDocker: UninstallRunDeps[
   return { calls, runDocker };
 }
 
-function runWithDockerInventory(): string[][] {
+async function runWithDockerInventory(): Promise<string[][]> {
   const { calls, runDocker } = collectDockerCalls();
   const run = vi.fn((command: string, args: string[]) => {
     const stubbed: Record<string, RunResult> = {
@@ -81,7 +85,7 @@ function runWithDockerInventory(): string[][] {
     );
   });
 
-  const result = runUninstallPlan(
+  const result = await runUninstallPlan(
     { assumeYes: true, deleteModels: false, keepOpenShell: true },
     {
       commandExists: () => true,
@@ -105,41 +109,45 @@ function runWithDockerInventory(): string[][] {
 }
 
 describe("uninstall Docker resource scope", () => {
-  it("keeps containers belonging to the separate OpenClaw project (#8496)", () => {
-    const calls = runWithDockerInventory();
+  it("keeps containers belonging to the separate OpenClaw project (#8496)", async () => {
+    const calls = await runWithDockerInventory();
 
     expect(calls).not.toContainEqual(["rm", "-f", "c-openclaw"]);
+    expect(calls).not.toContainEqual(["rm", "-f", "c-registry"]);
     expect(calls).not.toContainEqual(["rm", "-f", "c-unrelated"]);
   });
 
-  it("keeps images belonging to the separate OpenClaw project (#8496)", () => {
-    const calls = runWithDockerInventory();
+  it("keeps images belonging to the separate OpenClaw project (#8496)", async () => {
+    const calls = await runWithDockerInventory();
 
     expect(calls).not.toContainEqual(["rmi", "-f", "i-openclaw"]);
+    expect(calls).not.toContainEqual(["rmi", "-f", "i-tag"]);
+    expect(calls).not.toContainEqual(["rmi", "-f", "i-registry"]);
     expect(calls).not.toContainEqual(["rmi", "-f", "i-unrelated"]);
   });
 
-  it("still removes the gateway and sandbox containers it owns by name", () => {
-    const calls = runWithDockerInventory();
+  it("still removes the gateway and sandbox containers it owns by name", async () => {
+    const calls = await runWithDockerInventory();
 
     expect(calls).toContainEqual(["rm", "-f", "c-cluster"]);
     expect(calls).toContainEqual(["rm", "-f", "c-sandbox"]);
   });
 
-  it("still reclaims a randomly named probe container by its NemoClaw image", () => {
-    const calls = runWithDockerInventory();
+  it("still reclaims a randomly named probe container by its NemoClaw image", async () => {
+    const calls = await runWithDockerInventory();
 
     expect(calls).toContainEqual(["rm", "-f", "c-probe"]);
   });
 
-  it("still removes NemoClaw images published under a registry path", () => {
-    const calls = runWithDockerInventory();
+  it("still removes NemoClaw images published under a registry path", async () => {
+    const calls = await runWithDockerInventory();
 
     expect(calls).toContainEqual(["rmi", "-f", "i-nemoclaw"]);
+    expect(calls).toContainEqual(["rmi", "-f", "i-managed"]);
   });
 
-  it("still removes gateway-built OpenShell sandbox images", () => {
-    const calls = runWithDockerInventory();
+  it("still removes gateway-built OpenShell sandbox images", async () => {
+    const calls = await runWithDockerInventory();
 
     expect(calls).toContainEqual(["rmi", "-f", "i-openshell"]);
   });

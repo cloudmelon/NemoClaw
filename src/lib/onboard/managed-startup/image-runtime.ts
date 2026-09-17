@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, X509Certificate } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { PEM_CERTIFICATE_RE_GLOBAL } from "../corporate-ca-policy";
 import {
   type ManagedStartupAgentEnvironment,
   type ManagedStartupAgentMaterial,
@@ -51,6 +52,17 @@ export const MANAGED_STARTUP_MERGED_CA_FILE = "/run/nemoclaw/managed-startup-ca-
 export const MANAGED_STARTUP_COMPLETION_FILE = "/run/nemoclaw/managed-startup-complete.json";
 
 const MANAGED_STARTUP_CORPORATE_CA_FILE = "/usr/local/share/nemoclaw/corporate-ca.pem";
+const MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY = "/usr/local/share/ca-certificates";
+const MANAGED_STARTUP_SYSTEM_CA_ANCHOR_RE = /^nemoclaw-corporate-ca-[0-9]{2}\.crt$/u;
+const SYSTEM_CA_BUNDLE_FILE = "/etc/ssl/certs/ca-certificates.crt";
+const UPDATE_CA_CERTIFICATES_EXECUTABLE = "/usr/sbin/update-ca-certificates";
+const MANAGED_STARTUP_TLS_ENV_NAMES = new Set([
+  "CURL_CA_BUNDLE",
+  "GIT_SSL_CAINFO",
+  "NODE_EXTRA_CA_CERTS",
+  "REQUESTS_CA_BUNDLE",
+  "SSL_CERT_FILE",
+]);
 const MESSAGING_RUNTIME_PLAN_FILE = "/usr/local/share/nemoclaw/messaging-runtime-plan.json";
 const ROOT_STATE_PARENT = "/var/lib/nemoclaw";
 const ROOT_RUNTIME_DIRECTORY = "/run/nemoclaw";
@@ -83,14 +95,12 @@ interface ManagedStartupApplyMessagingConstructionActionBase {
   readonly mode: "apply" | "clear";
 }
 
-export interface ManagedStartupApplyMessagingRuntimeConstructionAction
-  extends ManagedStartupApplyMessagingConstructionActionBase {
+export interface ManagedStartupApplyMessagingRuntimeConstructionAction extends ManagedStartupApplyMessagingConstructionActionBase {
   readonly phase: "runtime-setup";
   readonly runAs: "root";
 }
 
-export interface ManagedStartupApplyMessagingConfigConstructionAction
-  extends ManagedStartupApplyMessagingConstructionActionBase {
+export interface ManagedStartupApplyMessagingConfigConstructionAction extends ManagedStartupApplyMessagingConstructionActionBase {
   readonly phase: "post-agent-install";
   readonly runAs: "sandbox";
 }
@@ -508,23 +518,13 @@ function execute(
 function generatorCommand(agent: ManagedStartupAgent): readonly string[] {
   switch (agent) {
     case "openclaw":
-      return [
-        "/usr/local/bin/node",
-        "--experimental-strip-types",
-        "/scripts/generate-openclaw-config.mts",
-      ];
+      return ["/usr/local/bin/node", "/scripts/generate-openclaw-config.mts"];
     case "hermes":
-      return [
-        "/usr/local/bin/node",
-        "--experimental-strip-types",
-        "/opt/nemoclaw-hermes-config/generate-config.ts",
-      ];
+      return ["/usr/local/bin/node", "/opt/nemoclaw-hermes-config/generate-config.ts"];
     case "langchain-deepagents-code":
-      return [
-        "/usr/local/bin/node",
-        "--experimental-strip-types",
-        "/opt/nemoclaw-deepagents-code/generate-config.ts",
-      ];
+      return ["/usr/local/bin/node", "/opt/nemoclaw-deepagents-code/generate-config.ts"];
+    case "pi":
+      return ["/usr/local/bin/node", "/opt/nemoclaw-pi/generate-config.ts"];
   }
 }
 
@@ -535,7 +535,6 @@ function messagingCommand(
 ): readonly string[] {
   return [
     "/usr/local/bin/node",
-    "--experimental-strip-types",
     "/src/lib/messaging/applier/build/messaging-build-applier.mts",
     "--agent",
     agent,
@@ -837,9 +836,6 @@ export function installHermesManagedPolicy(
  * Restore the mutable Hermes image contract after its sandbox-side generator
  * atomically replaces config.yaml or .env with mode 0600. The mode transition
  * is performed through the already-authenticated descriptor, never by path.
- *
- * Shields-up turns these files into root:root 0444 trust anchors. That state is
- * valid on an already-committed replay and must not be made mutable again.
  */
 export function normalizeHermesManagedConfigDescriptor(
   target: string,
@@ -871,13 +867,12 @@ export function normalizeHermesManagedConfigDescriptor(
       before.uid === BigInt(sandboxIdentity.uid) &&
       before.gid === BigInt(sandboxIdentity.gid) &&
       (beforeMode === 0o600 || beforeMode === 0o640);
-    const shielded = before.uid === 0n && before.gid === 0n && beforeMode === 0o444;
-    if (!before.isFile() || before.nlink !== 1n || (!mutable && !shielded)) {
+    if (!before.isFile() || before.nlink !== 1n || !mutable) {
       fail(`refusing unexpected Hermes managed config descriptor ${target}`);
     }
 
-    const expectedMode = mutable ? 0o640 : 0o444;
-    if (mutable && beforeMode === 0o600) {
+    const expectedMode = 0o640;
+    if (beforeMode === 0o600) {
       try {
         fs.fchmodSync(descriptor, expectedMode);
       } catch {
@@ -892,8 +887,8 @@ export function normalizeHermesManagedConfigDescriptor(
     } catch {
       fail(`Hermes managed config descriptor disappeared during normalization: ${target}`);
     }
-    const expectedUid = mutable ? BigInt(sandboxIdentity.uid) : 0n;
-    const expectedGid = mutable ? BigInt(sandboxIdentity.gid) : 0n;
+    const expectedUid = BigInt(sandboxIdentity.uid);
+    const expectedGid = BigInt(sandboxIdentity.gid);
     if (
       !after.isFile() ||
       after.nlink !== 1n ||
@@ -938,28 +933,9 @@ function sealHermesConfiguration(
   const envPath = "/sandbox/.hermes/.env";
   const config = readStableRegularFile(configPath, 4 * 1024 * 1024);
   const env = readStableRegularFile(envPath, 512 * 1024);
-  const digest = execute(
-    [
-      "/opt/hermes/.venv/bin/python3",
-      "-I",
-      "/usr/local/lib/nemoclaw/build-hermes-mcp-digest.py",
-      "--guard",
-      "/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py",
-      "--config",
-      configPath,
-    ],
-    "root",
-    configurationEnvironment,
-    applicationRuntime,
-    true,
-  ).stdout.trim();
-  if (!SHA256_RE.test(digest)) {
-    fail("Hermes MCP digest helper returned an invalid digest");
-  }
   const hashText = [
     `${createHash("sha256").update(config).digest("hex")}  ${configPath}`,
     `${createHash("sha256").update(env).digest("hex")}  ${envPath}`,
-    `# nemoclaw-hermes-mcp-state-v1 intended=${digest} applied=${digest}`,
     "",
   ].join("\n");
   atomicWriteRootFile("/etc/nemoclaw/hermes.config-hash", hashText, 0o444);
@@ -1009,6 +985,111 @@ function installCorporateCa(corporateCaPath: string | null): void {
   atomicWriteRootFile(MANAGED_STARTUP_CORPORATE_CA_FILE, bytes, 0o444);
 }
 
+function corporateCaCertificateBlocks(corporateCaPath: string): readonly string[] {
+  const corporate = readStableRegularFile(corporateCaPath, 128 * 1024).toString("utf8");
+  const blocks = corporate.match(PEM_CERTIFICATE_RE_GLOBAL);
+  if (!blocks || blocks.length === 0) {
+    fail("corporate CA material contains no certificate");
+  }
+  for (const block of blocks) {
+    try {
+      if (!new X509Certificate(block).ca) {
+        fail("corporate CA material contains a certificate that is not a CA");
+      }
+    } catch (error) {
+      if (error instanceof ManagedStartupImageRuntimeError) throw error;
+      fail("corporate CA material contains an invalid certificate");
+    }
+  }
+  return blocks.map((block) => `${block.trim()}\n`);
+}
+
+function managedSystemCaAnchorNames(): readonly string[] {
+  try {
+    fs.lstatSync(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    fail("could not inspect the managed system CA anchor directory");
+  }
+  requireRootOwnedDirectory(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, ROOT_OWNED_DIRECTORY_MODE);
+  try {
+    return (fs.readdirSync(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY) as string[])
+      .filter((name) => MANAGED_STARTUP_SYSTEM_CA_ANCHOR_RE.test(name))
+      .sort();
+  } catch (error) {
+    fail("could not inspect the managed system CA anchors");
+  }
+}
+
+function refreshSystemCaBundle(): void {
+  if (!trustedExecutable(UPDATE_CA_CERTIFICATES_EXECUTABLE)) {
+    fail(`a trusted ${UPDATE_CA_CERTIFICATES_EXECUTABLE} executable is required`);
+  }
+  const result = spawnSync(UPDATE_CA_CERTIFICATES_EXECUTABLE, [], {
+    encoding: "utf8",
+    env: { PATH: FIXED_PATH },
+    stdio: "inherit",
+  });
+  if (result.error) {
+    fail(`could not execute ${UPDATE_CA_CERTIFICATES_EXECUTABLE}: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    fail(
+      `${UPDATE_CA_CERTIFICATES_EXECUTABLE} exited with status ${String(result.status ?? "unknown")}`,
+    );
+  }
+}
+
+function requireSystemCaBundleContains(blocks: readonly string[]): void {
+  const systemBundle = safeTrustBundle(SYSTEM_CA_BUNDLE_FILE);
+  if (systemBundle === null) fail("the refreshed system CA bundle is missing");
+  const systemBlocks = systemBundle.toString("utf8").match(PEM_CERTIFICATE_RE_GLOBAL) ?? [];
+  const systemFingerprints = new Set<string>();
+  for (const block of systemBlocks) {
+    try {
+      systemFingerprints.add(new X509Certificate(block).fingerprint256);
+    } catch {
+      fail("the refreshed system CA bundle contains an invalid certificate");
+    }
+  }
+  for (const block of blocks) {
+    if (!systemFingerprints.has(new X509Certificate(block).fingerprint256)) {
+      fail("the refreshed system CA bundle does not contain the corporate CA");
+    }
+  }
+}
+
+export function installCorporateCaSystemAnchors(corporateCaPath: string | null): void {
+  const existingNames = managedSystemCaAnchorNames();
+  if (corporateCaPath === null) {
+    for (const name of existingNames) {
+      removeSafeRootFile(path.join(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, name));
+    }
+    refreshSystemCaBundle();
+    return;
+  }
+
+  ensureRootOwnedDirectory(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY);
+  const blocks = corporateCaCertificateBlocks(corporateCaPath);
+  const expectedNames = blocks.map(
+    (_block, index) => `nemoclaw-corporate-ca-${String(index + 1).padStart(2, "0")}.crt`,
+  );
+  for (const name of existingNames) {
+    if (!expectedNames.includes(name)) {
+      removeSafeRootFile(path.join(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, name));
+    }
+  }
+  for (const [index, name] of expectedNames.entries()) {
+    atomicWriteRootFile(
+      path.join(MANAGED_STARTUP_SYSTEM_CA_ANCHOR_DIRECTORY, name),
+      blocks[index] as string,
+      0o444,
+    );
+  }
+  refreshSystemCaBundle();
+  requireSystemCaBundleContains(blocks);
+}
+
 function safeTrustBundle(target: string): Buffer | null {
   try {
     const { bytes, stat } = readStableRegularFileSnapshot(target, MAX_TRUST_BUNDLE_BYTES);
@@ -1056,7 +1137,7 @@ function shellSingleQuote(value: string): string {
   if (value.includes("\0") || /[\r\n]/u.test(value)) {
     fail("runtime environment values must be single-line text");
   }
-  return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 export function serializeManagedStartupRuntimeEnvironment(
@@ -1098,14 +1179,8 @@ function materializeManagedStartupRuntimeEnvironment(
     NEMOCLAW_MANAGED_STARTUP_APPLIED: "1",
   };
   if (corporateCaMerged) {
-    for (const name of [
-      "CURL_CA_BUNDLE",
-      "GIT_SSL_CAINFO",
-      "NODE_EXTRA_CA_CERTS",
-      "REQUESTS_CA_BUNDLE",
-      "SSL_CERT_FILE",
-    ]) {
-      output[name] = MANAGED_STARTUP_MERGED_CA_FILE;
+    for (const name of MANAGED_STARTUP_TLS_ENV_NAMES) {
+      delete output[name];
     }
     output._NEMOCLAW_CORPORATE_CA_MERGED = "1";
   }
@@ -1115,8 +1190,14 @@ function materializeManagedStartupRuntimeEnvironment(
     }
   }
   const unsetNames = new Set([
-    ...Object.keys(configurationEnvironment).filter((name) => !Object.hasOwn(output, name)),
-    ...validatedApplicationRuntime.unsetEnvironment,
+    ...Object.keys(configurationEnvironment).filter(
+      (name) =>
+        !Object.hasOwn(output, name) &&
+        (!corporateCaMerged || !MANAGED_STARTUP_TLS_ENV_NAMES.has(name)),
+    ),
+    ...validatedApplicationRuntime.unsetEnvironment.filter(
+      (name) => !corporateCaMerged || !MANAGED_STARTUP_TLS_ENV_NAMES.has(name),
+    ),
   ]);
   for (const name of validatedApplicationRuntime.unsetEnvironment) {
     if (Object.hasOwn(output, name)) {
@@ -1325,6 +1406,7 @@ function applyAdapter(
   }
   installRootOwnedMaterials(mapped.materials);
   installCorporateCa(context.corporateCaPath);
+  installCorporateCaSystemAnchors(context.corporateCaPath);
   mergeCorporateCa(context.corporateCaPath);
 }
 
@@ -1374,8 +1456,7 @@ export async function applyManagedStartupImageProfile(
     fail(`mapped ${mapped.agent} environment for ${result.application.profile.agent}`);
   }
   if (expectedAgent === "hermes" && !result.adapterApplied) {
-    // Committed startup replays still repair generator-created 0600 files,
-    // while the descriptor guard preserves root-owned shields-up files.
+    // Committed startup replays still repair generator-created 0600 files.
     normalizeHermesManagedConfiguration();
   }
   let corporateCaMerged: boolean;
@@ -1394,6 +1475,7 @@ export async function applyManagedStartupImageProfile(
         fail("committed corporate CA material drifted");
       }
     }
+    installCorporateCaSystemAnchors(result.application.corporateCaPath);
     corporateCaMerged = mergeCorporateCa(result.application.corporateCaPath);
   }
   const runtimeEnvironment = serializeManagedStartupRuntimeEnvironment(

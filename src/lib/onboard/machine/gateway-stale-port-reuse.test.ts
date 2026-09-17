@@ -45,8 +45,9 @@ describe("classifyGatewayPortReuse", () => {
     ).toBe("reuse");
   });
 
-  it("returns reuse when the CLI lacks lifecycle commands, regardless of container state", () => {
-    for (const containerState of ["missing", "running", "unknown"] as GatewayContainerState[]) {
+  it.each(["missing", "running", "unknown"] as GatewayContainerState[])(
+    "returns reuse when the CLI lacks lifecycle commands, regardless of container state [case %#]",
+    (containerState) => {
       expect(
         classifyGatewayPortReuse({
           gatewayReuseState: "healthy",
@@ -54,11 +55,12 @@ describe("classifyGatewayPortReuse", () => {
           containerState,
         }),
       ).toBe("reuse");
-    }
-  });
+    },
+  );
 
-  it("returns skip for any non-healthy recorded state", () => {
-    for (const gatewayReuseState of NON_HEALTHY_STATES) {
+  it.each(NON_HEALTHY_STATES)(
+    "returns skip for any non-healthy recorded state [case %#]",
+    (gatewayReuseState) => {
       expect(
         classifyGatewayPortReuse({
           gatewayReuseState,
@@ -66,14 +68,13 @@ describe("classifyGatewayPortReuse", () => {
           containerState: "missing",
         }),
       ).toBe("skip");
-    }
-  });
+    },
+  );
 });
 
 const BASE_INPUT = {
   kind: "gateway" as const,
   port: 8080,
-  dashboardPort: 18789,
   label: "OpenShell gateway",
   runtimeDisplayName: "NemoClaw",
   gatewayName: "nemoclaw",
@@ -88,12 +89,50 @@ describe("applyHealthyPortReuse", () => {
     vi.restoreAllMocks();
   });
 
+  it("reuses a provider-owned gateway without Docker container inspection (#10984)", async () => {
+    const destroyGateway = vi.fn(() => true);
+    const checkPortAvailable = vi.fn();
+    const verifyGatewayContainerRunning = vi.fn();
+
+    await expect(
+      applyHealthyPortReuse({
+        ...BASE_INPUT,
+        managedGatewayObservationAuthoritative: true,
+        destroyGateway,
+        checkPortAvailable,
+        verifyGatewayContainerRunning,
+      }),
+    ).resolves.toBe("continue");
+    expect(verifyGatewayContainerRunning).not.toHaveBeenCalled();
+    expect(destroyGateway).not.toHaveBeenCalled();
+    expect(checkPortAvailable).not.toHaveBeenCalled();
+  });
+
+  it("rejects stale provider-owned reuse without Docker container inspection (#10984)", async () => {
+    const destroyGateway = vi.fn(() => true);
+    const checkPortAvailable = vi.fn();
+    const verifyGatewayContainerRunning = vi.fn();
+
+    await expect(
+      applyHealthyPortReuse({
+        ...BASE_INPUT,
+        gatewayReuseState: "stale",
+        managedGatewayObservationAuthoritative: true,
+        destroyGateway,
+        checkPortAvailable,
+        verifyGatewayContainerRunning,
+      }),
+    ).resolves.toBeNull();
+    expect(verifyGatewayContainerRunning).not.toHaveBeenCalled();
+    expect(destroyGateway).not.toHaveBeenCalled();
+    expect(checkPortAvailable).not.toHaveBeenCalled();
+  });
+
   it("returns null when recorded state is not healthy", async () => {
     const result = await applyHealthyPortReuse({
       ...BASE_INPUT,
       gatewayReuseState: "missing",
       destroyGateway: () => true,
-      runOpenshell: vi.fn(),
       checkPortAvailable: vi.fn(),
       verifyGatewayContainerRunning: vi.fn(),
     });
@@ -106,82 +145,73 @@ describe("applyHealthyPortReuse", () => {
       kind: "other",
       port: 9999,
       destroyGateway: () => true,
-      runOpenshell: vi.fn(),
       checkPortAvailable: vi.fn(),
       verifyGatewayContainerRunning: vi.fn(),
     });
     expect(result).toBeNull();
   });
 
-  it.each([
-    "healthy",
-    "missing",
-  ] as GatewayReuseState[])("preserves an externally supervised gateway port for downstream attachment from %s state (#6576)", async (gatewayReuseState) => {
-    const destroyGateway = vi.fn(() => true);
-    const runOpenshell = vi.fn();
-    const checkPortAvailable = vi.fn();
-    const verifyGatewayContainerRunning = vi.fn(() => "missing" as GatewayContainerState);
+  it.each(["healthy", "missing"] as GatewayReuseState[])(
+    "preserves an externally supervised gateway port for downstream attachment from %s state (#6576)",
+    async (gatewayReuseState) => {
+      const destroyGateway = vi.fn(() => true);
+      const checkPortAvailable = vi.fn();
+      const verifyGatewayContainerRunning = vi.fn(() => "missing" as GatewayContainerState);
 
-    const result = await applyHealthyPortReuse({
-      ...BASE_INPUT,
-      gatewayReuseState,
-      externallySupervised: true,
-      destroyGateway,
-      runOpenshell,
-      checkPortAvailable,
-      verifyGatewayContainerRunning,
-    });
+      const result = await applyHealthyPortReuse({
+        ...BASE_INPUT,
+        gatewayReuseState,
+        externallySupervised: true,
+        destroyGateway,
+        checkPortAvailable,
+        verifyGatewayContainerRunning,
+      });
 
-    expect(result).toBe("continue");
-    expect(verifyGatewayContainerRunning).not.toHaveBeenCalled();
-    expect(destroyGateway).not.toHaveBeenCalled();
-    expect(runOpenshell).not.toHaveBeenCalled();
-    expect(checkPortAvailable).not.toHaveBeenCalled();
-  });
+      expect(result).toBe("continue");
+      expect(verifyGatewayContainerRunning).not.toHaveBeenCalled();
+      expect(destroyGateway).not.toHaveBeenCalled();
+      expect(checkPortAvailable).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     { gatewayReuseState: "missing", port: 18789, relationship: "distinct" },
     { gatewayReuseState: "healthy", port: 18789, relationship: "distinct" },
     { gatewayReuseState: "missing", port: 8080, relationship: "equal-number" },
     { gatewayReuseState: "healthy", port: 8080, relationship: "equal-number" },
-  ] as const)("retains conflict handling for a $relationship external dashboard from $gatewayReuseState state (#6576)", async ({
-    gatewayReuseState,
-    port,
-  }) => {
-    const destroyGateway = vi.fn(() => true);
-    const runOpenshell = vi.fn();
-    const checkPortAvailable = vi.fn();
-    const verifyGatewayContainerRunning = vi.fn();
+  ] as const)(
+    "retains conflict handling for a $relationship external dashboard from $gatewayReuseState state (#6576)",
+    async ({ gatewayReuseState, port }) => {
+      const destroyGateway = vi.fn(() => true);
+      const checkPortAvailable = vi.fn();
+      const verifyGatewayContainerRunning = vi.fn();
 
-    const result = await applyHealthyPortReuse({
-      ...BASE_INPUT,
-      kind: "dashboard",
-      port,
-      gatewayReuseState,
-      externallySupervised: true,
-      destroyGateway,
-      runOpenshell,
-      checkPortAvailable,
-      verifyGatewayContainerRunning,
-    });
+      const result = await applyHealthyPortReuse({
+        ...BASE_INPUT,
+        kind: "dashboard",
+        port,
+        gatewayReuseState,
+        externallySupervised: true,
+        destroyGateway,
+        checkPortAvailable,
+        verifyGatewayContainerRunning,
+      });
 
-    expect(result).toBeNull();
-    expect(verifyGatewayContainerRunning).not.toHaveBeenCalled();
-    expect(destroyGateway).not.toHaveBeenCalled();
-    expect(runOpenshell).not.toHaveBeenCalled();
-    expect(checkPortAvailable).not.toHaveBeenCalled();
-  });
+      expect(result).toBeNull();
+      expect(verifyGatewayContainerRunning).not.toHaveBeenCalled();
+      expect(destroyGateway).not.toHaveBeenCalled();
+      expect(checkPortAvailable).not.toHaveBeenCalled();
+    },
+  );
 
   it("cleans up stale metadata and returns downgraded state when the port frees up", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const destroyGateway = vi.fn(() => true);
-    const runOpenshell = vi.fn();
     const checkPortAvailable = vi.fn().mockResolvedValue({ ok: true });
 
     const result = await applyHealthyPortReuse({
       ...BASE_INPUT,
       destroyGateway,
-      runOpenshell,
       checkPortAvailable,
       verifyGatewayContainerRunning: () => "missing",
     });
@@ -195,7 +225,6 @@ describe("applyHealthyPortReuse", () => {
       expect(result.portCheck.ok).toBe(true);
     }
     expect(destroyGateway).toHaveBeenCalledTimes(1);
-    expect(runOpenshell).toHaveBeenCalledWith(["forward", "stop", "18789"], { ignoreError: true });
     expect(checkPortAvailable).toHaveBeenCalledWith(8080, undefined);
     const messages = log.mock.calls.map((c) => c[0]);
     expect(messages).toContain(
@@ -211,7 +240,6 @@ describe("applyHealthyPortReuse", () => {
     const result = await applyHealthyPortReuse({
       ...BASE_INPUT,
       destroyGateway: () => true,
-      runOpenshell: vi.fn(),
       checkPortAvailable,
       verifyGatewayContainerRunning: () => "missing",
     });
@@ -232,7 +260,6 @@ describe("applyHealthyPortReuse", () => {
     const result = await applyHealthyPortReuse({
       ...BASE_INPUT,
       destroyGateway,
-      runOpenshell: vi.fn(),
       checkPortAvailable,
       verifyGatewayContainerRunning: () => "running",
     });
@@ -258,7 +285,6 @@ describe("applyHealthyPortReuse", () => {
       ...BASE_INPUT,
       supportsLifecycleCommands: false,
       destroyGateway: () => true,
-      runOpenshell: vi.fn(),
       checkPortAvailable: vi.fn(),
       verifyGatewayContainerRunning: verifyContainer,
     });
@@ -282,7 +308,6 @@ describe("applyHealthyPortReuse", () => {
       port: 18789,
       label: "NemoClaw dashboard",
       destroyGateway: () => true,
-      runOpenshell: vi.fn(),
       checkPortAvailable,
       verifyGatewayContainerRunning: verifyContainer,
     });

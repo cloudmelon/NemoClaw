@@ -1,196 +1,199 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ExecutionCapability, ExecutionProfile } from "../registry/execution-profile.ts";
-import {
-  buildExecutionEvidence,
-  type ExecutionEvidence,
-  type ManagedImageEvidence,
-  type NonEmptyProviderReceipts,
-} from "../registry/parity-evidence.ts";
-import {
-  executionPreparationKey,
-  type ResolvedRuntimeCase,
-  type RuntimeAdapterRequest,
-  type RuntimeAdapterRuntime,
-} from "../registry/runtime-matrix.ts";
-import type { FsmTransition, JsonValue, TerminalOutcome } from "../registry/scenario.ts";
+import path from "node:path";
 
-export type RuntimeReadinessEvidence =
-  | {
-      profileId: string;
-      ready: true;
-      engineName: string;
-      engineVersion: string;
-      capabilities: readonly ExecutionCapability[];
-    }
-  | {
-      profileId: string;
-      ready: false;
-      detail?: string;
+import { buildAvailabilityProbeEnv } from "./availability-env.ts";
+import type { HostCliClient } from "./clients/host.ts";
+import type { ShellProbeResult, ShellProbeRunOptions } from "./shell-probe.ts";
+
+export type RuntimeProviderSkip = (reason: string) => never;
+
+export type E2eRuntimeProviderId = "docker" | "podman";
+
+const SANITIZED_PRIVILEGED_ENVIRONMENT = [
+  "BASH_ENV=",
+  "ENV=",
+  "GCONV_PATH=",
+  "GLIBC_TUNABLES=",
+  "LD_AUDIT=",
+  "LD_LIBRARY_PATH=",
+  "LD_PRELOAD=",
+  "LOCPATH=",
+  "NODE_OPTIONS=",
+  "PERL5OPT=",
+  "PYTHONHOME=",
+  "PYTHONINSPECT=",
+  "PYTHONNOUSERSITE=1",
+  "PYTHONPATH=",
+  "PYTHONSTARTUP=",
+  "PYTHONUSERBASE=",
+  "RUBYOPT=",
+] as const;
+
+const SANDBOX_NAME_LABEL = "openshell.ai/sandbox-name";
+const CONTAINER_ID = /^[a-f0-9]{12,64}$/u;
+
+interface RuntimeProviderInvocation {
+  readonly argsPrefix: readonly string[];
+  readonly command: E2eRuntimeProviderId;
+  readonly displayName: "Docker" | "Podman";
+  readonly id: E2eRuntimeProviderId;
+}
+
+export interface E2eRuntimeProviderCommand {
+  readonly args: readonly string[];
+  readonly command: E2eRuntimeProviderId;
+}
+
+function configuredRuntimeProviderInvocation(
+  environment: NodeJS.ProcessEnv,
+): RuntimeProviderInvocation {
+  const portable = environment.NEMOCLAW_EXPERIMENTAL_PROFILE === "portable";
+  const configured = environment.NEMOCLAW_GATEWAY_RUNTIME?.trim() || "docker";
+  if (configured !== "docker" && configured !== "podman") {
+    throw new Error(`unsupported E2E gateway runtime: ${configured}`);
+  }
+
+  const providerId = portable ? "docker" : configured;
+  if (providerId === "docker") {
+    return {
+      argsPrefix: [],
+      command: "docker",
+      displayName: "Docker",
+      id: providerId,
     };
+  }
 
-export interface ExactWorkloadIdentity {
-  logicalId: string;
-  providerResourceId: string;
-  managedImages: readonly ManagedImageEvidence[];
-}
-
-export interface RuntimeLifecycleRequest {
-  caseId: string;
-  workload: ExactWorkloadIdentity;
-}
-
-export interface RuntimeLifecycleEvidence {
-  desiredState: JsonValue;
-  fsmTrace: readonly FsmTransition[];
-  terminalOutcome: TerminalOutcome;
-  userVisibleState: JsonValue;
-  providerReceipts: NonEmptyProviderReceipts;
-}
-
-/**
- * Provider commands stop at this seam. Scenario, matrix, and parity code use
- * only normalized evidence and exact workload identities.
- */
-export interface RuntimeProviderEnvironment {
-  prepare(): Promise<RuntimeReadinessEvidence>;
-}
-
-export interface RuntimeProviderLifecycle {
-  executeAdapter(adapterId: string, request: RuntimeAdapterRequest): Promise<void>;
-  cleanup(
-    identity: ExactWorkloadIdentity | Pick<ExactWorkloadIdentity, "logicalId">,
-  ): Promise<NonEmptyProviderReceipts>;
-}
-
-export interface RuntimeProviderState {
-  inspectWorkload(request: { logicalId: string }): Promise<ExactWorkloadIdentity>;
-  observe(request: RuntimeLifecycleRequest): Promise<RuntimeLifecycleEvidence>;
-}
-
-export interface RuntimeProviderFixture extends RuntimeAdapterRuntime {
-  readonly profile: ExecutionProfile;
-  readonly environment: RuntimeProviderEnvironment;
-  readonly lifecycle: RuntimeProviderLifecycle;
-  readonly state: RuntimeProviderState;
-}
-
-export interface RuntimeExecutionRequest {
-  resolved: ResolvedRuntimeCase;
-  provider: RuntimeProviderFixture;
-  source: {
-    headSha: string;
-    baseSha: string;
+  const socketPath = environment.OPENSHELL_PODMAN_SOCKET?.trim();
+  if (
+    !socketPath ||
+    !path.isAbsolute(socketPath) ||
+    path.normalize(socketPath) !== socketPath ||
+    /[\u0000-\u001f\u007f-\u009f]/u.test(socketPath)
+  ) {
+    throw new Error("native Podman E2E requires one absolute provider-owned socket path");
+  }
+  return {
+    argsPrefix: ["--url", `unix://${socketPath}`],
+    command: "podman",
+    displayName: "Podman",
+    id: providerId,
   };
 }
 
-async function cleanupAfterExecutionFailure(
-  provider: RuntimeProviderFixture,
-  workloads: readonly (ExactWorkloadIdentity | Pick<ExactWorkloadIdentity, "logicalId">)[],
-  executionError: unknown,
-): Promise<never> {
-  const cleanupErrors: unknown[] = [];
-  for (const workload of workloads) {
-    try {
-      await provider.lifecycle.cleanup(workload);
-    } catch (cleanupError) {
-      cleanupErrors.push(cleanupError);
-    }
+export class RuntimeProviderPrerequisite {
+  readonly displayName: "Docker" | "Podman";
+  readonly id: E2eRuntimeProviderId;
+  private readonly invocation: RuntimeProviderInvocation;
+
+  constructor(
+    private readonly host: HostCliClient,
+    private readonly skip: RuntimeProviderSkip,
+    private readonly environment: NodeJS.ProcessEnv = process.env,
+  ) {
+    this.invocation = configuredRuntimeProviderInvocation(environment);
+    this.displayName = this.invocation.displayName;
+    this.id = this.invocation.id;
   }
-  if (cleanupErrors.length > 0) {
-    throw new AggregateError(
-      [executionError, ...cleanupErrors],
-      "Runtime case execution failed and provider cleanup also failed",
-      { cause: executionError },
+
+  command(args: readonly string[], options: ShellProbeRunOptions = {}): Promise<ShellProbeResult> {
+    const invocation = this.hostInvocation(args);
+    return this.host.command(invocation.command, [...invocation.args], {
+      env: buildAvailabilityProbeEnv(this.environment),
+      ...options,
+    });
+  }
+
+  hostInvocation(args: readonly string[]): E2eRuntimeProviderCommand {
+    return Object.freeze({
+      command: this.invocation.command,
+      args: Object.freeze([...this.invocation.argsPrefix, ...args]),
+    });
+  }
+
+  async requireAvailable(options: { artifactName: string; scenarioLabel: string }): Promise<void> {
+    const result = await this.command(["info"], {
+      artifactName: options.artifactName,
+      timeoutMs: 30_000,
+    });
+    if (result.exitCode === 0) return;
+
+    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n");
+    const reason = `${this.displayName} is required for ${options.scenarioLabel} live E2E: ${detail}`;
+    if (process.env.GITHUB_ACTIONS === "true") throw new Error(reason);
+    this.skip(reason);
+  }
+
+  async resolveSandboxResourceHandle(
+    sandboxName: string,
+    options: ShellProbeRunOptions = {},
+  ): Promise<string> {
+    const result = await this.command(
+      [
+        "container",
+        "ps",
+        "--all",
+        "--no-trunc",
+        "--filter",
+        `label=${SANDBOX_NAME_LABEL}=${sandboxName}`,
+        "--format",
+        "{{.ID}}",
+      ],
+      options,
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `${this.displayName} sandbox resource discovery failed for '${sandboxName}': ${[
+          result.stdout,
+          result.stderr,
+        ]
+          .filter(Boolean)
+          .join("\n")}`,
+      );
+    }
+    const handles = result.stdout
+      .split(/\r?\n/u)
+      .map((line) => line.trim().toLowerCase())
+      .filter(Boolean);
+    if (handles.length !== 1 || !CONTAINER_ID.test(handles[0] ?? "")) {
+      throw new Error(
+        `${this.displayName} sandbox '${sandboxName}' resolved ${String(handles.length)} runtime resources; expected exactly one.`,
+      );
+    }
+    return handles[0] as string;
+  }
+
+  async execSandboxAsRoot(
+    sandboxName: string,
+    args: readonly string[],
+    options: ShellProbeRunOptions & { sanitizeEnvironment?: boolean } = {},
+  ): Promise<ShellProbeResult> {
+    const { sanitizeEnvironment = false, ...runOptions } = options;
+    const resourceHandle = await this.resolveSandboxResourceHandle(sandboxName, {
+      ...runOptions,
+      artifactName: runOptions.artifactName ? `${runOptions.artifactName}-resource` : undefined,
+    });
+    const environment = sanitizeEnvironment
+      ? SANITIZED_PRIVILEGED_ENVIRONMENT.flatMap((value) => ["--env", value])
+      : [];
+    return this.command(
+      ["container", "exec", ...environment, "--user", "root", resourceHandle, ...args],
+      runOptions,
     );
   }
-  throw executionError;
 }
 
-/**
- * The only executable cross-runtime path in this foundation. It does not use
- * the legacy Docker-shaped environment/lifecycle/state fixtures and is not
- * selected by any canonical target or workflow.
- */
-export async function executeRuntimeCaseThroughProvider(
-  request: RuntimeExecutionRequest,
-): Promise<ExecutionEvidence> {
-  const { case: runtimeCase } = request.resolved;
-  const provider = request.provider;
-  if (
-    provider.profile.id !== runtimeCase.profile.id ||
-    executionPreparationKey(provider.profile) !== runtimeCase.preparationKey
-  ) {
-    throw new Error(
-      `Runtime provider profile '${provider.profile.id}' does not match case '${runtimeCase.id}'`,
-    );
-  }
-  const readiness = await provider.environment.prepare();
-  if (readiness.ready !== true) {
-    throw new Error(
-      `Runtime provider for '${runtimeCase.profile.id}' did not report a ready environment`,
-    );
-  }
-  if (readiness.profileId !== runtimeCase.profile.id) {
-    throw new Error(
-      `Runtime readiness profile '${readiness.profileId}' does not match '${runtimeCase.profile.id}'`,
-    );
-  }
-  const missingCapabilities = runtimeCase.profile.capabilities.filter(
-    (capability) => !readiness.capabilities.includes(capability),
-  );
-  if (missingCapabilities.length > 0) {
-    throw new Error(
-      `Runtime readiness for '${runtimeCase.profile.id}' is missing capabilities: ${missingCapabilities.join(", ")}`,
-    );
-  }
-
-  const workload = await provider.state.inspectWorkload({
-    logicalId: runtimeCase.identities.sandbox,
-  });
-  if (workload.logicalId !== runtimeCase.identities.sandbox) {
-    const mismatch = new Error(
-      `workload.logicalId '${workload.logicalId}' does not match case sandbox identity '${runtimeCase.identities.sandbox}'`,
-    );
-    return cleanupAfterExecutionFailure(
-      provider,
-      [workload, { logicalId: runtimeCase.identities.sandbox }],
-      mismatch,
-    );
-  }
-  let lifecycle: RuntimeLifecycleEvidence;
-  try {
-    for (const binding of runtimeCase.obligationBindings) {
-      await binding.adapter.execute(provider, {
-        caseId: runtimeCase.id,
-        obligationId: binding.obligationId,
-        workloadId: workload.logicalId,
-      });
-    }
-    lifecycle = await provider.state.observe({
-      caseId: runtimeCase.id,
-      workload,
-    });
-  } catch (executionError) {
-    return cleanupAfterExecutionFailure(provider, [workload], executionError);
-  }
-  const cleanupReceipts = await provider.lifecycle.cleanup(workload);
-
-  return buildExecutionEvidence({
-    resolved: request.resolved,
-    source: request.source,
-    engine: {
-      name: readiness.engineName,
-      version: readiness.engineVersion,
-    },
-    workload,
-    observed: {
-      desiredState: lifecycle.desiredState,
-      fsmTrace: lifecycle.fsmTrace,
-      terminalOutcome: lifecycle.terminalOutcome,
-      userVisibleState: lifecycle.userVisibleState,
-    },
-    providerReceipts: [...lifecycle.providerReceipts, ...cleanupReceipts],
+export async function ensureConfiguredRuntimeProviderAvailable(options: {
+  artifactName: string;
+  environment?: NodeJS.ProcessEnv;
+  host: HostCliClient;
+  scenarioLabel: string;
+  skip: RuntimeProviderSkip;
+}): Promise<void> {
+  const environment = options.environment ?? process.env;
+  await new RuntimeProviderPrerequisite(options.host, options.skip, environment).requireAvailable({
+    artifactName: options.artifactName,
+    scenarioLabel: options.scenarioLabel,
   });
 }

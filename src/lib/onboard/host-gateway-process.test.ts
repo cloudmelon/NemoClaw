@@ -13,8 +13,11 @@ import {
   type HostGatewayProcessDeps,
   isHostPortFree,
   type RunResult,
+  resolveOwnedHostGatewayRuntimeProviderId,
+  scopedHostGatewayProcessAbsenceFailure,
   stopHostGatewayProcesses,
 } from "./host-gateway-process";
+import { writeDockerDriverGatewayRuntimeMarkerForStateDir } from "./docker-driver-gateway-runtime-marker";
 
 const PGREP_KEY = `pgrep -f ${HOST_GATEWAY_PGREP_PATTERN}`;
 
@@ -56,6 +59,7 @@ function psResponses(
     cmdline?: string;
     exited: Set<number>;
     owner?: string;
+    uid?: number;
   },
 ): [string, RunResult | ((args: string[]) => RunResult)][] {
   return [
@@ -65,10 +69,61 @@ function psResponses(
       `ps -p ${pid} -o args=`,
       ok(opts.cmdline ?? `/home/test/.local/bin/openshell-gateway --port 8080\n`),
     ],
+    ...(opts.uid === undefined
+      ? []
+      : [[`ps -p ${pid} -o uid=`, ok(`${opts.uid}\n`)] as [string, RunResult]]),
   ];
 }
 
+function otherUserUid(): number {
+  return (process.getuid?.() ?? 0) + 1;
+}
+
 describe("host gateway cleanup boundaries", () => {
+  it("recovers the provider from an owned gateway runtime marker", () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-provider-marker-"));
+    try {
+      writeDockerDriverGatewayRuntimeMarkerForStateDir(stateDir, {
+        pid: 4242,
+        desiredEnv: {},
+        endpoint: "https://127.0.0.1:9123",
+        runtimeProviderId: "podman",
+      });
+
+      expect(
+        resolveOwnedHostGatewayRuntimeProviderId({
+          gatewayName: "nemoclaw-9123",
+          gatewayPort: 9123,
+          stateDir,
+        }),
+      ).toBe("podman");
+    } finally {
+      fs.rmSync(stateDir, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects a provider marker outside the selected gateway identity", () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-provider-marker-"));
+    try {
+      writeDockerDriverGatewayRuntimeMarkerForStateDir(stateDir, {
+        pid: 4242,
+        desiredEnv: {},
+        endpoint: "https://127.0.0.1:8080",
+        runtimeProviderId: "podman",
+      });
+
+      expect(
+        resolveOwnedHostGatewayRuntimeProviderId({
+          gatewayName: "nemoclaw-9123",
+          gatewayPort: 9123,
+          stateDir,
+        }),
+      ).toBeNull();
+    } finally {
+      fs.rmSync(stateDir, { force: true, recursive: true });
+    }
+  });
+
   it.each([
     ["free", 0, true],
     ["occupied", 1, false],
@@ -84,6 +139,61 @@ describe("host gateway cleanup boundaries", () => {
       ["-e", expect.stringContaining("server.listen(8080, '127.0.0.1'")],
       { stdio: "ignore", timeout: 2_000 },
     );
+  });
+
+  it("proves a recorded gateway is stopped only after a complete orphan scan", () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-stopped-gateway-proof-"));
+    try {
+      fs.writeFileSync(path.join(stateDir, "openshell-gateway.pid"), "4242\n", { mode: 0o600 });
+      const { run } = makeRun(
+        new Map([
+          ["ps -p 4242 -o stat=", notFound()],
+          [PGREP_KEY, notFound()],
+        ]),
+      );
+
+      expect(
+        scopedHostGatewayProcessAbsenceFailure(
+          { commandExists: () => true, env: {}, isPortFree: () => true, kill: vi.fn(), run },
+          {
+            openShellGatewayName: "nemoclaw-9123",
+            openShellGatewayPort: 9123,
+            stateDir,
+          },
+        ),
+      ).toBeNull();
+    } finally {
+      fs.rmSync(stateDir, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects a discovered live process that claims the selected gateway", () => {
+    // Match the other process fixtures: avoid a real Linux PID overriding mocked ps output.
+    const pid = 9999434;
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-live-gateway-proof-"));
+    try {
+      const { run } = makeRun(
+        new Map([
+          [PGREP_KEY, ok(`${pid}\n`)],
+          [`ps -p ${pid} -o stat=`, ok("S\n")],
+          [`ps -p ${pid} -o uid=`, notFound()],
+          [`ps -p ${pid} -o args=`, ok("openshell-gateway[nemoclaw=nemoclaw-9123;port=9123]\n")],
+        ]),
+      );
+
+      expect(
+        scopedHostGatewayProcessAbsenceFailure(
+          { commandExists: () => true, env: {}, isPortFree: () => true, kill: vi.fn(), run },
+          {
+            openShellGatewayName: "nemoclaw-9123",
+            openShellGatewayPort: 9123,
+            stateDir,
+          },
+        ),
+      ).toContain(`live gateway process ${pid}`);
+    } finally {
+      fs.rmSync(stateDir, { force: true, recursive: true });
+    }
   });
 
   it("clears the exact gateway PID file and runtime marker", () => {
@@ -347,10 +457,10 @@ describe("stopHostGatewayProcesses", () => {
     expect(kill).not.toHaveBeenCalledWith(9999222, expect.anything());
   });
 
-  it("prints sudo remediation when a privileged host gateway cannot be killed", () => {
+  it("requires fresh identity proof when a privileged host gateway cannot be killed", () => {
     const responses = new Map<string, RunResult | ((args: string[]) => RunResult)>([
       [PGREP_KEY, ok("9999042\n")],
-      ...psResponses(9999042, { exited: new Set(), owner: "root" }),
+      ...psResponses(9999042, { exited: new Set(), owner: "root", uid: 0 }),
     ]);
     const { run } = makeRun(responses);
     const warn = vi.fn();
@@ -373,8 +483,98 @@ describe("stopHostGatewayProcesses", () => {
     expect(result.failed).toEqual([9999042]);
     expect(result.sudoRemediationPids).toEqual([9999042]);
     expect(warn).toHaveBeenCalledWith(
-      "Cannot stop root-owned host openshell-gateway process 9999042. Run: sudo kill -9 9999042",
+      "Cannot stop root-owned host openshell-gateway process 9999042. " +
+        "Do not signal this saved PID without a fresh identity check. Before any privileged stop, " +
+        "verify that the live process owner and command line identify the intended gateway name and port, " +
+        "and that the PID file, runtime marker, and loaded sandbox namespace still match the selected state directory.",
     );
+  });
+
+  it("leaves a swept host gateway owned by another user running without failing cleanup", () => {
+    const responses = new Map<string, RunResult | ((args: string[]) => RunResult)>([
+      [PGREP_KEY, ok("9999043\n")],
+      ...psResponses(9999043, { exited: new Set(), owner: "otheruser", uid: otherUserUid() }),
+    ]);
+    const { run } = makeRun(responses);
+    const kill = vi.fn(() => false);
+    const warn = vi.fn();
+
+    const result = stopHostGatewayProcesses(
+      {
+        run,
+        kill,
+        env: { USER: "tester" },
+        commandExists: () => true,
+        warn,
+      },
+      {
+        killWaitMs: 0,
+        stateDir: fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-host-gateway-")),
+        termWaitMs: 0,
+      },
+    );
+
+    expect(result.foreignUserPids).toEqual([9999043]);
+    expect(result.failed).toEqual([]);
+    expect(result.sudoRemediationPids).toEqual([]);
+    expect(result.stopped).toEqual([]);
+    expect(kill).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "Kept otheruser-owned host openshell-gateway process 9999043 running. " +
+        "Cleanup does not stop a gateway process that another user owns.",
+    );
+  });
+
+  it("stops a foreign-user gateway recorded by this installation", () => {
+    const pid = 9999045;
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-host-gateway-"));
+    fs.writeFileSync(path.join(stateDir, "openshell-gateway.pid"), `${pid}\n`);
+    const exited = new Set<number>();
+    const responses = new Map<string, RunResult | ((args: string[]) => RunResult)>([
+      [PGREP_KEY, notFound()],
+      ...psResponses(pid, { exited, owner: "otheruser", uid: otherUserUid() }),
+    ]);
+    const { run } = makeRun(responses);
+    const kill = vi.fn<HostGatewayProcessDeps["kill"]>((targetPid, signal) => {
+      signal === "SIGTERM" && exited.add(targetPid);
+      return true;
+    });
+
+    const result = stopHostGatewayProcesses(
+      { run, kill, env: { USER: "tester" }, commandExists: () => true, log: vi.fn() },
+      { stateDir },
+    );
+
+    expect(result.stopped).toEqual([pid]);
+    expect(result.foreignUserPids).toEqual([]);
+    expect(kill).toHaveBeenCalledWith(pid, "SIGTERM");
+  });
+
+  it("still stops a swept host gateway owned by the current user", () => {
+    const exited = new Set<number>();
+    const responses = new Map<string, RunResult | ((args: string[]) => RunResult)>([
+      [PGREP_KEY, ok("9999044\n")],
+      ...psResponses(9999044, { exited, uid: process.getuid?.() ?? 0 }),
+    ]);
+    const { run } = makeRun(responses);
+    const kill = vi.fn<HostGatewayProcessDeps["kill"]>((pid, signal) => {
+      signal === "SIGTERM" && exited.add(pid);
+      return true;
+    });
+
+    const result = stopHostGatewayProcesses(
+      {
+        run,
+        kill,
+        env: { USER: "tester" },
+        commandExists: () => true,
+        log: vi.fn(),
+      },
+      { stateDir: fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-host-gateway-")) },
+    );
+
+    expect(result.stopped).toEqual([9999044]);
+    expect(result.foreignUserPids).toEqual([]);
   });
 
   it("skips pgrep sweep when explicit PIDs are passed (drift restart)", () => {

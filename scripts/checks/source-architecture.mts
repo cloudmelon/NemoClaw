@@ -120,7 +120,7 @@ function sourceFileFor(absPath: string): ts.SourceFile {
     absPath,
     readFileSync(absPath, "utf8"),
     ts.ScriptTarget.Latest,
-    true,
+    false,
     scriptKind,
   );
 }
@@ -214,6 +214,7 @@ function resolveInternalImport(
 ): string | null {
   if (!specifier.startsWith(".")) return null;
   for (const candidate of importCandidates(fromAbsPath, specifier)) {
+    if (sourceFiles.has(candidate)) return candidate;
     if (!existsSync(candidate) || !lstatSync(candidate).isFile()) continue;
     const canonical = realpathSync(candidate);
     if (sourceFiles.has(canonical)) return canonical;
@@ -280,10 +281,13 @@ export function analyzeSourceArchitecture(
   repoRoot = REPO_ROOT,
   options: AnalyzeOptions = {},
 ): SourceArchitectureReport {
+  const canonicalRepoRoot = realpathSync(repoRoot);
   const scanRoots = options.scanRoots ?? DEFAULT_SCAN_ROOTS;
   const rootFileDirectories = options.rootFileDirectories ?? [];
   const absoluteFiles = [
-    ...new Set(scanRoots.flatMap((root) => [...walkSourceFiles(path.join(repoRoot, root))])),
+    ...new Set(
+      scanRoots.flatMap((root) => [...walkSourceFiles(path.join(canonicalRepoRoot, root))]),
+    ),
   ].sort();
   const sourceFiles = new Set(absoluteFiles);
   const edges = new Map<string, Set<string>>();
@@ -304,21 +308,27 @@ export function analyzeSourceArchitecture(
     }
   }
 
-  const files = absoluteFiles.map((file) => toRepoPath(repoRoot, file));
+  const files = absoluteFiles.map((file) => toRepoPath(canonicalRepoRoot, file));
   const fanIn = Object.fromEntries(
-    absoluteFiles.map((file) => [toRepoPath(repoRoot, file), fanInByAbsolutePath.get(file) ?? 0]),
+    absoluteFiles.map((file) => [
+      toRepoPath(canonicalRepoRoot, file),
+      fanInByAbsolutePath.get(file) ?? 0,
+    ]),
   );
   const fanOut = Object.fromEntries(
-    absoluteFiles.map((file) => [toRepoPath(repoRoot, file), edges.get(file)?.size ?? 0]),
+    absoluteFiles.map((file) => [toRepoPath(canonicalRepoRoot, file), edges.get(file)?.size ?? 0]),
   );
   const repoEdges = new Map(
     absoluteFiles.map((file) => [
-      toRepoPath(repoRoot, file),
-      new Set([...(edges.get(file) ?? [])].map((target) => toRepoPath(repoRoot, target))),
+      toRepoPath(canonicalRepoRoot, file),
+      new Set([...(edges.get(file) ?? [])].map((target) => toRepoPath(canonicalRepoRoot, target))),
     ]),
   );
   const rootFiles = Object.fromEntries(
-    rootFileDirectories.map((directory) => [directory, countRootFiles(repoRoot, directory)]),
+    rootFileDirectories.map((directory) => [
+      directory,
+      countRootFiles(canonicalRepoRoot, directory),
+    ]),
   );
 
   return {

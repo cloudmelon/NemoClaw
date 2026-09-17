@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from "vitest";
+import * as registry from "../../state/registry";
 import type { SandboxEntry } from "../../state/registry";
 import { getSandboxDockerHealth, getSandboxDockerRuntime } from "./docker-health";
 
@@ -60,6 +61,31 @@ function fixture({
 }
 
 describe("getSandboxDockerHealth", () => {
+  it("excludes created pending registrations from container ownership (#9733)", () => {
+    const listSpy = vi.spyOn(registry, "listSandboxes").mockReturnValue({
+      sandboxes: [
+        { name: "my", pendingRouteReservation: undefined },
+        {
+          name: "my-assistant",
+          pendingRouteReservation: true,
+          createdAt: "2026-08-20T00:00:00.000Z",
+        },
+      ],
+      defaultSandbox: null,
+    });
+    const { listSandboxNames: _listSandboxNames, ...deps } = fixture({
+      psNames: "openshell-my-assistant-12ab",
+      healthRaw: "healthy",
+    });
+    const result = getSandboxDockerHealth("my", deps);
+    listSpy.mockRestore();
+
+    expect(result).toEqual({
+      state: "healthy",
+      containerName: "openshell-my-assistant-12ab",
+    });
+  });
+
   it("returns the docker container health when the sandbox runs on the docker driver", () => {
     const deps = fixture({ healthRaw: "healthy\n" });
     expect(getSandboxDockerHealth("my-assistant", deps)).toEqual({
@@ -180,6 +206,7 @@ describe("getSandboxDockerRuntime (#4495)", () => {
     expect(getSandboxDockerRuntime("my-assistant", deps)).toEqual({
       health: "none",
       paused: false,
+      running: false,
       containerName: null,
     });
   });
@@ -193,6 +220,7 @@ describe("getSandboxDockerRuntime (#4495)", () => {
     expect(getSandboxDockerRuntime("my-assistant", deps)).toEqual({
       health: "unhealthy",
       paused: true,
+      running: true,
       containerName: "openshell-my-assistant-live",
     });
   });
@@ -206,6 +234,7 @@ describe("getSandboxDockerRuntime (#4495)", () => {
     expect(getSandboxDockerRuntime("my-assistant", deps)).toEqual({
       health: "none",
       paused: false,
+      running: false,
       containerName: "openshell-my-assistant-12ab",
     });
   });
@@ -215,13 +244,23 @@ describe("getSandboxDockerRuntime (#4495)", () => {
     expect(getSandboxDockerRuntime("my-assistant", deps)).toEqual({
       health: "healthy",
       paused: true,
+      running: true,
       containerName: "openshell-my-assistant-12ab",
     });
   });
 
-  it("reports paused=false for a running container", () => {
-    const deps = fixture({ healthRaw: "healthy\n", pausedRaw: "false\n" });
-    expect(getSandboxDockerRuntime("my-assistant", deps).paused).toBe(false);
+  it("reports running state for the owned container", () => {
+    const running = getSandboxDockerRuntime("my-assistant", fixture());
+    const stopped = getSandboxDockerRuntime(
+      "my-assistant",
+      fixture({
+        psNames: "openshell-cluster-nemoclaw\n",
+        psAllNames: "openshell-cluster-nemoclaw\nopenshell-my-assistant-12ab\n",
+      }),
+    );
+
+    expect(running).toMatchObject({ running: true, paused: false });
+    expect(stopped).toMatchObject({ running: false, paused: false });
   });
 
   it("normalizes whitespace and case in the .State.Paused value", () => {
@@ -250,6 +289,7 @@ describe("getSandboxDockerRuntime (#4495)", () => {
     expect(getSandboxDockerRuntime("my-assistant", deps)).toEqual({
       health: "none",
       paused: false,
+      running: false,
       containerName: null,
     });
     expect(findLabeledSandboxContainers).not.toHaveBeenCalled();
@@ -260,6 +300,7 @@ describe("getSandboxDockerRuntime (#4495)", () => {
     expect(getSandboxDockerRuntime("my-assistant", deps)).toEqual({
       health: "none",
       paused: false,
+      running: false,
       containerName: null,
     });
   });

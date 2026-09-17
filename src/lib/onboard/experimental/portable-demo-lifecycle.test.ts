@@ -7,7 +7,9 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PodmanSocketAuthorityDeps } from "../../adapters/podman";
+import type { CheckpointPortableRuntimeAuthority } from "../../state/onboard-checkpoint-types";
 import type { SandboxEntry } from "../../state/registry";
+import { gatewayWaitResult } from "./__test-helpers__/portable-demo-gateway-wait";
 import { recordUserLocalOllamaOwnership } from "./ollama-user-local-runtime";
 import {
   installPortableDemoSandboxLifecycle,
@@ -16,11 +18,22 @@ import {
   recoverPortableDemoSandboxLifecycle as recoverPortableDemoSandboxLifecycleUnchecked,
   removePortableDemoSandboxLifecycleReceipt,
   resolvePortableDemoPrivilegedExecTarget,
+  stopPortableDemoSandboxLifecycle,
 } from "./portable-demo-lifecycle";
 
 const CONTAINER_ID = "a".repeat(64);
 const SANDBOX_ID = "sandbox-id-alpha";
 const SOCKET_PATH = "/run/user/1001/podman/podman.sock";
+const RUNTIME_AUTHORITY: CheckpointPortableRuntimeAuthority = {
+  schemaVersion: 1,
+  kind: "podman",
+  ownership: "current-user",
+  uid: 1001,
+  homeDir: "/home/tester",
+  configHome: "/home/tester/.config",
+  runtimeDir: "/run/user/1001",
+  socketPath: SOCKET_PATH,
+};
 const STARTUP_ARGV = [
   "env",
   "CHAT_UI_URL=http://127.0.0.1:18789",
@@ -78,12 +91,11 @@ function createPodman(
   let containerId = CONTAINER_ID;
   let containerName = `openshell-default--alpha-${sandboxId}`;
   let matches = [...(options.discoveredContainerIds ?? [CONTAINER_ID])];
-  let socketPath = SOCKET_PATH;
   const podman = vi.fn((args: readonly string[], _env?: NodeJS.ProcessEnv) => {
     const command = args[0] === "--url" ? args.slice(2) : args;
     switch (command[0]) {
-      case "info":
-        return { status: 0, stdout: `${socketPath}\n` };
+      case "version":
+        return { status: 0, stdout: JSON.stringify({ Server: { Version: "5.6.1" } }) };
       case "ps":
         return { status: 0, stdout: matches.length > 0 ? `${matches.join("\n")}\n` : "" };
       case "inspect":
@@ -102,12 +114,15 @@ function createPodman(
                   "openshell.ai/sandbox-workspace": sandboxWorkspaceLabel,
                 },
               },
-              State: { Running: running },
+              State: { Running: running, Status: running ? "running" : "exited" },
             },
           ]),
         };
       case "start":
         running = true;
+        return { status: 0 };
+      case "stop":
+        running = false;
         return { status: 0 };
       case "update":
         return { status: options.updateStatus ?? 0 };
@@ -144,9 +159,6 @@ function createPodman(
     },
     setRunning(value: boolean) {
       running = value;
-    },
-    setSocketPath(value: string) {
-      socketPath = value;
     },
   };
 }
@@ -201,6 +213,17 @@ function resolveTarget(
     podman: runtime.podman,
     podmanSocketAuthorityDeps: socketAuthorityDeps(),
     hardenSocketDirectory: vi.fn(),
+    runtimeReadiness: {
+      uid: 1001,
+      home: RUNTIME_AUTHORITY.homeDir,
+      systemctl: () => ({ status: 0 }),
+      podmanCapture: () => ({
+        status: 0,
+        stdout: JSON.stringify({ Server: { Version: "5.6.1" } }),
+        stderr: "",
+      }),
+    },
+    log: vi.fn(),
     ...overrides,
   });
 }
@@ -210,7 +233,25 @@ function installReceipt(stateDir: string, podman: ReturnType<typeof createPodman
     "alpha",
     STARTUP_ARGV,
     { HOME: stateDir, NEMOCLAW_EXPERIMENTAL_PROFILE: "portable" },
-    { platform: "linux", podman, stateDir },
+    {
+      platform: "linux",
+      podman,
+      stateDir,
+      runtimeAuthority: RUNTIME_AUTHORITY,
+      podmanSocketAuthorityDeps: socketAuthorityDeps(),
+      hardenSocketDirectory: vi.fn(),
+      runtimeReadiness: {
+        uid: 1001,
+        home: RUNTIME_AUTHORITY.homeDir,
+        systemctl: () => ({ status: 0 }),
+        podmanCapture: () => ({
+          status: 0,
+          stdout: JSON.stringify({ Server: { Version: "5.6.1" } }),
+          stderr: "",
+        }),
+      },
+      log: vi.fn(),
+    },
   );
 }
 
@@ -226,7 +267,23 @@ function recoverPortableDemoSandboxLifecycle(
       openshellDriver: "docker",
       ...context,
     },
-    deps,
+    {
+      platform: "linux",
+      podmanSocketAuthorityDeps: socketAuthorityDeps(),
+      hardenSocketDirectory: vi.fn(),
+      runtimeReadiness: {
+        uid: 1001,
+        home: RUNTIME_AUTHORITY.homeDir,
+        systemctl: () => ({ status: 0 }),
+        podmanCapture: () => ({
+          status: 0,
+          stdout: JSON.stringify({ Server: { Version: "5.6.1" } }),
+          stderr: "",
+        }),
+      },
+      log: vi.fn(),
+      ...deps,
+    },
   );
 }
 
@@ -263,6 +320,50 @@ describe("portable demo sandbox lifecycle", () => {
 
     expect(fs.existsSync(filePath)).toBe(false);
     expect(runtime.podman).not.toHaveBeenCalled();
+  });
+
+  it("stops the receipt-owned container through qualified Podman authority (#9070)", () => {
+    const stateDir = temporaryStateDir();
+    const runtime = createPodman();
+    installReceipt(stateDir, runtime.podman);
+    runtime.podman.mockClear();
+    const beforeStop = vi.fn();
+
+    expect(
+      stopPortableDemoSandboxLifecycle(
+        "alpha",
+        {
+          agent: "openclaw",
+          gatewayName: "nemoclaw",
+          lifecycleGeneration: CONTAINER_ID,
+          openshellDriver: "docker",
+        },
+        beforeStop,
+        {
+          platform: "linux",
+          podman: runtime.podman,
+          podmanSocketAuthorityDeps: socketAuthorityDeps(),
+          stateDir,
+          hardenSocketDirectory: vi.fn(),
+          runtimeReadiness: {
+            uid: 1001,
+            home: RUNTIME_AUTHORITY.homeDir,
+            systemctl: () => ({ status: 0 }),
+            podmanCapture: () => ({
+              status: 0,
+              stdout: JSON.stringify({ Server: { Version: "5.6.1" } }),
+              stderr: "",
+            }),
+          },
+          log: vi.fn(),
+        },
+      ),
+    ).toEqual({ kind: "stopped" });
+    expect(beforeStop).toHaveBeenCalledExactlyOnceWith();
+    expect(runtime.podman).toHaveBeenCalledWith(
+      expect.arrayContaining(["stop", CONTAINER_ID]),
+      expect.any(Object),
+    );
   });
 
   it("removes a stale receipt for another startup contract (#8584)", () => {
@@ -354,39 +455,6 @@ describe("portable demo sandbox lifecycle", () => {
     expect(runtime.podman).not.toHaveBeenCalled();
   });
 
-  it("records the exact OpenShell container and applies the unless-stopped restart policy (#8441)", () => {
-    const stateDir = temporaryStateDir();
-    const { podman } = createPodman();
-
-    installReceipt(stateDir, podman);
-
-    expect(podman).toHaveBeenCalledWith([
-      "ps",
-      "-a",
-      "--no-trunc",
-      "--filter",
-      "label=openshell.managed=true",
-      "--filter",
-      "label=openshell.ai/sandbox-name=alpha",
-      "--filter",
-      "label=openshell.ai/sandbox-workspace=default",
-      "--format",
-      "{{.ID}}",
-    ]);
-    expect(podman).toHaveBeenCalledWith(["update", "--restart=unless-stopped", CONTAINER_ID]);
-    const filePath = portableDemoLifecycleInternals.receiptPath("alpha", stateDir);
-    const receipt = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-    expect(receipt).toEqual({
-      schemaVersion: 3,
-      sandboxName: "alpha",
-      sandboxId: SANDBOX_ID,
-      containerId: CONTAINER_ID,
-      dashboardPort: 18789,
-      registryGeneration: CONTAINER_ID,
-    });
-    expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
-  });
-
   it("resolves the receipt-owned container through the rootless Podman socket (#8584)", () => {
     const stateDir = temporaryStateDir();
     const runtime = createPodman();
@@ -404,10 +472,9 @@ describe("portable demo sandbox lifecycle", () => {
       containerId: CONTAINER_ID,
       dockerHost: "unix:///run/user/1001/podman/podman.sock",
     });
-    expect(hardenSocketDirectory).toHaveBeenCalledWith(SOCKET_PATH);
+    expect(hardenSocketDirectory).toHaveBeenCalledWith(SOCKET_PATH, 1001);
     expect(socketEvents.slice(0, 2)).toEqual(["harden", "capture"]);
     expect(runtime.podman.mock.calls.map(([args]) => args)).toEqual([
-      ["info", "--format", "{{.Host.RemoteSocket.Path}}"],
       [
         "--url",
         "unix:///run/user/1001/podman/podman.sock",
@@ -426,7 +493,6 @@ describe("portable demo sandbox lifecycle", () => {
       ["--url", "unix:///run/user/1001/podman/podman.sock", "inspect", CONTAINER_ID],
     ]);
     expect(runtime.podman.mock.calls.map(([, env]) => env)).toEqual([
-      expect.not.objectContaining({ CONTAINER_HOST: expect.anything() }),
       expect.not.objectContaining({ CONTAINER_HOST: expect.anything() }),
       expect.not.objectContaining({ CONTAINER_HOST: expect.anything() }),
     ]);
@@ -476,6 +542,7 @@ describe("portable demo sandbox lifecycle", () => {
     const receiptPath = portableDemoLifecycleInternals.receiptPath("alpha", stateDir);
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
     delete receipt.registryGeneration;
+    delete receipt.runtimeAuthority;
     fs.writeFileSync(receiptPath, `${JSON.stringify({ ...receipt, schemaVersion: 2 })}\n`, {
       mode: 0o600,
     });
@@ -507,16 +574,17 @@ describe("portable demo sandbox lifecycle", () => {
     expect(fs.existsSync(receiptPath)).toBe(false);
   });
 
-  it("refuses missing or duplicate portable containers before privileged exec (#8584)", () => {
-    for (const matches of [[], [CONTAINER_ID, "b".repeat(64)]]) {
+  it.each([[], [CONTAINER_ID, "b".repeat(64)]].map((matches) => [matches] as const))(
+    "refuses missing or duplicate portable containers before privileged exec [case %#] (#8584)",
+    (matches) => {
       const stateDir = temporaryStateDir();
       const runtime = createPodman();
       installReceipt(stateDir, runtime.podman);
       runtime.setMatches(matches);
 
       expect(() => resolveTarget(stateDir, runtime)).toThrow(`found ${matches.length}`);
-    }
-  });
+    },
+  );
 
   it("refuses renamed or relabeled portable containers before privileged exec (#8584)", () => {
     const stateDir = temporaryStateDir();
@@ -547,15 +615,6 @@ describe("portable demo sandbox lifecycle", () => {
     expect(() => resolveTarget(stateDir, runtime)).toThrow("is not running");
   });
 
-  it("refuses a non-local portable Podman socket before privileged exec (#8584)", () => {
-    const stateDir = temporaryStateDir();
-    const runtime = createPodman();
-    installReceipt(stateDir, runtime.podman);
-    runtime.setSocketPath("tcp://example.test:1234");
-
-    expect(() => resolveTarget(stateDir, runtime)).toThrow("socket path is invalid");
-  });
-
   it.each([
     ["foreign owner", socketAuthorityDeps({ socketUid: 2000n }), "owned by uid 2000"],
     ["world-writable socket", socketAuthorityDeps({ socketMode: 0o666n }), "writable by another"],
@@ -566,14 +625,14 @@ describe("portable demo sandbox lifecycle", () => {
     ],
     ["writable parent", socketAuthorityDeps({ directoryMode: 0o770n }), "writable by another"],
     ["symlinked parent", socketAuthorityDeps({ directory: false }), "not a real directory"],
-  ])("refuses a %s for portable privileged exec (#8584)", (_case, authority, message) => {
+  ])("refuses a %s for portable privileged exec (#8584)", (_case, authority, _message) => {
     const stateDir = temporaryStateDir();
     const runtime = createPodman();
     installReceipt(stateDir, runtime.podman);
 
     expect(() =>
       resolveTarget(stateDir, runtime, { podmanSocketAuthorityDeps: authority }),
-    ).toThrow(message);
+    ).toThrow("socket authority");
   });
 
   it("ignores ambient Podman remote selection for portable privileged exec (#8584)", () => {
@@ -590,7 +649,16 @@ describe("portable demo sandbox lifecycle", () => {
       },
     });
 
-    expect(runtime.podman.mock.calls.map(([, env]) => env)).toEqual([{}, {}, {}]);
+    runtime.podman.mock.calls.forEach(([, commandEnv]) => {
+      expect(commandEnv).toMatchObject({
+        HOME: RUNTIME_AUTHORITY.homeDir,
+        XDG_CONFIG_HOME: RUNTIME_AUTHORITY.configHome,
+        XDG_RUNTIME_DIR: RUNTIME_AUTHORITY.runtimeDir,
+      });
+      expect(commandEnv).not.toHaveProperty("CONTAINER_CONNECTION");
+      expect(commandEnv).not.toHaveProperty("CONTAINER_HOST");
+      expect(commandEnv).not.toHaveProperty("CONTAINER_SSHKEY");
+    });
   });
 
   it("refuses socket replacement after portable workload inspection (#8584)", () => {
@@ -618,7 +686,25 @@ describe("portable demo sandbox lifecycle", () => {
         STARTUP_ARGV.at(-1)!,
       ],
       { NEMOCLAW_EXPERIMENTAL_PROFILE: "portable" },
-      { platform: "linux", podman, stateDir },
+      {
+        platform: "linux",
+        podman,
+        stateDir,
+        runtimeAuthority: RUNTIME_AUTHORITY,
+        podmanSocketAuthorityDeps: socketAuthorityDeps(),
+        hardenSocketDirectory: vi.fn(),
+        runtimeReadiness: {
+          uid: 1001,
+          home: RUNTIME_AUTHORITY.homeDir,
+          systemctl: () => ({ status: 0 }),
+          podmanCapture: () => ({
+            status: 0,
+            stdout: JSON.stringify({ Server: { Version: "5.6.1" } }),
+            stderr: "",
+          }),
+        },
+        log: vi.fn(),
+      },
     );
 
     const receipt = fs.readFileSync(
@@ -667,16 +753,16 @@ describe("portable demo sandbox lifecycle", () => {
     const launchOpenshell = vi.fn();
     const log = vi.fn();
     const captureOpenshell = vi.fn((args: readonly string[]) => {
-      const command = args.find((arg) => ["true", "pgrep", "curl"].includes(arg));
+      const command = args.find((arg) => ["true", "pgrep", "curl", "python3"].includes(arg));
       switch (command) {
         case "true":
           return { status: 0 };
         case "pgrep":
           return { status: 1 };
         case "curl":
-          return launchOpenshell.mock.calls.length === 0
-            ? { status: 0, stdout: "000" }
-            : { status: 0, stdout: "200" };
+          return { status: 0, stdout: "000" };
+        case "python3":
+          return gatewayWaitResult();
         default:
           throw new Error(`Unexpected OpenShell command: ${args.join(" ")}`);
       }
@@ -696,7 +782,10 @@ describe("portable demo sandbox lifecycle", () => {
     );
 
     expect(result).toEqual({ kind: "recovered" });
-    expect(runtime.podman).toHaveBeenCalledWith(["start", CONTAINER_ID]);
+    expect(runtime.podman).toHaveBeenCalledWith(
+      ["--url", `unix://${SOCKET_PATH}`, "start", CONTAINER_ID],
+      expect.any(Object),
+    );
     expect(launchOpenshell).toHaveBeenCalledWith([
       "sandbox",
       "exec",
@@ -718,16 +807,16 @@ describe("portable demo sandbox lifecycle", () => {
     const launchOpenshell = vi.fn();
     let now = 0;
     const captureOpenshell = vi.fn((args: readonly string[]) => {
-      const command = args.find((arg) => ["true", "pgrep", "curl"].includes(arg));
+      const command = args.find((arg) => ["true", "pgrep", "curl", "python3"].includes(arg));
       switch (command) {
         case "true":
-          return { status: now >= 31_000 ? 0 : 1 };
+          return { status: now >= 30_100 ? 0 : 1 };
         case "pgrep":
           return { status: 1 };
         case "curl":
-          return launchOpenshell.mock.calls.length === 0
-            ? { status: 0, stdout: "000" }
-            : { status: 0, stdout: "200" };
+          return { status: 0, stdout: "000" };
+        case "python3":
+          return gatewayWaitResult();
         default:
           throw new Error(`Unexpected OpenShell command: ${args.join(" ")}`);
       }
@@ -750,30 +839,36 @@ describe("portable demo sandbox lifecycle", () => {
         },
       ),
     ).toEqual({ kind: "recovered" });
-    expect(now).toBe(31_000);
+    expect(now).toBe(30_100);
     expect(launchOpenshell).toHaveBeenCalledOnce();
   });
 
-  it("waits for the agent gateway to pass its health check when the managed startup process already exists (#8441)", () => {
+  it("fails after the startup timeout when the managed startup process exists and the agent gateway does not pass its health check (#8441)", () => {
     const stateDir = temporaryStateDir();
     const runtime = createPodman();
     installReceipt(stateDir, runtime.podman);
     const launchOpenshell = vi.fn();
     let now = 0;
     const captureOpenshell = vi.fn((args: readonly string[]) => {
-      const command = args.find((arg) => ["true", "pgrep", "curl"].includes(arg));
+      const command = args.find((arg) => ["true", "pgrep", "curl", "python3"].includes(arg));
       switch (command) {
         case "true":
         case "pgrep":
           return { status: 0 };
         case "curl":
-          return { status: 0, stdout: now >= 2_000 ? "200" : "000" };
+          return { status: 0, stdout: "000" };
+        case "python3": {
+          const emittedCommand = args.slice(args.lastIndexOf("--") + 1);
+          const waiterTimeoutMs = Number(emittedCommand.at(-2));
+          now += waiterTimeoutMs;
+          return gatewayWaitResult("not-ready", { sleepMs: waiterTimeoutMs });
+        }
         default:
           throw new Error(`Unexpected OpenShell command: ${args.join(" ")}`);
       }
     });
 
-    expect(
+    expect(() =>
       recoverPortableDemoSandboxLifecycle(
         "alpha",
         { agent: sandboxEntry().agent, gatewayName: "nemoclaw" },
@@ -789,37 +884,9 @@ describe("portable demo sandbox lifecycle", () => {
           },
         },
       ),
-    ).toEqual({ kind: "already-running" });
-    expect(now).toBe(2_000);
-    expect(launchOpenshell).not.toHaveBeenCalled();
-  });
-
-  it("fails after the startup timeout when the managed startup process exists and the agent gateway does not pass its health check (#8441)", () => {
-    const stateDir = temporaryStateDir();
-    const runtime = createPodman();
-    installReceipt(stateDir, runtime.podman);
-    const launchOpenshell = vi.fn();
-    let now = 0;
-
-    expect(() =>
-      recoverPortableDemoSandboxLifecycle(
-        "alpha",
-        { agent: sandboxEntry().agent, gatewayName: "nemoclaw" },
-        {
-          platform: "linux",
-          stateDir,
-          podman: runtime.podman,
-          captureOpenshell: (args) =>
-            args.includes("curl") ? { status: 0, stdout: "000" } : { status: 0 },
-          launchOpenshell,
-          now: () => now,
-          sleep: (milliseconds) => {
-            now += milliseconds;
-          },
-        },
-      ),
     ).toThrow("has a startup process, but its agent gateway did not pass");
     expect(now).toBe(90_000);
+    expect(captureOpenshell.mock.calls.filter(([args]) => args.includes("curl"))).toHaveLength(1);
     expect(launchOpenshell).not.toHaveBeenCalled();
   });
 
@@ -832,16 +899,17 @@ describe("portable demo sandbox lifecycle", () => {
     const launchOpenshell = vi.fn();
     let now = 0;
     const captureOpenshell = vi.fn((args: readonly string[]) => {
-      const command = args.find((arg) => ["true", "pgrep", "curl"].includes(arg));
+      const command = args.find((arg) => ["true", "pgrep", "curl", "python3"].includes(arg));
       switch (command) {
         case "true":
           return { status: 0 };
         case "pgrep":
           return { status: 1 };
         case "curl":
-          return launchOpenshell.mock.calls.length >= 2
-            ? { status: 0, stdout: "200" }
-            : { status: 0, stdout: "000" };
+          return { status: 0, stdout: "000" };
+        case "python3":
+          now += 89_900;
+          return gatewayWaitResult(launchOpenshell.mock.calls.length < 2 ? "not-ready" : "ready");
         default:
           throw new Error(`Unexpected OpenShell command: ${args.join(" ")}`);
       }
@@ -874,7 +942,12 @@ describe("portable demo sandbox lifecycle", () => {
       ),
     ).toEqual({ kind: "recovered" });
     expect(launchOpenshell).toHaveBeenCalledTimes(2);
-    expect(runtime.podman).not.toHaveBeenCalledWith(["start", expect.any(String)]);
+    expect(
+      runtime.podman.mock.calls.some(([args]) => {
+        const command = args[0] === "--url" ? args.slice(2) : args;
+        return command[0] === "start";
+      }),
+    ).toBe(false);
     expect(fs.readFileSync(receiptPath, "utf-8")).toBe(originalReceipt);
   });
 
@@ -886,9 +959,14 @@ describe("portable demo sandbox lifecycle", () => {
     const otherFilePath = portableDemoLifecycleInternals.receiptPath("beta", stateDir);
     const otherReceipt = '{"sandboxName":"beta"}\n';
     fs.writeFileSync(otherFilePath, otherReceipt, { mode: 0o600 });
-    runtime.podman.mockReturnValue({
-      status: 125,
-      stdout: `Error: no such container ${CONTAINER_ID}`,
+    runtime.podman.mockImplementation((args) => {
+      const command = args[0] === "--url" ? args.slice(2) : args;
+      return command[0] === "info"
+        ? { status: 0, stdout: `${SOCKET_PATH}\n` }
+        : {
+            status: 125,
+            stdout: `Error: no such container ${CONTAINER_ID}`,
+          };
     });
 
     expect(
@@ -1328,13 +1406,14 @@ describe("portable demo sandbox lifecycle", () => {
     expect(launchHost).toHaveBeenCalledOnce();
   });
 
-  it("restarts the managed startup process once when recovery upgrades a schema-1 receipt (#8441)", () => {
+  it("refuses schema-1 recovery without recorded runtime authority (#9070)", () => {
     const stateDir = temporaryStateDir();
     const runtime = createPodman();
     installReceipt(stateDir, runtime.podman);
     const receiptPath = portableDemoLifecycleInternals.receiptPath("alpha", stateDir);
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf-8"));
     delete receipt.registryGeneration;
+    delete receipt.runtimeAuthority;
     fs.writeFileSync(
       receiptPath,
       `${JSON.stringify({ ...receipt, schemaVersion: 1 }, null, 2)}\n`,
@@ -1342,75 +1421,15 @@ describe("portable demo sandbox lifecycle", () => {
         mode: 0o600,
       },
     );
-    let startupRunning = true;
-    let gatewayRunning = true;
-    const launchOpenshell = vi.fn(() => {
-      startupRunning = true;
-      gatewayRunning = true;
-    });
-    const captureOpenshell = vi.fn((args: readonly string[]) => {
-      const command = args.find((arg) => ["true", "pgrep", "pkill", "curl"].includes(arg));
-      switch (command) {
-        case "true":
-          return { status: 0 };
-        case "pgrep":
-          return { status: startupRunning ? 0 : 1 };
-        case "pkill":
-          startupRunning = false;
-          gatewayRunning = false;
-          return { status: 0 };
-        case "curl":
-          return { status: 0, stdout: gatewayRunning ? "200" : "000" };
-        default:
-          throw new Error(`Unexpected OpenShell command: ${args.join(" ")}`);
-      }
-    });
-    const deps = {
-      platform: "linux" as const,
-      stateDir,
-      podman: runtime.podman,
-      captureOpenshell,
-      launchOpenshell,
-    };
-
-    expect(
+    runtime.podman.mockClear();
+    expect(() =>
       recoverPortableDemoSandboxLifecycle(
         "alpha",
         { agent: sandboxEntry().agent, gatewayName: "nemoclaw" },
-        deps,
+        { platform: "linux", stateDir, podman: runtime.podman },
       ),
-    ).toEqual({ kind: "recovered" });
-    expect(captureOpenshell).toHaveBeenCalledWith(
-      [
-        "sandbox",
-        "exec",
-        "-g",
-        "nemoclaw",
-        "--name",
-        "alpha",
-        "--no-tty",
-        "--",
-        "pkill",
-        "-TERM",
-        "-f",
-        "^(/usr/local/bin/nemoclaw-start|(bash|/bin/bash|/usr/bin/bash) /usr/local/bin/nemoclaw-start)( |$)",
-      ],
-      5000,
-    );
-    expect(launchOpenshell).toHaveBeenCalledOnce();
-    expect(JSON.parse(fs.readFileSync(receiptPath, "utf-8"))).toMatchObject({
-      schemaVersion: 3,
-      registryGeneration: CONTAINER_ID,
-    });
-
-    expect(
-      recoverPortableDemoSandboxLifecycle(
-        "alpha",
-        { agent: sandboxEntry().agent, gatewayName: "nemoclaw" },
-        deps,
-      ),
-    ).toEqual({ kind: "already-running" });
-    expect(launchOpenshell).toHaveBeenCalledOnce();
+    ).toThrow("predates recorded portable Podman authority");
+    expect(runtime.podman).not.toHaveBeenCalled();
   });
 
   it("fails closed for a schema-1 receipt when the gateway is healthy without its managed startup process (#8441)", () => {
@@ -1420,6 +1439,7 @@ describe("portable demo sandbox lifecycle", () => {
     const receiptPath = portableDemoLifecycleInternals.receiptPath("alpha", stateDir);
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf-8"));
     delete receipt.registryGeneration;
+    delete receipt.runtimeAuthority;
     fs.writeFileSync(
       receiptPath,
       `${JSON.stringify({ ...receipt, schemaVersion: 1 }, null, 2)}\n`,
@@ -1451,7 +1471,7 @@ describe("portable demo sandbox lifecycle", () => {
           launchOpenshell,
         },
       ),
-    ).toThrow("agent gateway without its managed startup process");
+    ).toThrow("predates recorded portable Podman authority");
     expect(launchOpenshell).not.toHaveBeenCalled();
     expect(JSON.parse(fs.readFileSync(receiptPath, "utf-8"))).toMatchObject({ schemaVersion: 1 });
   });

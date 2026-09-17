@@ -6,11 +6,13 @@ import {
   allGatewayPortsRequested,
   runUninstallAllGatewayPorts,
 } from "../../../lib/actions/uninstall/all-gateway-ports";
-import { runUninstallPlan } from "../../../lib/actions/uninstall/run-plan";
+import { backupAllUnderPortableHostFence } from "../../../lib/actions/maintenance";
+import { runUninstallPlanProduction } from "../../../lib/actions/uninstall/run-plan";
 import { CLI_DISPLAY_NAME, CLI_NAME } from "../../../lib/cli/branding";
 import { NemoClawCommand } from "../../../lib/cli/nemoclaw-oclif-command";
 import { GATEWAY_PORT } from "../../../lib/core/ports";
 import { resolveGatewayName } from "../../../lib/onboard/gateway-binding";
+import { withSandboxMutationLock } from "../../../lib/state/mcp-lifecycle-lock";
 
 export default class InternalUninstallRunPlanCommand extends NemoClawCommand {
   static hidden = true;
@@ -30,11 +32,12 @@ export default class InternalUninstallRunPlanCommand extends NemoClawCommand {
     "all-gateway-ports-child": Flags.boolean({ hidden: true }),
     "keep-openshell": Flags.boolean({ description: "Leave the openshell binary installed" }),
     "delete-models": Flags.boolean({
-      description: `Remove ${CLI_DISPLAY_NAME}-pulled Ollama models`,
+      description:
+        "Remove all Ollama models and non-credential Hugging Face cache data (authentication files remain)",
     }),
     "destroy-user-data": Flags.boolean({
       description:
-        "Also remove preserved user data under ~/.nemoclaw/ (rebuild-backups/, backups/, sandboxes.json)",
+        "Skip eligible fresh sandbox backups and remove preserved data from the selected gateway state root",
     }),
     gateway: Flags.string({
       description: "Gateway name",
@@ -51,13 +54,27 @@ export default class InternalUninstallRunPlanCommand extends NemoClawCommand {
       gatewayName: flags.gateway,
       keepOpenShell: flags["keep-openshell"] ?? false,
     };
+    const backupAllBeforeUninstall = (sandboxNames: readonly string[]) =>
+      backupAllUnderPortableHostFence({
+        purpose: "pre-uninstall",
+        requireAll: true,
+        sandboxNames,
+        skipUnreachable: false,
+      });
     if (allGatewayPortsRequested(flags["all-gateway-ports"], process.env)) {
-      this.applyExitResult(runUninstallAllGatewayPorts(options));
+      this.applyExitResult(
+        await runUninstallAllGatewayPorts(options, {
+          backupAllBeforeUninstall,
+          withSandboxMutationLock,
+        }),
+      );
       return;
     }
     this.applyExitResult(
-      runUninstallPlan(options, {
+      await runUninstallPlanProduction(options, {
+        backupAllBeforeUninstall,
         requireCompleteGatewayProcessCleanup: flags["all-gateway-ports-child"] ?? false,
+        withSandboxMutationLock,
       }),
     );
   }

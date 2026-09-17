@@ -6,7 +6,12 @@ import path from "node:path";
 
 import { isErrnoException } from "../core/errno";
 import { detectNvidiaPlatform, type NvidiaPlatform } from "../inference/nim";
-import { selectVllmModelFromEnv, type VllmModelDef } from "../inference/vllm-models";
+import {
+  selectVllmModelFromEnv,
+  STATION_PAIR_OPTIONAL_ORCHESTRATION,
+  type VllmModelDef,
+  vllmStationPairForOrchestration,
+} from "../inference/vllm-models";
 import { NAME_MAX_LENGTH, NAME_VALID_PATTERN } from "../name-validation";
 import { getNemoclawStateRoot, resolveHome, STATE_DIR_NAME } from "../state/state-root";
 import { isSafeModelId } from "../validation";
@@ -99,8 +104,6 @@ const BOUND_RECEIPT_INTENT_KEYS =
 const SPARK_INTENT_KEYS = "kind,sandboxName,version";
 const SPARK_INTENT_KEYS_WITH_MODEL = "kind,model,sandboxName,version";
 const SPARK_EXPRESS_PROVIDER = "install-vllm";
-const STATION_ULTRA_ENV_VALUE = "nemotron-3-ultra-550b-a55b";
-const STATION_ULTRA_DUAL_SERVED_MODEL = "nemotron-ultra";
 const STATION_EXPRESS_INSTALLER_RESUME_FILE = "station-express-resume";
 const STATION_EXPRESS_RETIREMENT_CLAIM_PREFIX = `${STATION_EXPRESS_INSTALLER_RESUME_FILE}.retiring-`;
 const STATION_EXPRESS_RETIREMENT_CLAIM_RECEIPT = "receipt";
@@ -146,7 +149,12 @@ function sparkModel(value: unknown): VllmModelDef | null {
 
 function canonicalStationModelValue(value: string): string | null {
   if (value.trim() !== value) return null;
-  return stationModel(value)?.envValue ?? null;
+  const model = stationModel(value);
+  if (!model) return null;
+  const normalized = value.toLowerCase();
+  return normalized === model.envValue.toLowerCase() || normalized === model.id.toLowerCase()
+    ? model.envValue
+    : null;
 }
 
 function servedModel(model: VllmModelDef): string {
@@ -157,15 +165,26 @@ function qualifiedDualStationServedModel(
   env: NodeJS.ProcessEnv,
   model: VllmModelDef,
 ): string | null {
+  let stationPair;
+  try {
+    stationPair = vllmStationPairForOrchestration(
+      model,
+      STATION_PAIR_OPTIONAL_ORCHESTRATION,
+      "station",
+      "arm64",
+    );
+  } catch {
+    return null;
+  }
   if (
-    model.envValue !== STATION_ULTRA_ENV_VALUE ||
+    !stationPair ||
     String(env.NEMOCLAW_DGX_STATION_PEER ?? "").trim().length === 0 ||
     String(env.NEMOCLAW_DGX_STATION_SSH_BINDING ?? "").trim().length === 0
   ) {
     return null;
   }
   const selected = String(env.NEMOCLAW_MODEL ?? "").trim();
-  return selected === STATION_ULTRA_DUAL_SERVED_MODEL ? selected : null;
+  return selected === stationPair.servedName ? selected : null;
 }
 
 function identifiesCheckpoint(model: VllmModelDef, value: string): boolean {
@@ -240,8 +259,22 @@ function lstatOrNull(candidate: string): fs.Stats | null {
 
 function assertOwnerOnlyDirectory(candidate: string, stat: fs.Stats): void {
   const uid = process.getuid?.();
-  if (!stat.isDirectory() || uid === undefined || stat.uid !== uid || (stat.mode & 0o077) !== 0) {
-    throw new Error(`Refusing non-owner-only DGX Station Express resume directory: ${candidate}`);
+  if (!stat.isDirectory()) {
+    throw new Error(
+      `Refusing NemoClaw installer resume path that is not a directory: ${candidate}`,
+    );
+  }
+  if (uid === undefined || stat.uid !== uid) {
+    throw new Error(
+      `Refusing NemoClaw installer resume directory that is not owned by the current user: ${candidate}`,
+    );
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    const mode = (stat.mode & 0o7777).toString(8).padStart(4, "0");
+    throw new Error(
+      `NemoClaw installer resume directory has mode ${mode}; expected 0700: ${candidate}. ` +
+        'After you verify ownership, run `chmod 700 -- "$HOME/.nemoclaw"` for the default state directory.',
+    );
   }
 }
 
@@ -267,14 +300,17 @@ function assertStationExpressClearStatePathSafe(paths: StationExpressReceiptPath
     if (stat.isSymbolicLink()) {
       throw new Error(`Refusing symbolic link in DGX Station Express resume path: ${candidate}`);
     }
-    const isLegacyStateBase = candidate === paths.stateBase && (stat.mode & 0o7777) === 0o755;
+    const isLegacyStateBase =
+      candidate === paths.stateBase && stat.isDirectory() && (stat.mode & 0o7777) === 0o755;
     if (!isLegacyStateBase) {
       assertOwnerOnlyDirectory(candidate, stat);
       continue;
     }
     const uid = process.getuid?.();
-    if (!stat.isDirectory() || uid === undefined || stat.uid !== uid) {
-      throw new Error(`Refusing non-owner-only DGX Station Express resume directory: ${candidate}`);
+    if (uid === undefined || stat.uid !== uid) {
+      throw new Error(
+        `Refusing NemoClaw installer resume directory that is not owned by the current user: ${candidate}`,
+      );
     }
   }
 }
@@ -785,6 +821,29 @@ export function parseStationExpressResumeIntent(value: unknown): StationExpressR
   };
 }
 
+export function isValidStationExpressProviderState(
+  intent: StationExpressResumeIntent,
+  providerStepStatus: string | null | undefined,
+  provider: unknown,
+  model: unknown,
+): boolean {
+  const providerComplete = providerStepStatus === "complete";
+  const providerBound = Boolean(
+    intent.kind !== "spark" && intent.servedModel && intent.checkpointModel,
+  );
+  if (providerComplete !== providerBound) return false;
+  if (providerComplete) {
+    return intent.kind !== "spark" && provider === "vllm-local" && model === intent.servedModel;
+  }
+  if (provider == null && model == null) return true;
+  if (provider !== "vllm-local" || typeof model !== "string" || model.trim().length === 0) {
+    return false;
+  }
+  return (
+    intent.kind === "spark" || (model.length <= MAX_SERVED_MODEL_LENGTH && isSafeModelId(model))
+  );
+}
+
 export function bindStationExpressProviderSelection(
   intentValue: unknown,
   provider: unknown,
@@ -1034,17 +1093,11 @@ function matchesRecordedStationExpressSelection(
   intent: StationExpressResumeIntent,
 ): boolean {
   if (session.sandboxName != null && session.sandboxName !== intent.sandboxName) return false;
-
-  const providerComplete = session.steps?.provider_selection?.status === "complete";
-  if (intent.kind === "spark") {
-    return !providerComplete && session.provider == null && session.model == null;
-  }
-  const providerBound = Boolean(intent.servedModel && intent.checkpointModel);
-  if (providerComplete !== providerBound) return false;
-  if (!providerComplete) return session.provider == null && session.model == null;
-
-  return Boolean(
-    intent.servedModel && session.provider === "vllm-local" && session.model === intent.servedModel,
+  return isValidStationExpressProviderState(
+    intent,
+    session.steps?.provider_selection?.status,
+    session.provider,
+    session.model,
   );
 }
 
@@ -1079,7 +1132,7 @@ export function withStationExpressResumeEnvironment<Options extends ResumeOption
           deps.clearInstallerResume();
         } catch (error) {
           deps.error(
-            `  Could not discard DGX Station Express installer resume state: ${error instanceof Error ? error.message : String(error)}`,
+            `  Could not discard NemoClaw installer resume state: ${error instanceof Error ? error.message : String(error)}`,
           );
           deps.exitProcess(1);
         }

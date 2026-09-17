@@ -6,6 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import {
+  serializedHostLocalInferenceReceipt,
+  serializedLlamaCppHostLocalInferenceReceipt,
+} from "../../../test/helpers/host-local-inference-receipt";
 import { managedStartupE2eProfile } from "../../../scripts/checks/generate-managed-startup-profile-fixture.mts";
 import { decisionSelected } from "../state/onboard-checkpoint-decision";
 import { deriveCheckpointFromSession } from "../state/onboard-checkpoint-migrate";
@@ -15,6 +19,7 @@ import type {
 } from "../state/onboard-checkpoint-types";
 import { createSession } from "../state/onboard-session";
 import type { SandboxEntry } from "../state/registry";
+import { createSandboxHostLocalInferenceProvenance } from "../state/registry/host-local-inference";
 import { encodeManagedStartupProfile } from "./managed-startup/profile";
 import { createDockerRuntimeProviderBundle } from "./runtime-provider/docker";
 import { createRuntimeProviderBundleRegistry } from "./runtime-provider/registry";
@@ -23,18 +28,23 @@ import {
   advanceSandboxRecreateTransaction,
   assertSandboxRecreateSourceProof,
   beginSandboxRecreateTransaction,
+  captureCreatedSandboxLifecycleRegistration,
   clearCompletedSandboxRecreateTransaction,
+  createCreatedSandboxLifecycle,
   createSandboxRecreateRuntime,
   fingerprintSandboxLiveIdentity,
   fingerprintSandboxRecreateValue,
   fingerprintSandboxRegistryEntry,
   matchingSandboxRecreateTransaction,
   planSandboxRecreateRecovery,
+  revalidateCreatedSandboxLifecycleRegistration,
   retireReplacedSandboxWorkload,
   type SandboxRecreateObservation,
   SandboxRecreateSourceMismatchError,
   sandboxRecreateSourceProof,
   sandboxRecreateSourceWorkloadEntry,
+  selectCreatedSandboxLifecycleRegistration,
+  selectSandboxRecreateTargetIntentFingerprint,
   selectedGatewayForSandboxRecreate,
 } from "./sandbox-recreate-transaction";
 import { nativeArtifactWorkloadReceiptFixture } from "./workload/native-artifact-test-fixture";
@@ -49,6 +59,7 @@ const TARGET_INTENT = fingerprintSandboxRecreateValue({
   agent: "openclaw",
   provider: "nvidia",
 });
+const CREATED_TARGET = { sandboxName: "alpha", gatewayName: "owner-gateway" };
 const SOURCE_ENTRY: SandboxEntry = {
   name: "alpha",
   agent: "openclaw",
@@ -111,6 +122,96 @@ function transactionAt(
   };
 }
 
+function freshTransactionAt(
+  phase: CheckpointSandboxRecreatePhase,
+): CheckpointSandboxRecreateTransaction {
+  return {
+    ...transactionAt(phase),
+    sourceRegistryFingerprint: fingerprintSandboxRecreateValue(null),
+    sourceLiveIdentityFingerprint: null,
+    sourceWorkload: null,
+  };
+}
+
+function creatingLifecycleFixture(generationOverride?: string) {
+  const session = createSession({ sandboxName: "alpha" });
+  beginSandboxRecreateTransaction(
+    session,
+    beginInput({ state: "ready", liveIdentityFingerprint: SOURCE_ID }),
+  );
+  let observation: SandboxRecreateObservation = {
+    state: "ready",
+    liveIdentityFingerprint: SOURCE_ID,
+  };
+  const runtime = createSandboxRecreateRuntime(
+    {
+      loadSession: () => session,
+      updateSession: (mutator) => {
+        mutator(session);
+        return session;
+      },
+    },
+    {
+      id: TX_ID,
+      targetGeneration: TARGET_GENERATION,
+      targetIntentFingerprint: TARGET_INTENT,
+    },
+    "alpha",
+    "nemoclaw-31818",
+    SOURCE_ENTRY,
+    () => observation,
+    () => undefined,
+  );
+  runtime.advance("deleting");
+  observation = { state: "missing", liveIdentityFingerprint: null };
+  runtime.confirmDeleted();
+  runtime.advance("creating");
+  return {
+    lifecycle: createCreatedSandboxLifecycle(
+      runtime,
+      CREATED_TARGET,
+      () => observation,
+      generationOverride,
+    ),
+    session,
+    setObservation: (next: SandboxRecreateObservation) => {
+      observation = next;
+    },
+  };
+}
+
+describe("sandbox recreate target intent selection", () => {
+  it("keeps the active transaction target when the requested target changes", () => {
+    const transaction = transactionAt("planned");
+    const changedTarget = fingerprintSandboxRecreateValue({
+      agent: "hermes",
+      provider: "ollama",
+    });
+
+    expect(
+      selectSandboxRecreateTargetIntentFingerprint(transaction, changedTarget, TARGET_INTENT),
+    ).toBe(TARGET_INTENT);
+  });
+
+  it("uses the requested target when no active transaction exists", () => {
+    expect(selectSandboxRecreateTargetIntentFingerprint(null, TARGET_INTENT, null)).toBe(
+      TARGET_INTENT,
+    );
+  });
+
+  it("uses the requested target when the active transaction was not handed off", () => {
+    const transaction = transactionAt("planned");
+    const changedTarget = fingerprintSandboxRecreateValue({
+      agent: "hermes",
+      provider: "ollama",
+    });
+
+    expect(selectSandboxRecreateTargetIntentFingerprint(transaction, changedTarget, null)).toBe(
+      changedTarget,
+    );
+  });
+});
+
 describe("sandbox recreate journal", () => {
   it("binds a secret-free transaction to a non-default gateway before deletion (#6492)", () => {
     const session = createSession({ sandboxName: "alpha", agent: "openclaw" });
@@ -137,6 +238,36 @@ describe("sandbox recreate journal", () => {
     const serialized = JSON.stringify(transaction);
     expect(serialized).not.toContain("NVIDIA_API_KEY");
     expect(serialized).not.toContain("model-a");
+  });
+
+  it("journals a fresh create only after OpenShell proves the name is absent (#9833)", () => {
+    const session = createSession({ sandboxName: "alpha", agent: "openclaw" });
+    const transaction = beginSandboxRecreateTransaction(session, {
+      ...beginInput({ state: "missing", liveIdentityFingerprint: null }),
+      sourceEntry: null,
+    });
+
+    expect(transaction).toMatchObject({
+      sandboxName: "alpha",
+      gatewayName: "nemoclaw-31818",
+      gatewayPort: 31818,
+      sourceRegistryFingerprint: fingerprintSandboxRecreateValue(null),
+      sourceLiveIdentityFingerprint: null,
+      sourceWorkload: null,
+      phase: "deleted",
+    });
+    expect(session.checkpoint?.sandboxRecreate).toBe(transaction);
+  });
+
+  it("refuses an absent-source journal when OpenShell reports a same-name sandbox (#9833)", () => {
+    const session = createSession({ sandboxName: "alpha", agent: "openclaw" });
+
+    expect(() =>
+      beginSandboxRecreateTransaction(session, {
+        ...beginInput({ state: "ready", liveIdentityFingerprint: SOURCE_ID }),
+        sourceEntry: null,
+      }),
+    ).toThrow(/without its source registry row.*same-name sandbox/su);
   });
 
   it("retains a shared source image after reconstructing an interrupted replacement", () => {
@@ -322,6 +453,9 @@ describe("sandbox recreate journal", () => {
           mutator(session);
           return session;
         },
+        compareAndSwapSession: (matches, mutator) => {
+          return matches(session) ? (mutator(session), "updated") : "mismatch";
+        },
       },
       {
         id: TX_ID,
@@ -340,7 +474,7 @@ describe("sandbox recreate journal", () => {
     runtime.confirmDeleted();
     runtime.advance("creating");
     observation = { state: "ready", liveIdentityFingerprint: TARGET_ID };
-    runtime.recordCreated();
+    runtime.recordCreated(observation);
 
     expect(runtime).toMatchObject({
       acceptedTarget: false,
@@ -354,6 +488,56 @@ describe("sandbox recreate journal", () => {
       phase: "created",
       revision: 4,
       targetLiveIdentityFingerprint: TARGET_ID,
+    });
+  });
+
+  it("rejects a malformed replacement identity before the recreate journal records it (#8942)", () => {
+    const session = createSession({ sandboxName: "alpha" });
+    beginSandboxRecreateTransaction(
+      session,
+      beginInput({ state: "ready", liveIdentityFingerprint: SOURCE_ID }),
+    );
+    let observation: SandboxRecreateObservation = {
+      state: "ready",
+      liveIdentityFingerprint: SOURCE_ID,
+    };
+    const runtime = createSandboxRecreateRuntime(
+      {
+        loadSession: () => session,
+        updateSession: (mutator) => {
+          mutator(session);
+          return session;
+        },
+        compareAndSwapSession: (matches, mutator) => {
+          return matches(session) ? (mutator(session), "updated") : "mismatch";
+        },
+      },
+      {
+        id: TX_ID,
+        targetGeneration: TARGET_GENERATION,
+        targetIntentFingerprint: TARGET_INTENT,
+      },
+      "alpha",
+      "nemoclaw-31818",
+      SOURCE_ENTRY,
+      () => observation,
+      () => undefined,
+    );
+
+    runtime.advance("deleting");
+    observation = { state: "missing", liveIdentityFingerprint: null };
+    runtime.confirmDeleted();
+    runtime.advance("creating");
+
+    expect(() =>
+      runtime.recordCreated({
+        state: "ready",
+        liveIdentityFingerprint: "not-a-fingerprint",
+      }),
+    ).toThrow(/valid live identity fingerprint/u);
+    expect(session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "creating",
+      targetLiveIdentityFingerprint: null,
     });
   });
 
@@ -373,6 +557,9 @@ describe("sandbox recreate journal", () => {
         updateSession: (mutator) => {
           mutator(session);
           return session;
+        },
+        compareAndSwapSession: (matches, mutator) => {
+          return matches(session) ? (mutator(session), "updated") : "mismatch";
         },
       },
       {
@@ -398,6 +585,77 @@ describe("sandbox recreate journal", () => {
     observation = { state: "missing", liveIdentityFingerprint: null };
     expect(runtime.beginDelete()).toBe("missing");
     expect(session.checkpoint?.sandboxRecreate).toMatchObject({ phase: "deleting" });
+  });
+
+  it("revalidates authority and source evidence at the second delete edge (#10491)", () => {
+    const session = createSession({ sandboxName: "alpha" });
+    beginSandboxRecreateTransaction(
+      session,
+      beginInput({ state: "ready", liveIdentityFingerprint: SOURCE_ID }),
+    );
+    let registryEntry = SOURCE_ENTRY;
+    let observation: SandboxRecreateObservation = {
+      state: "ready",
+      liveIdentityFingerprint: SOURCE_ID,
+    };
+    const revalidateGatewayAuthority = vi.fn();
+    const runtime = createSandboxRecreateRuntime(
+      {
+        loadSession: () => session,
+        updateSession: (mutator) => (mutator(session), session),
+        compareAndSwapSession: (matches, mutator) =>
+          matches(session) ? (mutator(session), "updated") : "mismatch",
+      },
+      { id: TX_ID, targetGeneration: TARGET_GENERATION, targetIntentFingerprint: TARGET_INTENT },
+      "alpha",
+      "nemoclaw-31818",
+      SOURCE_ENTRY,
+      () => observation,
+      () => undefined,
+      () => registryEntry,
+      revalidateGatewayAuthority,
+    );
+
+    expect(runtime.beginDelete()).toBe("source");
+    registryEntry = { ...SOURCE_ENTRY, imageTag: "foreign" };
+    observation = { state: "ready", liveIdentityFingerprint: FOREIGN_ID };
+    expect(() => runtime.beginDelete()).toThrow(/registry row changed|not the journaled source/iu);
+    expect(revalidateGatewayAuthority).toHaveBeenCalledTimes(2);
+    expect(session.checkpoint?.sandboxRecreate).toMatchObject({ phase: "deleting", revision: 1 });
+  });
+
+  it("refuses authority drift after the runtime opens (#10491)", () => {
+    const session = createSession({ sandboxName: "alpha" });
+    beginSandboxRecreateTransaction(
+      session,
+      beginInput({ state: "ready", liveIdentityFingerprint: SOURCE_ID }),
+    );
+    let authorityMatches = true;
+    const runtime = createSandboxRecreateRuntime(
+      {
+        loadSession: () => session,
+        updateSession: (mutator) => (mutator(session), session),
+        compareAndSwapSession: (matches, mutator) =>
+          matches(session) ? (mutator(session), "updated") : "mismatch",
+      },
+      { id: TX_ID, targetGeneration: TARGET_GENERATION, targetIntentFingerprint: TARGET_INTENT },
+      "alpha",
+      "nemoclaw-31818",
+      SOURCE_ENTRY,
+      () => ({ state: "ready", liveIdentityFingerprint: SOURCE_ID }),
+      () => undefined,
+      () => SOURCE_ENTRY,
+      () =>
+        authorityMatches
+          ? undefined
+          : (() => {
+              throw new Error("gateway lifecycle authority changed");
+            })(),
+    );
+    authorityMatches = false;
+
+    expect(() => runtime.beginDelete()).toThrow(/gateway lifecycle authority changed/iu);
+    expect(session.checkpoint?.sandboxRecreate).toMatchObject({ phase: "planned", revision: 0 });
   });
 
   it("refuses to open the delete edge when no transaction proves the source (#7736)", () => {
@@ -434,6 +692,12 @@ describe("sandbox recreate journal", () => {
       updateSession: (mutator: (current: typeof session) => void) => {
         mutator(session);
         return session;
+      },
+      compareAndSwapSession: (
+        matches: (current: typeof session) => boolean,
+        mutator: (current: typeof session) => typeof session | void,
+      ) => {
+        return matches(session) ? (mutator(session), "updated" as const) : ("mismatch" as const);
       },
     };
     const request = {
@@ -521,7 +785,7 @@ describe("sandbox recreate journal", () => {
     expect(restart().acceptedTarget).toBe(false);
 
     observation = { state: "ready", liveIdentityFingerprint: TARGET_ID };
-    runtime.recordCreated();
+    runtime.recordCreated(observation);
     expect(() => restart()).toThrow(/registration did not commit/i);
 
     registryEntry = {
@@ -565,33 +829,31 @@ describe("sandbox recreate journal", () => {
 });
 
 describe("sandbox recreate recovery", () => {
-  it.each([
-    "planned",
-    "deleting",
-  ] as const)("continues source deletion from %s when both identities still match", (phase) => {
-    expect(
-      planSandboxRecreateRecovery(
-        transactionAt(phase),
-        { state: "ready", liveIdentityFingerprint: SOURCE_ID },
-        SOURCE_ENTRY,
-      ),
-    ).toEqual({ action: "continue_delete" });
-  });
+  it.each(["planned", "deleting"] as const)(
+    "continues source deletion from %s when both identities still match",
+    (phase) => {
+      expect(
+        planSandboxRecreateRecovery(
+          transactionAt(phase),
+          { state: "ready", liveIdentityFingerprint: SOURCE_ID },
+          SOURCE_ENTRY,
+        ),
+      ).toEqual({ action: "continue_delete" });
+    },
+  );
 
-  it.each([
-    "planned",
-    "deleting",
-    "deleted",
-    "creating",
-  ] as const)("continues target creation from %s when the source is durably absent", (phase) => {
-    expect(
-      planSandboxRecreateRecovery(
-        transactionAt(phase),
-        { state: "missing", liveIdentityFingerprint: null },
-        SOURCE_ENTRY,
-      ),
-    ).toEqual({ action: "continue_create" });
-  });
+  it.each(["planned", "deleting", "deleted", "creating"] as const)(
+    "continues target creation from %s when the source is durably absent",
+    (phase) => {
+      expect(
+        planSandboxRecreateRecovery(
+          transactionAt(phase),
+          { state: "missing", liveIdentityFingerprint: null },
+          SOURCE_ENTRY,
+        ),
+      ).toEqual({ action: "continue_create" });
+    },
+  );
 
   it.each([
     "planned",
@@ -601,19 +863,22 @@ describe("sandbox recreate recovery", () => {
     "created",
     "registry_committing",
     "completed",
-  ] as const)("accepts the ready target from %s when its generation and live identity match", (phase) => {
-    expect(
-      planSandboxRecreateRecovery(
-        transactionAt(phase),
-        { state: "ready", liveIdentityFingerprint: TARGET_ID },
-        {
-          ...SOURCE_ENTRY,
-          lifecycleGeneration: TARGET_GENERATION,
-          lifecycleLiveIdentityFingerprint: TARGET_ID,
-        },
-      ),
-    ).toEqual({ action: "accept_target" });
-  });
+  ] as const)(
+    "accepts the ready target from %s when its generation and live identity match",
+    (phase) => {
+      expect(
+        planSandboxRecreateRecovery(
+          transactionAt(phase),
+          { state: "ready", liveIdentityFingerprint: TARGET_ID },
+          {
+            ...SOURCE_ENTRY,
+            lifecycleGeneration: TARGET_GENERATION,
+            lifecycleLiveIdentityFingerprint: TARGET_ID,
+          },
+        ),
+      ).toEqual({ action: "accept_target" });
+    },
+  );
 
   it("rejects a changed source registry row before delete", () => {
     expect(
@@ -665,6 +930,19 @@ describe("sandbox recreate recovery", () => {
     ).toMatchObject({ action: "reject", reason: expect.stringMatching(/appeared/) });
   });
 
+  it("rejects a different same-name sandbox after a fresh target identity was journaled (#9833)", () => {
+    expect(
+      planSandboxRecreateRecovery(
+        freshTransactionAt("created"),
+        { state: "ready", liveIdentityFingerprint: FOREIGN_ID },
+        null,
+      ),
+    ).toMatchObject({
+      action: "reject",
+      reason: expect.stringMatching(/not the journaled created sandbox/u),
+    });
+  });
+
   it("rejects a registered target that is not ready", () => {
     expect(
       planSandboxRecreateRecovery(
@@ -677,6 +955,61 @@ describe("sandbox recreate recovery", () => {
         },
       ),
     ).toMatchObject({ action: "reject", reason: expect.stringMatching(/not ready/) });
+  });
+
+  it("selects an exact not-ready replacement with a parent-format pending checkpoint (#10560)", () => {
+    expect(
+      planSandboxRecreateRecovery(
+        transactionAt("created"),
+        { state: "not_ready", liveIdentityFingerprint: TARGET_ID },
+        {
+          ...SOURCE_ENTRY,
+          lifecycleGeneration: TARGET_GENERATION,
+          lifecycleLiveIdentityFingerprint: TARGET_ID,
+          pendingRouteReservation: true,
+          reservationSessionId: "v0-0-55-upgrade-session",
+          pendingCreateIdentity: {
+            schemaVersion: 1,
+            state: "verified-create",
+            gatewayName: "nemoclaw-31818",
+            gatewayPort: 31818,
+            sandboxName: "alpha",
+            lifecycleGeneration: TARGET_GENERATION,
+            sandboxIdentityFingerprint: TARGET_ID,
+            route: "compatibility",
+          },
+        },
+      ),
+    ).toEqual({ action: "accept_target" });
+  });
+
+  it("rejects identity drift in a parent-format pending replacement (#10560)", () => {
+    expect(
+      planSandboxRecreateRecovery(
+        transactionAt("created"),
+        { state: "not_ready", liveIdentityFingerprint: FOREIGN_ID },
+        {
+          ...SOURCE_ENTRY,
+          lifecycleGeneration: TARGET_GENERATION,
+          lifecycleLiveIdentityFingerprint: TARGET_ID,
+          pendingRouteReservation: true,
+          reservationSessionId: "v0-0-55-upgrade-session",
+          pendingCreateIdentity: {
+            schemaVersion: 1,
+            state: "verified-create",
+            gatewayName: "nemoclaw-31818",
+            gatewayPort: 31818,
+            sandboxName: "alpha",
+            lifecycleGeneration: TARGET_GENERATION,
+            sandboxIdentityFingerprint: TARGET_ID,
+            route: "compatibility",
+          },
+        },
+      ),
+    ).toMatchObject({
+      action: "reject",
+      reason: expect.stringMatching(/not the journaled pending replacement/u),
+    });
   });
 
   it("rejects a ready same-name sandbox whose identity differs from the registered target", () => {
@@ -719,6 +1052,8 @@ describe("source registry fingerprint", () => {
     vi.resetModules();
     try {
       const registry = await import("../state/registry");
+      const lifecycleGeneration = "00000000-0000-4000-8000-000000000001";
+      const lifecycleLiveIdentityFingerprint = "a".repeat(64);
       registry.registerSandbox({
         name: "alpha",
         agent: "openclaw",
@@ -732,10 +1067,12 @@ describe("source registry fingerprint", () => {
         preferredInferenceApi: "openai-responses",
         gatewayName: "nemoclaw",
         gatewayPort: 8080,
+        lifecycleGeneration,
+        lifecycleLiveIdentityFingerprint,
       });
-      const journaled = fingerprintSandboxRegistryEntry(
-        registry.getSandbox("alpha") as SandboxEntry,
-      );
+      const sourceEntry = registry.getSandbox("alpha") as SandboxEntry;
+      const journaled = fingerprintSandboxRegistryEntry(sourceEntry);
+      const hostLocalInferenceReceipt = serializedHostLocalInferenceReceipt("podman");
 
       expect(
         registry.reserveSandboxInferenceRoute("alpha", {
@@ -747,11 +1084,73 @@ describe("source registry fingerprint", () => {
           preferredInferenceApi: "openai-responses",
           gatewayName: "nemoclaw",
           reservationSessionId: "session-9",
+          hostLocalInferenceReceipt,
         }),
       ).toBe(true);
-      expect(fingerprintSandboxRegistryEntry(registry.getSandbox("alpha") as SandboxEntry)).toBe(
-        journaled,
+      const reserved = registry.getSandbox("alpha") as SandboxEntry;
+      expect(reserved.hostLocalInferenceReceipt).toBe(hostLocalInferenceReceipt);
+      expect(fingerprintSandboxRegistryEntry(reserved)).toBe(journaled);
+
+      registry.restoreSandboxEntry(sourceEntry);
+      expect(registry.getSandbox("alpha")).toEqual(sourceEntry);
+    } finally {
+      await fs.rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("survives exact explicit llama.cpp route reservation during rebuild", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "nemoclaw-recreate-journal-"));
+    vi.stubEnv("HOME", home);
+    vi.resetModules();
+    try {
+      const registry = await import("../state/registry");
+      const hostLocalInferenceReceipt = serializedLlamaCppHostLocalInferenceReceipt("docker");
+      const hostLocalInferenceProvenance = createSandboxHostLocalInferenceProvenance(
+        "alpha",
+        hostLocalInferenceReceipt,
       );
+      const route = {
+        provider: "llama-cpp-local",
+        model: "llama-cpp-model",
+        endpointUrl: "https://inference.local/v1",
+        endpointSource: "inference-set" as const,
+        credentialEnv: "NEMOCLAW_LLAMACPP_LOCAL_TOKEN",
+        preferredInferenceApi: "openai-completions",
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        openshellDriver: "docker",
+        hostLocalInferenceReceipt,
+        hostLocalInferenceProvenance,
+      };
+      const {
+        hostLocalInferenceReceipt: _reservedReceipt,
+        hostLocalInferenceProvenance: _reservedProvenance,
+        ...registeredRoute
+      } = route;
+      registry.registerSandbox({
+        name: "alpha",
+        agent: "openclaw",
+        agentVersion: "2026.3.11",
+        createdAt: ISO,
+        imageTag: "nemoclaw/openclaw:2026.3.11",
+        lifecycleGeneration: "alpha-generation-1",
+        ...registeredRoute,
+      });
+      const journaled = fingerprintSandboxRegistryEntry(
+        registry.getSandbox("alpha") as SandboxEntry,
+      );
+
+      expect(
+        registry.reserveSandboxInferenceRoute("alpha", {
+          ...route,
+          reservationSessionId: "session-llama-rebuild",
+        }),
+      ).toBe(true);
+      const reserved = registry.getSandbox("alpha") as SandboxEntry;
+
+      expect(reserved.hostLocalInferenceReceipt).toBe(hostLocalInferenceReceipt);
+      expect(reserved.hostLocalInferenceProvenance).toEqual(hostLocalInferenceProvenance);
+      expect(fingerprintSandboxRegistryEntry(reserved)).toBe(journaled);
     } finally {
       await fs.rm(home, { recursive: true, force: true });
     }
@@ -869,21 +1268,186 @@ describe("journal-bound source proof", () => {
     ).toThrow(SandboxRecreateSourceMismatchError);
   });
 
-  it.each([
-    "ready",
-    "not_ready",
-  ] as const)("rejects a %s same-name sandbox that reports no OpenShell Id, even when the journal recorded none (#7736)", (state) => {
-    const proof = proofFor({ state: "missing", liveIdentityFingerprint: null });
+  it.each(["ready", "not_ready"] as const)(
+    "rejects a %s same-name sandbox that reports no OpenShell Id, even when the journal recorded none (#7736)",
+    (state) => {
+      const proof = proofFor({ state: "missing", liveIdentityFingerprint: null });
 
-    expect(proof.sourceLiveIdentityFingerprint).toBeNull();
+      expect(proof.sourceLiveIdentityFingerprint).toBeNull();
+      expect(() =>
+        assertSandboxRecreateSourceProof(proof, {
+          sandboxName: "alpha",
+          gatewayName: "nemoclaw-31818",
+          gatewayPort: 31818,
+          registryEntry: SOURCE_ENTRY,
+          observation: { state, liveIdentityFingerprint: null },
+        }),
+      ).toThrow(/reports no OpenShell Id/);
+    },
+  );
+});
+
+describe("created sandbox lifecycle registration", () => {
+  it("keeps the active recreate target ahead of an older recovered generation (#10056)", () => {
+    const fixture = creatingLifecycleFixture("33333333-3333-4333-8333-333333333333");
+
+    expect(fixture.lifecycle.generation).toBe(TARGET_GENERATION);
+  });
+
+  it.each([
+    ["not Ready", { state: "not_ready" as const, liveIdentityFingerprint: null }, /Ready/u],
+    [
+      "malformed",
+      { state: "ready" as const, liveIdentityFingerprint: "not-a-fingerprint" },
+      /valid live identity/u,
+    ],
+  ])("does not journal a %s replacement before validation (#8942)", (_label, invalid, expected) => {
+    const fixture = creatingLifecycleFixture();
+    fixture.setObservation(invalid);
+
+    expect(() => fixture.lifecycle.capture({ lifecycleGeneration: TARGET_GENERATION })).toThrow(
+      expected,
+    );
+    expect(fixture.session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "creating",
+      targetLiveIdentityFingerprint: null,
+    });
+
+    fixture.setObservation({ state: "ready", liveIdentityFingerprint: TARGET_ID });
+    const captured = fixture.lifecycle.capture({ lifecycleGeneration: TARGET_GENERATION });
+    expect(captured).toEqual({
+      lifecycleGeneration: TARGET_GENERATION,
+      lifecycleLiveIdentityFingerprint: TARGET_ID,
+    });
+    expect(fixture.session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "created",
+      targetLiveIdentityFingerprint: TARGET_ID,
+    });
+    expect(fixture.lifecycle.revalidate(captured)).toEqual(captured);
+    expect(fixture.session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "created",
+      targetLiveIdentityFingerprint: TARGET_ID,
+    });
+  });
+
+  it("retains the captured identity when registry revalidation observes drift (#9833)", () => {
+    const fixture = creatingLifecycleFixture();
+    fixture.setObservation({ state: "ready", liveIdentityFingerprint: TARGET_ID });
+    const registration = fixture.lifecycle.capture({
+      lifecycleGeneration: TARGET_GENERATION,
+    });
+
+    fixture.setObservation({ state: "ready", liveIdentityFingerprint: FOREIGN_ID });
+    expect(() => fixture.lifecycle.revalidate(registration)).toThrow(/identity changed/u);
+    expect(fixture.session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "created",
+      targetLiveIdentityFingerprint: TARGET_ID,
+    });
+
+    fixture.setObservation({ state: "ready", liveIdentityFingerprint: TARGET_ID });
+    expect(fixture.lifecycle.revalidate(registration)).toEqual(registration);
+    expect(fixture.session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "created",
+      targetLiveIdentityFingerprint: TARGET_ID,
+    });
+  });
+
+  it("captures the Ready identity only from the owning gateway", () => {
+    const observe = vi.fn((_sandboxName: string, gatewayName: string) =>
+      gatewayName === CREATED_TARGET.gatewayName
+        ? { state: "ready" as const, liveIdentityFingerprint: TARGET_ID }
+        : { state: "ready" as const, liveIdentityFingerprint: FOREIGN_ID },
+    );
+
+    expect(
+      captureCreatedSandboxLifecycleRegistration(
+        CREATED_TARGET,
+        TARGET_GENERATION,
+        { lifecycleGeneration: TARGET_GENERATION },
+        observe,
+      ),
+    ).toEqual({
+      lifecycleGeneration: TARGET_GENERATION,
+      lifecycleLiveIdentityFingerprint: TARGET_ID,
+    });
+    expect(observe).toHaveBeenCalledExactlyOnceWith("alpha", "owner-gateway");
+  });
+
+  it("rejects lifecycle setup generation drift before observing the sandbox", () => {
+    const observe = vi.fn();
+
     expect(() =>
-      assertSandboxRecreateSourceProof(proof, {
-        sandboxName: "alpha",
-        gatewayName: "nemoclaw-31818",
-        gatewayPort: 31818,
-        registryEntry: SOURCE_ENTRY,
-        observation: { state, liveIdentityFingerprint: null },
+      captureCreatedSandboxLifecycleRegistration(
+        CREATED_TARGET,
+        TARGET_GENERATION,
+        { lifecycleGeneration: "33333333-3333-4333-8333-333333333333" },
+        observe,
+      ),
+    ).toThrow(/lifecycle setup did not preserve its generation/u);
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", { state: "missing" as const, liveIdentityFingerprint: null }, /Ready/u],
+    ["not Ready", { state: "not_ready" as const, liveIdentityFingerprint: null }, /Ready/u],
+    [
+      "missing identity",
+      { state: "ready" as const, liveIdentityFingerprint: null },
+      /valid live identity/u,
+    ],
+    [
+      "malformed identity",
+      { state: "ready" as const, liveIdentityFingerprint: "not-a-fingerprint" },
+      /valid live identity/u,
+    ],
+  ])("rejects a %s final observation from the owning gateway", (_label, observation, expected) => {
+    expect(() =>
+      revalidateCreatedSandboxLifecycleRegistration(
+        CREATED_TARGET,
+        {
+          lifecycleGeneration: TARGET_GENERATION,
+          lifecycleLiveIdentityFingerprint: TARGET_ID,
+        },
+        () => observation,
+      ),
+    ).toThrow(expected);
+  });
+
+  it("rejects an identity change before registry publication", () => {
+    expect(() =>
+      revalidateCreatedSandboxLifecycleRegistration(
+        CREATED_TARGET,
+        {
+          lifecycleGeneration: TARGET_GENERATION,
+          lifecycleLiveIdentityFingerprint: TARGET_ID,
+        },
+        () => ({ state: "ready", liveIdentityFingerprint: FOREIGN_ID }),
+      ),
+    ).toThrow(/identity changed/u);
+  });
+
+  it("keeps the recreate transaction authoritative", () => {
+    const observed = {
+      lifecycleGeneration: TARGET_GENERATION,
+      lifecycleLiveIdentityFingerprint: TARGET_ID,
+    };
+
+    expect(
+      selectCreatedSandboxLifecycleRegistration("alpha", observed, TARGET_GENERATION, observed),
+    ).toEqual(observed);
+    expect(() =>
+      selectCreatedSandboxLifecycleRegistration(
+        "alpha",
+        observed,
+        "33333333-3333-4333-8333-333333333333",
+        observed,
+      ),
+    ).toThrow(/recreate transaction no longer matches/u);
+    expect(() =>
+      selectCreatedSandboxLifecycleRegistration("alpha", observed, TARGET_GENERATION, {
+        ...observed,
+        lifecycleLiveIdentityFingerprint: FOREIGN_ID,
       }),
-    ).toThrow(/reports no OpenShell Id/);
+    ).toThrow(/recreate transaction no longer matches/u);
   });
 });

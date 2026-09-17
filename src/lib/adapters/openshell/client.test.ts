@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { SpawnSyncReturns } from "node:child_process";
+import type { ChildProcess, SpawnSyncReturns } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,6 +13,7 @@ import { withStdoutRedirectedToStderr } from "../../cli/stdout-guard";
 import {
   captureOpenshellCommand,
   captureOpenshellCommandAsync,
+  captureOpenshellCommandAsyncResult,
   captureSandboxSshConfigCommand,
   getInstalledOpenshellVersion,
   type OpenshellSpawnSync,
@@ -17,6 +22,7 @@ import {
   stripAnsi,
   versionGte,
 } from "./client";
+import { processTreeBoundedOpenshellInvocation } from "./process-tree-timeout";
 
 interface SpawnResultSpec {
   status: number | null;
@@ -51,6 +57,21 @@ function exitWithCode(code: number): never {
 }
 
 describe("openshell helpers", () => {
+  it("wraps a synchronous Linux probe in a process-group timeout (#10238)", () => {
+    expect(
+      processTreeBoundedOpenshellInvocation(
+        "/opt/openshell",
+        ["sandbox", "list"],
+        { killProcessTreeOnTimeout: true, timeout: 1000 },
+        { platform: "linux", timeoutExecutableExists: () => true },
+      ),
+    ).toEqual({
+      binary: "/usr/bin/timeout",
+      args: ["--signal=KILL", "0.75s", "/opt/openshell", "sandbox", "list"],
+      killSignal: "SIGKILL",
+    });
+  });
+
   afterEach(() => {
     vi.unstubAllEnvs();
   });
@@ -138,6 +159,41 @@ describe("openshell helpers", () => {
     expect(result.status).toBe(0);
   });
 
+  it("lets a detached background mutation return without waiting on inherited output pipes", () => {
+    const fixtureDirectory = mkdtempSync(join(tmpdir(), "nemoclaw-openshell-background-"));
+    const fixturePath = join(fixtureDirectory, "openshell");
+    const childMarkerPath = join(fixtureDirectory, "child-started");
+    writeFileSync(
+      fixturePath,
+      `#!${process.execPath}\n` +
+        `const { spawn } = require("node:child_process");\n` +
+        `const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600)"], { stdio: "inherit" });\n` +
+        `require("node:fs").writeFileSync(${JSON.stringify(childMarkerPath)}, String(child.pid));\n` +
+        `child.unref();\n`,
+      { mode: 0o500 },
+    );
+    chmodSync(fixturePath, 0o500);
+    try {
+      const captured = captureOpenshellCommand(fixturePath, ["forward", "start", "--background"], {
+        ignoreError: true,
+        timeout: 200,
+      });
+
+      const detached = runOpenshellCommand(fixturePath, ["forward", "start", "--background"], {
+        ignoreError: true,
+        stdio: "ignore",
+        timeout: 1_000,
+      });
+
+      expect((captured.error as NodeJS.ErrnoException | undefined)?.code).toBe("ETIMEDOUT");
+      expect(existsSync(childMarkerPath)).toBe(true);
+      expect(detached.status).toBe(0);
+      expect(detached.error).toBeUndefined();
+    } finally {
+      rmSync(fixtureDirectory, { force: true, recursive: true });
+    }
+  });
+
   it("redirects inherited stdout while the JSONL stdout guard is active", async () => {
     const observedStdio: unknown[] = [];
     const spawnSyncImpl: OpenshellSpawnSync = (_command, _args, options) => {
@@ -182,14 +238,27 @@ describe("openshell helpers", () => {
     expect(observedEnv?.PATH).toBe(process.env.PATH);
   });
 
-  it("passes timeout and maxBuffer options through to OpenShell spawn calls", () => {
-    const observedOptions: Array<{ timeout?: number; maxBuffer?: number }> = [];
+  it("passes timeout, kill signal, and maxBuffer options through to OpenShell spawn calls", () => {
+    const observedOptions: Array<{
+      timeout?: number;
+      killSignal?: NodeJS.Signals | number;
+      maxBuffer?: number;
+    }> = [];
     const spawnSyncImpl: OpenshellSpawnSync = (_command, _args, options) => {
-      observedOptions.push({ timeout: options.timeout, maxBuffer: options.maxBuffer });
+      observedOptions.push({
+        timeout: options.timeout,
+        killSignal: options.killSignal,
+        maxBuffer: options.maxBuffer,
+      });
       return makeSpawnResult({ status: 0, stdout: "ok\n", stderr: "" });
     };
 
-    runOpenshellCommand("openshell", ["status"], { timeout: 4321, spawnSyncImpl });
+    runOpenshellCommand("openshell", ["status"], {
+      timeout: 4321,
+      killSignal: "SIGKILL",
+      maxBuffer: 65432,
+      spawnSyncImpl,
+    });
     captureOpenshellCommand("openshell", ["status"], {
       timeout: 9876,
       maxBuffer: 123456,
@@ -197,8 +266,8 @@ describe("openshell helpers", () => {
     });
 
     expect(observedOptions).toEqual([
-      { timeout: 4321, maxBuffer: undefined },
-      { timeout: 9876, maxBuffer: 123456 },
+      { timeout: 4321, killSignal: "SIGKILL", maxBuffer: 65432 },
+      { timeout: 9876, killSignal: undefined, maxBuffer: 123456 },
     ]);
   });
 
@@ -381,6 +450,85 @@ describe("openshell helpers", () => {
     expect(result.signal).toBeTruthy();
   });
 
+  it("ignores empty async input so EPIPE cannot replace a successful close", async () => {
+    const child = new EventEmitter() as EventEmitter & ChildProcess;
+    const stdin = new EventEmitter() as EventEmitter & {
+      end: ReturnType<typeof vi.fn>;
+    };
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    const observedStdio: unknown[] = [];
+    stdin.on("error", () => {});
+    stdin.end = vi.fn();
+    Object.assign(child, {
+      exitCode: null,
+      signalCode: null,
+      stdin,
+      stdout,
+      stderr,
+      kill: vi.fn(() => true),
+    });
+
+    const resultPromise = captureOpenshellCommandAsyncResult("openshell", ["status"], {
+      input: "",
+      spawnImpl: ((_binary: string, _args: readonly string[], options: { stdio?: unknown }) => {
+        observedStdio.push(options.stdio);
+        queueMicrotask(() => {
+          stdout.emit("data", "READY");
+          stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+          child.emit("close", 0, null);
+        });
+        return child;
+      }) as never,
+    });
+
+    await expect(resultPromise).resolves.toEqual({
+      status: 0,
+      signal: null,
+      stdout: "READY",
+      stderr: "",
+    });
+    expect(observedStdio).toEqual([["ignore", "pipe", "pipe"]]);
+    expect(stdin.end).not.toHaveBeenCalled();
+  });
+
+  it("returns a structured failure when async process creation throws", async () => {
+    const error = Object.assign(new Error("spawn openshell EACCES"), { code: "EACCES" });
+
+    await expect(
+      captureOpenshellCommandAsyncResult("openshell", ["status"], {
+        spawnImpl: (() => {
+          throw error;
+        }) as never,
+      }),
+    ).resolves.toEqual({
+      status: null,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      error,
+    });
+  });
+
+  it("preserves a concrete async close status after its deadline", async () => {
+    const result = await captureOpenshellCommandAsync(
+      process.execPath,
+      ["-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)"],
+      {
+        ignoreError: true,
+        timeout: 100,
+        killGraceMs: 10,
+      },
+    );
+
+    expect(result).toEqual({
+      status: 0,
+      output: "",
+      error: expect.objectContaining({ code: "ETIMEDOUT" }),
+      signal: null,
+    });
+  });
+
   it("includes stderr in async capture output when requested", async () => {
     const result = await captureOpenshellCommandAsync(
       process.execPath,
@@ -409,6 +557,23 @@ describe("openshell helpers", () => {
       output: "hello",
       stdout: "hello\n",
       stderr: "boom\n",
+      signal: null,
+    });
+  });
+
+  it("bounds asynchronous capture through outputLimitBytes", async () => {
+    const result = await captureOpenshellCommandAsync(
+      process.execPath,
+      ["-e", "process.stdout.write('x'.repeat(64))"],
+      { ignoreError: true, includeStreams: true, outputLimitBytes: 8 },
+    );
+
+    expect(result).toEqual({
+      status: 1,
+      output: "x".repeat(8),
+      stdout: "x".repeat(8),
+      stderr: "",
+      error: expect.objectContaining({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }),
       signal: null,
     });
   });

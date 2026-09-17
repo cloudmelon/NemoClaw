@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --no-warnings --experimental-strip-types
+#!/usr/bin/env -S node --no-warnings
 
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
@@ -14,13 +14,13 @@ import {
   MANAGED_BOOTSTRAP_REQUEST_FILE,
   serializeManagedBootstrapEnvelopeTar,
 } from "../../src/lib/onboard/managed-bootstrap/envelope.ts";
-import { managedImageRuntimeIdentity } from "../../src/lib/onboard/managed-image/contract.ts";
-import { MANAGED_STARTUP_EXECUTABLE } from "../../src/lib/onboard/managed-startup/hold.ts";
 import {
-  encodeManagedStartupProfile,
-  MANAGED_STARTUP_AGENTS,
-  type ManagedStartupAgent,
-} from "../../src/lib/onboard/managed-startup/profile.ts";
+  managedImageRuntimeIdentity,
+  SHIPPED_MANAGED_IMAGE_AGENTS,
+  type ShippedManagedImageAgent,
+} from "../../src/lib/onboard/managed-image/contract.ts";
+import { MANAGED_STARTUP_EXECUTABLE } from "../../src/lib/onboard/managed-startup/hold.ts";
+import { encodeManagedStartupProfile } from "../../src/lib/onboard/managed-startup/profile.ts";
 import {
   createManagedStartupRootApplyRequest,
   type ManagedStartupRootApplyRequest,
@@ -28,6 +28,7 @@ import {
 } from "../../src/lib/onboard/managed-startup/root-apply.ts";
 import {
   MANAGED_STARTUP_E2E_CORPORATE_CA_PEM,
+  MANAGED_STARTUP_E2E_OPENCLAW_HEARTBEAT_EVERY,
   managedStartupE2eProfile,
 } from "./generate-managed-startup-profile-fixture.mts";
 import type { ProtectedManagedImagePlatform } from "./protected-managed-image-contract.ts";
@@ -47,7 +48,7 @@ const FIXED_ROOT_ENV = [
 ] as const;
 
 export interface ManagedImageDirectE2eInputs {
-  readonly agent: ManagedStartupAgent;
+  readonly agent: ShippedManagedImageAgent;
   readonly image: string;
   readonly platform: ProtectedManagedImagePlatform;
 }
@@ -90,7 +91,7 @@ export function parseManagedImageDirectE2eInputs(
       "usage: --agent <agent> --image <immutable> --platform <linux/amd64|linux/arm64>",
     );
   }
-  if (!(MANAGED_STARTUP_AGENTS as readonly string[]).includes(agent)) {
+  if (!(SHIPPED_MANAGED_IMAGE_AGENTS as readonly string[]).includes(agent)) {
     throw new Error("--agent must identify a shipped managed-image agent");
   }
   if (!IMMUTABLE_REFERENCE_RE.test(image)) {
@@ -99,7 +100,7 @@ export function parseManagedImageDirectE2eInputs(
   if (platform !== "linux/amd64" && platform !== "linux/arm64") {
     throw new Error("--platform must be linux/amd64 or linux/arm64");
   }
-  return { agent: agent as ManagedStartupAgent, image, platform };
+  return { agent: agent as ShippedManagedImageAgent, image, platform };
 }
 
 function commandDetail(result: CommandResult): string {
@@ -131,7 +132,10 @@ function docker(
   return normalized;
 }
 
-function requestFor(agent: ManagedStartupAgent, changed = false): ManagedStartupRootApplyRequest {
+function requestFor(
+  agent: ShippedManagedImageAgent,
+  changed = false,
+): ManagedStartupRootApplyRequest {
   return createManagedStartupRootApplyRequest({
     agent,
     encodedProfile: encodeManagedStartupProfile(
@@ -143,7 +147,7 @@ function requestFor(agent: ManagedStartupAgent, changed = false): ManagedStartup
 
 function rootRuntimeArgs(
   containerId: string,
-  agent: ManagedStartupAgent,
+  agent: ShippedManagedImageAgent,
   action: "--apply-root-stdin" | "--commit-shared-state-transaction",
   user = "0:0",
   bootstrapIdentity?: string,
@@ -269,7 +273,7 @@ function verifyManagedBootstrapPidOneBoundary(
   }
 }
 
-function managedConfig(agent: ManagedStartupAgent): string {
+function managedConfig(agent: ShippedManagedImageAgent): string {
   switch (agent) {
     case "openclaw":
       return "/sandbox/.openclaw/openclaw.json";
@@ -281,7 +285,10 @@ function managedConfig(agent: ManagedStartupAgent): string {
 }
 
 function waitForAgentCommand(containerId: string): void {
-  const deadline = Date.now() + 120_000;
+  // The image-owned hold allows up to 600 seconds for managed startup
+  // completion. Keep this observer from abandoning a still-running container
+  // before that bounded product wait can finish.
+  const deadline = Date.now() + 600_000;
   while (Date.now() < deadline) {
     const ready = docker(
       [
@@ -308,6 +315,88 @@ function waitForAgentCommand(containerId: string): void {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
   }
   throw new Error("managed image did not reach the forwarded sandbox command");
+}
+
+function verifyOpenClawExplicitGatewayConnectEnvironment(
+  input: ManagedImageDirectE2eInputs,
+  request: ManagedStartupRootApplyRequest,
+  heldWorkloadArgv: readonly string[],
+  bootstrapIdentity: string,
+  sandboxUid: string,
+  sandboxGid: string,
+): void {
+  if (input.agent !== "openclaw") return;
+  const gatewayUrl = "wss://gateway.example.test:443";
+  let containerId = "";
+  try {
+    containerId = docker([
+      "run",
+      "-d",
+      "--platform",
+      input.platform,
+      "--network",
+      "none",
+      "--user",
+      "sandbox",
+      "--env",
+      `OPENCLAW_GATEWAY_URL=${gatewayUrl}`,
+      "--entrypoint",
+      "/usr/bin/env",
+      input.image,
+      ...heldWorkloadArgv.slice(1),
+    ]).stdout.trim();
+    if (!CONTAINER_ID_RE.test(containerId)) {
+      throw new Error("explicit gateway startup did not return one exact container identity");
+    }
+    stageManagedBootstrapEnvelope(containerId, bootstrapIdentity, request);
+    docker(
+      [
+        "exec",
+        "--user",
+        "0:0",
+        "--workdir",
+        "/",
+        containerId,
+        MANAGED_BOOTSTRAP,
+        "--agent",
+        input.agent,
+        "--profile-fingerprint",
+        request.profileFingerprint,
+        "--bootstrap-identity",
+        bootstrapIdentity,
+        "--agent-uid",
+        sandboxUid,
+        "--agent-gid",
+        sandboxGid,
+        "--agent-workdir",
+        "/sandbox",
+        "--request-file",
+        MANAGED_BOOTSTRAP_REQUEST_FILE,
+        "--",
+        "/bin/true",
+      ],
+      { timeout: 300_000 },
+    );
+    waitForAgentCommand(containerId);
+    const connected = docker([
+      "exec",
+      "--user",
+      "sandbox",
+      containerId,
+      "/bin/bash",
+      "--noprofile",
+      "--norc",
+      "-c",
+      '. /tmp/nemoclaw-proxy-env.sh; printf "URL=%s TOKEN=%s INSECURE=%s\\n" "${OPENCLAW_GATEWAY_URL-unset}" "${OPENCLAW_GATEWAY_TOKEN-unset}" "${OPENCLAW_ALLOW_INSECURE_PRIVATE_WS-unset}"',
+    ]).stdout.trim();
+    if (connected !== `URL=${gatewayUrl} TOKEN=unset INSECURE=unset`) {
+      throw new Error(`explicit gateway connect environment was unsafe: ${connected}`);
+    }
+  } finally {
+    if (CONTAINER_ID_RE.test(containerId)) {
+      docker(["rm", "-f", containerId], { ignoreError: true, timeout: 30_000 });
+    }
+  }
 }
 
 function exactProxyEnvironment(): string {
@@ -582,6 +671,31 @@ export function runManagedImageDirectE2e(input: ManagedImageDirectE2eInputs): vo
         "managed hold or legacy entrypoint did not preserve the sandbox command identity",
       );
     }
+    if (input.agent === "openclaw") {
+      docker([
+        "exec",
+        "--user",
+        "sandbox",
+        containerId,
+        "/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        [
+          ". /tmp/nemoclaw-proxy-env.sh",
+          'test -z "${OPENCLAW_GATEWAY_URL+x}"',
+          'test -z "${OPENCLAW_ALLOW_INSECURE_PRIVATE_WS+x}"',
+        ].join("\n"),
+      ]);
+    }
+    verifyOpenClawExplicitGatewayConnectEnvironment(
+      input,
+      request,
+      heldWorkloadArgv,
+      bootstrapIdentity,
+      sandboxUid,
+      sandboxGid,
+    );
     const proxyEnvironment = docker([
       "exec",
       "--user",
@@ -604,6 +718,31 @@ export function runManagedImageDirectE2e(input: ManagedImageDirectE2eInputs): vo
     ]).stdout;
     if (!config.includes("nvidia/nemotron-3-ultra-550b-a55b")) {
       throw new Error("managed agent configuration does not contain the requested model");
+    }
+    if (input.agent === "openclaw") {
+      const parsed = JSON.parse(config) as {
+        agents?: {
+          defaults?: { heartbeat?: { every?: unknown; isolatedSession?: unknown } };
+        };
+      };
+      if (
+        parsed.agents?.defaults?.heartbeat?.every !==
+          MANAGED_STARTUP_E2E_OPENCLAW_HEARTBEAT_EVERY ||
+        parsed.agents?.defaults?.heartbeat?.isolatedSession !== true
+      ) {
+        throw new Error("managed OpenClaw configuration lost the isolated heartbeat settings");
+      }
+      docker([
+        "exec",
+        "--user",
+        "sandbox",
+        "--workdir",
+        "/sandbox/.openclaw",
+        containerId,
+        "sha256sum",
+        "--check",
+        ".config-hash",
+      ]);
     }
     const runtimeEnvironment = docker([
       "exec",
@@ -629,6 +768,14 @@ export function runManagedImageDirectE2e(input: ManagedImageDirectE2eInputs): vo
       "cat",
       "/usr/local/share/nemoclaw/corporate-ca.pem",
     ]).stdout;
+    const installedSystemCaAnchor = docker([
+      "exec",
+      "--user",
+      "0:0",
+      containerId,
+      "cat",
+      "/usr/local/share/ca-certificates/nemoclaw-corporate-ca-01.crt",
+    ]).stdout;
     const mergedCa = docker([
       "exec",
       "--user",
@@ -639,6 +786,7 @@ export function runManagedImageDirectE2e(input: ManagedImageDirectE2eInputs): vo
     ]).stdout;
     if (
       installedCa !== MANAGED_STARTUP_E2E_CORPORATE_CA_PEM ||
+      installedSystemCaAnchor !== MANAGED_STARTUP_E2E_CORPORATE_CA_PEM ||
       !mergedCa.endsWith(MANAGED_STARTUP_E2E_CORPORATE_CA_PEM)
     ) {
       throw new Error("managed corporate CA was not installed and merged exactly");
@@ -655,6 +803,8 @@ export function runManagedImageDirectE2e(input: ManagedImageDirectE2eInputs): vo
         'test "$(stat -c "%u:%g:%a" /run/nemoclaw/managed-startup-runtime.env)" = "0:0:444"',
         'test "$(stat -c "%u:%g:%a" /run/nemoclaw/managed-startup-complete.json)" = "0:0:444"',
         'test "$(stat -c "%u:%g:%a" /usr/local/share/nemoclaw/corporate-ca.pem)" = "0:0:444"',
+        'test "$(stat -c "%u:%g:%a" /usr/local/share/ca-certificates/nemoclaw-corporate-ca-01.crt)" = "0:0:444"',
+        "openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt /usr/local/share/nemoclaw/corporate-ca.pem >/dev/null",
         'test "$(stat -c "%u:%g:%a" /run/nemoclaw/managed-startup-ca-bundle.pem)" = "0:0:444"',
         "test -d /var/lib/nemoclaw/managed-startup-shared-state-transaction-v1",
       ].join("\n"),

@@ -6,6 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
+import {
+  LAUNCH_READINESS_FIXTURE_POLICY,
+  launchReadinessRegistryFixture,
+} from "../helpers/launch-readiness-fixture";
 import { run, runWithEnv, testTimeoutOptions, writeSandboxRegistry } from "./helpers";
 
 const CALL_SEPARATOR = "--- openshell call ---";
@@ -47,7 +51,7 @@ function createLaunchHarness(prefix: string, agent: string): LaunchHarness {
   const callArgvFile = path.join(home, "openshell-call-argv");
   const execArgvFile = path.join(home, "openshell-exec-argv");
   fs.mkdirSync(localBin, { recursive: true });
-  writeSandboxRegistry(home, { agent });
+  writeSandboxRegistry(home, { ...launchReadinessRegistryFixture(), agent });
 
   fs.writeFileSync(
     path.join(localBin, "openshell"),
@@ -94,6 +98,10 @@ function createLaunchHarness(prefix: string, agent: string): LaunchHarness {
       "  echo 'sandbox not found' >&2",
       "  exit 1",
       "fi",
+      'if [ "$1" = "policy" ] && [ "$2" = "get" ]; then',
+      `  printf '%b' ${JSON.stringify(LAUNCH_READINESS_FIXTURE_POLICY)}`,
+      "  exit 0",
+      "fi",
       'if [ "$1" = "sandbox" ] && [ "$2" = "exec" ]; then',
       // The interactive agent exec is the only exec that requests a TTY.
       '  for arg in "$@"; do',
@@ -102,6 +110,10 @@ function createLaunchHarness(prefix: string, agent: string): LaunchHarness {
       "      exit 0",
       "    fi",
       "  done",
+      '  if [[ "$*" == *"inference.local/v1/chat/completions"* ]]; then',
+      `    printf '%s\\n' '200' '{"choices":[{"message":{"content":"OK"}}]}'`,
+      "    exit 0",
+      "  fi",
       // Preflight probes: gateway health and the inference.local route.
       "  echo 'OK 200'",
       "  exit 0",
@@ -160,6 +172,9 @@ describe("CLI launch routing process contracts (#6006)", () => {
     expect(result.code).toBe(0);
     expect(result.out).toContain("launch <name>");
     expect(result.out).toContain("Connect to a sandbox and start its agent");
+    expect(result.out.replace(/\s+/g, " ")).toContain(
+      "Validate a current launch-readiness lease or run the complete connect preflight",
+    );
     expect(result.out).toContain("SANDBOXNAME");
   });
 
@@ -181,24 +196,19 @@ describe("CLI launch routing process contracts (#6006)", () => {
 
       expect(result.code).toBe(1);
       expect(result.out).toContain(
-        "Sandbox 'alpha;echo pwned' is registered locally, but is not present in the live OpenShell gateway.",
+        "Sandbox 'alpha;echo pwned' is not registered in the local NemoClaw state.",
       );
       // The token never reaches an in-sandbox command: no interactive exec ran.
       expect(harness.launchExecArgv()).toBeNull();
       expect(harness.callLines().some((call) => call.includes("--tty"))).toBe(false);
 
-      // Every `openshell` call that carries the token carries it as one argv
-      // element. No call splits it into a second command, which is what a
-      // shell-interpolated (rather than argv-passed) sandbox name would do.
+      // Local registry rejection happens before any OpenShell command can
+      // receive the untrusted token.
       const tokenCalls = harness
         .callArgvs()
         .filter((argv) => argv.some((element) => element.includes("pwned")));
-      expect(tokenCalls.length).toBeGreaterThan(0);
-      for (const argv of tokenCalls) {
-        expect(argv).toContain("alpha;echo pwned");
-        expect(argv).not.toContain("echo");
-        expect(argv).not.toContain("pwned");
-      }
+      expect(tokenCalls).toEqual([]);
+      expect(harness.callLines()).toEqual([]);
     },
   );
 
@@ -214,8 +224,8 @@ describe("CLI launch routing process contracts (#6006)", () => {
       const result = harness.runLaunch("launch alpha");
 
       expect(result.code).toBe(1);
-      expect(result.out).toContain(
-        'Cannot resolve an interactive command for unsupported agent "mystery-agent; echo pwned".',
+      expect(result.out).toMatch(
+        /(?:Cannot resolve an interactive command for unsupported agent "mystery-agent; echo pwned"\.|Launch readiness final validation failed due to config\.)/,
       );
       expect(harness.launchExecArgv()).toBeNull();
       expect(harness.callLines().some((call) => call.includes("--tty"))).toBe(false);

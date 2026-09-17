@@ -4,9 +4,8 @@
 /**
  * Acknowledgement package contract for `policy restore`.
  *
- * Declining confirmation must report cancellation so the operator knows no
- * mutation occurred. A non-interactive refusal must print the same usage line
- * as the prompt EOF path.
+ * A session without terminal input must require explicit acknowledgement and
+ * must not interpret pipe input as an interactive confirmation.
  *
  * These tests drive the compiled CLI (`dist/nemoclaw.js`) over a real stdin
  * pipe. The helper stubs registry and baseline lookups. It replaces
@@ -25,6 +24,9 @@ const REPO_ROOT = path.join(import.meta.dirname, "../../..");
 const CLI_PATH = JSON.stringify(path.join(REPO_ROOT, "dist", "nemoclaw.js"));
 const POLICIES_PATH = JSON.stringify(path.join(REPO_ROOT, "dist", "lib", "policy", "index.js"));
 const REGISTRY_PATH = JSON.stringify(path.join(REPO_ROOT, "dist", "lib", "state", "registry.js"));
+const CROSS_PORT_PATH = JSON.stringify(
+  path.join(REPO_ROOT, "dist", "lib", "state", "registry", "cross-port.js"),
+);
 
 const RESTORED_MARKER = "restore-baseline-entry-reached";
 const USAGE = "Usage: nemoclaw <sandbox> policy restore <key> [--yes|-y] [--force] [--dry-run]";
@@ -34,11 +36,14 @@ function runPolicyRestore({ input, nonInteractive }: { input: string; nonInterac
   const scriptPath = path.join(tmpDir, "policy-restore-acknowledgement-check.js");
   const script = String.raw`
 const registry = require(${REGISTRY_PATH});
+const crossPort = require(${CROSS_PORT_PATH});
 const policies = require(${POLICIES_PATH});
 registry.getSandbox = (name) => (name === "test-sandbox" ? { name, agent: "hermes" } : null);
 registry.listSandboxes = () => ({ sandboxes: [{ name: "test-sandbox" }] });
-registry.getBaselineExclusions = () => [{ key: "npm_registry", digest: "digest-1" }];
-registry.getBaselineExclusionTransition = () => null;
+crossPort.findSandboxAcrossGatewayRoots = (name) =>
+  name === "test-sandbox"
+    ? { entry: { name, agent: "hermes" }, gatewayPort: null, registryFile: "test-registry" }
+    : null;
 policies.resolveSandboxBaselinePolicy = () => ({
   agent: "hermes",
   policyPath: "/policy-additions.yaml",
@@ -75,15 +80,18 @@ require(${CLI_PATH});
 }
 
 describe("policy restore acknowledgement", () => {
-  it("reports the cancellation when the operator declines the confirmation", () => {
+  it("requires explicit acknowledgement when pipe input contains a decline", () => {
     const result = runPolicyRestore({ input: "n\n", nonInteractive: false });
 
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.stdout).toContain("re-allows:");
-    expect(result.stdout).toContain("Cancelled.");
+    expect(result.stderr).toContain(
+      "Non-interactive restore requires explicit acknowledgement: pass --force (or --yes).",
+    );
+    expect(result.stderr).toContain(USAGE);
     expect(result.stdout).not.toContain(RESTORED_MARKER);
-    expect(result.status).toBe(0);
+    expect(result.status).toBe(1);
   }, 45_000);
 
   it("prints the usage line when non-interactive mode has no acknowledgement", () => {
@@ -99,13 +107,13 @@ describe("policy restore acknowledgement", () => {
     expect(result.status).toBe(1);
   }, 45_000);
 
-  it("prints the same usage line when the confirmation prompt hits stdin EOF", () => {
+  it("prints the non-interactive usage line when stdin is an ended pipe", () => {
     const result = runPolicyRestore({ input: "", nonInteractive: false });
 
     expect(result.error).toBeUndefined();
     expect(result.signal).toBeNull();
     expect(result.stderr).toContain(
-      "No input available on stdin, so policy restore cannot prompt.",
+      "Non-interactive restore requires explicit acknowledgement: pass --force (or --yes).",
     );
     expect(result.stderr).toContain(USAGE);
     expect(result.stdout).not.toContain(RESTORED_MARKER);

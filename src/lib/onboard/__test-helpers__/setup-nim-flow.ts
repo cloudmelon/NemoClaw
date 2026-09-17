@@ -71,7 +71,7 @@ export function makeHostState(
     vllmProfile: null,
     hasVllmImage: false,
     vllmEntries: [],
-    ollamaInstallMenu: { entry: null, hasUpgradableOllama: false },
+    ollamaInstallMenu: { entry: null, hasUpgradableOllama: false, binaryNeedsUpgrade: false },
     gpuNimCapable: false,
     ...overrides,
   };
@@ -112,6 +112,8 @@ export function makeDeps(overrides: Partial<SetupNimFlowDeps> = {}): SetupNimFlo
     loadRoutedProfile: () => null,
     readRecordedProvider: () => null,
     readRecordedNimContainer: () => null,
+    readRecordedManagedLlamaCpp: () => false,
+    readRecordedManagedLlamaCppRecipeId: () => null,
     readRecordedModel: () => null,
     rejectWindowsHostOllama: () => false,
     prompt: async () => "",
@@ -129,6 +131,7 @@ export function makeDeps(overrides: Partial<SetupNimFlowDeps> = {}): SetupNimFlo
     handleInstallOllamaSelection: async () => unexpected("Ollama install selection"),
     installVllm: async () => unexpected("vLLM install"),
     handleVllmSelection: async () => unexpected("vLLM selection"),
+    selectVllmModelFromEnv: () => null,
     handleRoutedSelection: async () => unexpected("routed selection"),
     coerceAgentInferenceApi: (_agent, preferredInferenceApi) => preferredInferenceApi,
     resolveAgentInferenceApi: (_agentName, _provider, preferredInferenceApi) =>

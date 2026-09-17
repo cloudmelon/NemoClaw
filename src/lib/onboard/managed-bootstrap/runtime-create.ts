@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { SandboxGpuProofResult } from "../../state/registry";
+import type { OpenShellSandboxBufferedCommandExecutor } from "../../adapters/openshell/sandbox-command";
 import type { ManagedStartupRootApplyRequest } from "../managed-startup/root-apply";
+import type {
+  ManagedStartupStateRoot,
+  ManagedStartupWorkspaceRoot,
+} from "../managed-startup/state-roots";
 import type { SandboxGpuConfig } from "../sandbox-gpu-mode";
 import type {
   ManagedBootstrapAdapter,
@@ -21,6 +26,7 @@ export interface ManagedBootstrapRuntimeCommandResult {
 }
 
 export interface ManagedBootstrapRuntimeDependencies {
+  readonly commandExecutor?: OpenShellSandboxBufferedCommandExecutor;
   readonly runCaptureOpenshell?: (args: string[], options?: Record<string, unknown>) => string;
   readonly runOpenshell?: (
     args: string[],
@@ -37,15 +43,44 @@ export interface ManagedBootstrapRuntimeLimit {
   readonly hard: number;
 }
 
+export type ManagedBootstrapNativeGpuFallbackRollbackRequest = Readonly<{
+  ownerCleanupHandoff: "native-gpu-fallback";
+}>;
+
+export type ManagedBootstrapNativeGpuFallbackRollbackOutcome =
+  | Readonly<{ kind: "rolled-back" }>
+  | Readonly<{
+      kind: "openshell-owner-cleanup-required";
+      sandboxName: string;
+      sandboxId: string;
+      runtimeId: string;
+    }>;
+
+export type ManagedBootstrapNativeGpuFallbackOwnerCleanupHandoff = Extract<
+  ManagedBootstrapNativeGpuFallbackRollbackOutcome,
+  { readonly kind: "openshell-owner-cleanup-required" }
+>;
+
 /** Provider-neutral lifecycle surface consumed by sandbox-create coordinators. */
 export interface ManagedBootstrapRuntimePatch {
   maybeApplyDuringCreate(): void | Promise<void>;
+  /** Exact runtime ID owned by the transaction, or null until it records a replacement. */
+  replacementRuntimeId?(): string | null;
   createFailureMessage(): string | null;
   exitOnPatchError(): void | Promise<void>;
-  rollbackManagedStartupAfterCreateFailure(): void | Promise<void>;
+  rollbackManagedStartupAfterCreateFailure(
+    request?: ManagedBootstrapNativeGpuFallbackRollbackRequest,
+  ):
+    | void
+    | ManagedBootstrapNativeGpuFallbackRollbackOutcome
+    | Promise<void | ManagedBootstrapNativeGpuFallbackRollbackOutcome>;
   ensureApplied(): void | Promise<void>;
   waitForSupervisorReconnectIfNeeded(): void | Promise<void>;
-  commitAfterReady(): void | Promise<void>;
+  commitAfterReady(options?: {
+    readonly beforeFinalHandoff?: (replacementRuntimeId: string | null) => void;
+  }): void | Promise<void>;
+  /** True only after an exact replacement completed its owner-scoped final handoff. */
+  allowsNotReadyLifecycleRevalidation?(): boolean;
   selectedMode(): {
     readonly kind: string;
     readonly label: string;
@@ -60,11 +95,14 @@ export interface ManagedBootstrapRuntimePatch {
 
 export interface ManagedBootstrapRuntimeCreateLifecycleInput {
   readonly providerId: string;
+  readonly environment: NodeJS.ProcessEnv;
   readonly stateRoot: string;
   readonly bootstrapIdentity: string;
   readonly request: ManagedStartupRootApplyRequest;
   readonly image: ManagedBootstrapImageIdentity;
   readonly agentIdentity: ManagedBootstrapAgentIdentity;
+  readonly workspaceRoot: ManagedStartupWorkspaceRoot;
+  readonly managedStateRoots: readonly ManagedStartupStateRoot[];
   readonly intendedWorkloadArgv: readonly string[];
   readonly expectedSupervisorArgv: readonly string[];
   readonly launchArgv: readonly string[];
@@ -77,11 +115,14 @@ export interface ManagedBootstrapRuntimeCreateLifecycleInput {
   readonly sandboxGpuConfig: SandboxGpuConfig;
   readonly requiredLimits: readonly ManagedBootstrapRuntimeLimit[];
   readonly timeoutSecs: number;
+  /** Docker client authority used by the owning managed sandbox create. */
+  readonly dockerClientEnv: NodeJS.ProcessEnv;
   readonly onPatchFailure?: (error: unknown) => never;
   readonly network: {
     readonly inferenceProvider: string;
     readonly gatewayUsesContainerBridge: boolean;
     readonly gatewayPort: number;
+    readonly reverifyBridgeReachability: () => void | Promise<void>;
   };
   readonly dependencies: ManagedBootstrapRuntimeDependencies;
 }
@@ -130,6 +171,11 @@ export function createManagedBootstrapTerminalFinalizer(
 export interface ManagedBootstrapRuntimeCreateLifecycle {
   readonly launchArgv: readonly string[];
   readonly patch: ManagedBootstrapRuntimePatch;
+  /**
+   * Inspect the exact activated native runtime when provider authority is available.
+   * `undefined` means activation has not selected a runtime yet; `null` fails closed.
+   */
+  inspectNativeRuntime?(): ManagedBootstrapRuntimeSnapshot | null | undefined;
   recoverUnfinished(): Promise<ManagedBootstrapRecoveryReport>;
   prepareNetwork(): Promise<void>;
   runCreate<T>(
@@ -150,6 +196,8 @@ export interface ManagedBootstrapRuntimeSnapshot {
 export interface ManagedBootstrapRuntimeCompatibilityLaunchInput {
   readonly createArgs: readonly string[];
   readonly currentRegistryImageRef: string | null;
+  /** Exact managed image selected before either GPU route is attempted. */
+  readonly managedImageReference: string;
   readonly prebuildImageId: string | null;
   readonly allowUnbuiltSource: boolean;
   readonly compatibilityPolicyPath: string;

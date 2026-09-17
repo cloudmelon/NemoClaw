@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  validateE2eWorkflow,
   validateE2eWorkflowBoundary,
   validateJetsonDispatchBoundary,
 } from "../../../tools/e2e/workflow-boundary.mts";
@@ -17,7 +18,34 @@ function validateWorkflowMutation(
 }
 
 describe("Jetson nvmap GPU E2E workflow boundary", () => {
-  it("rejects a permissive Jetson dispatch opt-in (#8142)", () => {
+  it("passes the selected managed-image publication commit to Jetson dispatch", () => {
+    const errors = validateWorkflowMutation((workflow) => {
+      const publication = (workflow.jobs as Record<string, unknown>)["base-image-publication"] as {
+        outputs?: Record<string, unknown>;
+      };
+      publication.outputs!.managed_image_revision =
+        "${{ steps.publication.outputs.head_sha || inputs.checkout_sha || github.sha }}";
+    });
+
+    expect(errors).toContain(
+      "base-image-publication must expose the managed-image revision to Jetson dispatch",
+    );
+  });
+
+  it("waits for the exact managed-image publication before Jetson dispatch", () => {
+    const errors = validateWorkflowMutation((workflow) => {
+      const job = (workflow.jobs as Record<string, unknown>)["jetson-nvmap-gpu"] as {
+        needs?: unknown;
+      };
+      job.needs = "generate-matrix";
+    });
+
+    expect(errors).toContain(
+      "jetson-nvmap-gpu job must depend on managed publication and generate-matrix",
+    );
+  });
+
+  it("keeps manual Jetson dispatch disabled by default (#8142)", () => {
     const inputErrors = validateWorkflowMutation((workflow) => {
       const triggers = (workflow.on ?? workflow[true as unknown as string]) as {
         workflow_dispatch?: {
@@ -38,7 +66,21 @@ describe("Jetson nvmap GPU E2E workflow boundary", () => {
     );
   });
 
-  it("keeps opt-in and trusted selectors before controller assignment (#8142)", () => {
+  it("rejects a Jetson selector that omits trusted main pushes (#8142)", () => {
+    const errors = validateWorkflowMutation((workflow) => {
+      const job = (workflow.jobs as Record<string, unknown>)["jetson-nvmap-gpu"] as {
+        if?: string;
+      };
+      job.if =
+        "${{ inputs.allow_jetson_dispatch && github.repository == 'NVIDIA/NemoClaw' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && (inputs.checkout_repository == '' || inputs.checkout_repository == github.repository) && ((inputs.jobs == '' && inputs.targets == '') || contains(format(',{0},', inputs.jobs), ',jetson-nvmap-gpu,') || contains(format(',{0},', inputs.targets), ',jetson-nvmap-gpu,')) }}";
+    });
+
+    expect(errors).toContain(
+      "jetson-nvmap-gpu job must run on trusted main pushes and require opt-in for same-repository manual selections",
+    );
+  });
+
+  it("rejects an untrusted Jetson event selector (#8142)", () => {
     const errors = validateWorkflowMutation((workflow) => {
       const job = (workflow.jobs as Record<string, unknown>)["jetson-nvmap-gpu"] as {
         if?: string;
@@ -47,23 +89,33 @@ describe("Jetson nvmap GPU E2E workflow boundary", () => {
     });
 
     expect(errors).toContain(
-      "jetson-nvmap-gpu job must require the dispatch opt-in, trusted main workflow dispatch, same-repository candidate, and target selectors",
+      "jetson-nvmap-gpu job must run on trusted main pushes and require opt-in for same-repository manual selections",
     );
   });
 
-  it("queues every operator-backend dispatch without cancellation (#8142)", () => {
+  it("rejects the unsupported queue key from operator-backend concurrency (#8142)", () => {
     const workflow = readWorkflow();
     const job = (workflow.jobs as Record<string, unknown>)["jetson-nvmap-gpu"] as {
       concurrency?: Record<string, unknown>;
     };
-    job.concurrency = {
-      group: "jetson-${{ github.ref }}",
-      queue: 1,
-      "cancel-in-progress": true,
-    };
+    job.concurrency!.queue = "max";
     expect(validateJetsonDispatchBoundary(workflow)).toContain(
-      "jetson-nvmap-gpu concurrency must queue every operator-backend dispatch without cancellation",
+      "jetson-nvmap-gpu concurrency must preserve its operator-backend group without cancellation",
     );
+  });
+
+  it.each([
+    ["Jetson", "${{ inputs.checkout_sha != '' && !inputs.include_staging_brev_launchable }}"],
+    ["Launchable", "${{ inputs.checkout_sha != '' && !inputs.allow_jetson_dispatch }}"],
+  ])("rejects concurrency that cancels active %s dispatches", (_dispatch, cancellation) => {
+    const workflow = readWorkflow();
+    const validationError =
+      "workflow concurrency must not cancel an active Jetson or Launchable dispatch";
+    expect(validateE2eWorkflow(workflow)).not.toContain(validationError);
+    const concurrency = workflow.concurrency as Record<string, unknown>;
+    concurrency["cancel-in-progress"] = cancellation;
+
+    expect(validateE2eWorkflow(workflow)).toContain(validationError);
   });
 
   it("rejects candidate execution or credential-bearing controller steps (#8142)", () => {
@@ -87,7 +139,7 @@ describe("Jetson nvmap GPU E2E workflow boundary", () => {
       expect.arrayContaining([
         "jetson-nvmap-gpu controller must grant only contents:read and id-token:write",
         "jetson-nvmap-gpu checkout must use the trusted workflow SHA without credentials",
-        "jetson-nvmap-gpu controller must dispatch only the exact candidate and configured URL",
+        "jetson-nvmap-gpu controller must dispatch the exact candidate, managed-image revision, and configured URL",
       ]),
     );
   });
@@ -104,8 +156,20 @@ describe("Jetson nvmap GPU E2E workflow boundary", () => {
     });
 
     expect(errors).toContain(
-      "jetson-nvmap-gpu controller must contain only checkout, Node setup, dispatch, and upload",
+      "jetson-nvmap-gpu controller must contain only checkout, Node/npm setup, dispatch, and upload",
     );
+  });
+
+  it("rejects a mutable npm setup action in the Jetson controller (#8142)", () => {
+    const errors = validateWorkflowMutation((workflow) => {
+      const job = (workflow.jobs as Record<string, unknown>)["jetson-nvmap-gpu"] as {
+        steps?: Array<{ name?: string; uses?: string }>;
+      };
+      const setup = job.steps!.find((step) => step.name === "Install reviewed npm")!;
+      setup.uses = "NVIDIA/NemoClaw/.github/actions/setup-reviewed-npm@main";
+    });
+
+    expect(errors).toContain("jetson-nvmap-gpu controller must install reviewed npm immutably");
   });
 
   it("keeps the runner temporary artifact path on the dispatch step (#8142)", () => {
@@ -126,7 +190,7 @@ describe("Jetson nvmap GPU E2E workflow boundary", () => {
     expect(errors).toEqual(
       expect.arrayContaining([
         "jetson-nvmap-gpu controller must not define a job-level environment",
-        "jetson-nvmap-gpu controller must dispatch only the exact candidate and configured URL",
+        "jetson-nvmap-gpu controller must dispatch the exact candidate, managed-image revision, and configured URL",
       ]),
     );
   });

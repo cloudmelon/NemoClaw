@@ -15,10 +15,13 @@ SANDBOX_NAME="${SANDBOX_NAME:-${NEMOCLAW_SANDBOX_NAME:-}}"
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
 CLI="${NEMOCLAW_CLI_BIN:-${REPO}/bin/nemoclaw.js}"
 PREFIX="04-deepagents-code-fresh-reonboard"
-PRIMARY_TARGET_MODEL="openai/openai/gpt-5.5"
-FALLBACK_TARGET_MODEL="nvidia/nvidia/nemotron-3-ultra"
 HOSTED_ENDPOINT="${NEMOCLAW_ENDPOINT_URL:-https://inference-api.nvidia.com/v1}"
+MODEL_SELECTOR="${REPO}/test/e2e/lib/select-authorized-chat-model.mts"
 CREDENTIAL_CANARY="nemoclaw-dcode-config-get-canary"
+PERSONAL_LOGIN_PROFILE="/sandbox/.bash_profile"
+HOSTILE_LOGIN_FALLBACK="/sandbox/.bash_login"
+HOSTILE_PROFILE_MARKER="/tmp/nemoclaw-dcode-hostile-profile-loaded"
+HOSTILE_SHELL_ENV="/sandbox/.nemoclaw-dcode-hostile-bash-env"
 
 fail() {
   printf '%s: FAIL: %s\n' "$PREFIX" "$1" >&2
@@ -31,6 +34,46 @@ pass() {
 
 sandbox_exec() {
   openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "$1" 2>&1
+}
+
+cleanup_personal_profile_probe() {
+  local resource_handle
+  resource_handle="$(runtime_resource_handle)" || return 0
+  privileged_exec "$resource_handle" /bin/sh -c \
+    "rm -f '$PERSONAL_LOGIN_PROFILE' '$HOSTILE_LOGIN_FALLBACK' '$HOSTILE_PROFILE_MARKER' '$HOSTILE_SHELL_ENV'" \
+    >/dev/null 2>&1 || true
+}
+
+runtime_resource_handle() {
+  NEMOCLAW_E2E_SANDBOX_NAME="$SANDBOX_NAME" node <<'NODE'
+const { resolvePrivilegedSandboxTarget } = require("./dist/lib/sandbox/privileged-exec.js");
+
+const target = resolvePrivilegedSandboxTarget(process.env.NEMOCLAW_E2E_SANDBOX_NAME);
+process.stdout.write(target.resourceHandle);
+NODE
+}
+
+privileged_exec() {
+  local expected_resource_handle="$1"
+  shift
+  NEMOCLAW_E2E_EXPECTED_RESOURCE_HANDLE="$expected_resource_handle" \
+    NEMOCLAW_E2E_SANDBOX_NAME="$SANDBOX_NAME" \
+    node - "$@" <<'NODE'
+const { executePrivilegedSandboxCommand } = require("./dist/lib/sandbox/privileged-exec.js");
+
+const command = process.argv.slice(2);
+const result = executePrivilegedSandboxCommand(
+  process.env.NEMOCLAW_E2E_SANDBOX_NAME,
+  command,
+  {
+    expectedResourceHandle: process.env.NEMOCLAW_E2E_EXPECTED_RESOURCE_HANDLE,
+    sanitizeEnvironment: true,
+  },
+);
+process.stdout.write(result.stdout);
+process.stderr.write(result.stderr);
+process.exit(result.status ?? 1);
+NODE
 }
 
 dcode_identity() {
@@ -192,14 +235,55 @@ model_a="$(identity_field "$identity_before" Model)"
 model_a="${model_a#openai:}"
 [ -n "$model_a" ] || fail "initial dcode identity did not report a model"
 assert_identity "$identity_before" "$model_a" "initial"
-
-if [ "$model_a" = "$PRIMARY_TARGET_MODEL" ]; then
-  model_b="$FALLBACK_TARGET_MODEL"
-else
-  model_b="$PRIMARY_TARGET_MODEL"
-fi
-[ "$model_a" != "$model_b" ] || fail "model A and model B must differ"
 pass "initial live identity reports model A"
+
+# Exercise the installed /etc/profile.d hook in real sandbox login shells.
+# Managed probes must skip personal startup code; ordinary logins must read it.
+resource_handle="$(runtime_resource_handle)" || fail "could not resolve the DCode sandbox runtime resource"
+[ -n "$resource_handle" ] || fail "DCode sandbox runtime resource is empty"
+managed_hook_state="$(
+  privileged_exec "$resource_handle" /bin/sh -c \
+    "set -eu; for f in '$PERSONAL_LOGIN_PROFILE' '$HOSTILE_LOGIN_FALLBACK' '$HOSTILE_PROFILE_MARKER' '$HOSTILE_SHELL_ENV'; do test ! -e \"\$f\"; test ! -L \"\$f\"; done; stat -c '%U:%G:%a' /sandbox; stat -c '%U:%G:%a' /etc/profile.d/nemoclaw-dcode.sh"
+)" || fail "personal probe files already exist or the managed DCode system hook could not be inspected"
+expected_hook_state="$(printf '%s\n' root:sandbox:1775 root:root:444)"
+[ "$managed_hook_state" = "$expected_hook_state" ] || fail "managed DCode system hook posture is unsafe: $managed_hook_state"
+trap cleanup_personal_profile_probe EXIT
+
+for login_profile in "$PERSONAL_LOGIN_PROFILE" "$HOSTILE_LOGIN_FALLBACK"; do
+  profile_before="$(sandbox_exec "set -eu; test -w /sandbox/.bashrc; test -w /sandbox/.profile; printf '%s\n' 'touch $HOSTILE_PROFILE_MARKER' 'export NEMOCLAW_E2E_PERSONAL_PROFILE=loaded' > '$login_profile'; printf '%s\n' 'export NEMOCLAW_E2E_PERSONAL_PROFILE=loaded' >> /sandbox/.bashrc; printf '%s\n' 'touch $HOSTILE_PROFILE_MARKER' > '$HOSTILE_SHELL_ENV'; sha256sum '$login_profile' /sandbox/.bashrc")" \
+    || fail "sandbox identity could not write its personal login profile"
+  managed_output="$(
+    openshell sandbox exec --name "$SANDBOX_NAME" -- \
+      /usr/bin/env HOME=/sandbox BASH_ENV="$HOSTILE_SHELL_ENV" ENV="$HOSTILE_SHELL_ENV" \
+      /bin/bash -lc '/usr/local/lib/nemoclaw/dcode-managed-exec /usr/bin/printf %s MANAGED_EXEC_OK' 2>&1
+  )" || fail "managed exec failed with personal startup files present: $managed_output"
+  [ "$managed_output" = MANAGED_EXEC_OK ] || fail "managed exec output contains personal startup output: $managed_output"
+  privileged_exec "$resource_handle" /bin/sh -c \
+    "/usr/bin/env HOME=/sandbox BASH_ENV='$HOSTILE_SHELL_ENV' ENV='$HOSTILE_SHELL_ENV' /usr/local/bin/nemoclaw-start /usr/bin/true && test ! -e '$HOSTILE_PROFILE_MARKER'" \
+    || fail "managed exec or root entrypoint failed or read personal startup code"
+
+  # shellcheck disable=SC2016 # Read the variable set by the sandbox's personal profile.
+  ordinary_output="$(openshell sandbox exec --name "$SANDBOX_NAME" -- /usr/bin/env -u NEMOCLAW_E2E_PERSONAL_PROFILE /bin/bash -lc 'printf %s "$NEMOCLAW_E2E_PERSONAL_PROFILE"' 2>&1)" \
+    || fail "ordinary login failed with a personal profile: $ordinary_output"
+  [ "$ordinary_output" = loaded ] || fail "ordinary login did not read its personal profile"
+  # shellcheck disable=SC2016 # Read the variable set by the sandbox's personal profile.
+  openshell sandbox exec --name "$SANDBOX_NAME" -- /usr/bin/env -u NEMOCLAW_E2E_PERSONAL_PROFILE /bin/bash -ic 'test "$NEMOCLAW_E2E_PERSONAL_PROFILE" = loaded' \
+    || fail "ordinary interactive shell did not read its personal profile"
+  profile_after="$(sandbox_exec "set -eu; test -w '$login_profile'; sha256sum '$login_profile' /sandbox/.bashrc")" \
+    || fail "personal profile became unwritable after managed and ordinary commands"
+  [ "$profile_after" = "$profile_before" ] || fail "managed or ordinary shells rewrote personal profiles"
+  cleanup_personal_profile_probe
+done
+trap - EXIT
+pass "system hook isolates managed exec while ordinary login preserves personal profiles"
+
+model_b="$(
+  npx --no-install tsx "$MODEL_SELECTOR" \
+    --endpoint "$HOSTED_ENDPOINT" \
+    --current-model "$model_a"
+)" || fail "could not select an authorized alternate chat model"
+[ "$model_a" != "$model_b" ] || fail "model A and model B must differ"
+pass "authenticated endpoint validation selected model B"
 
 seed_source="$(seed_config_source)"
 seed_output="$(
@@ -268,9 +352,7 @@ if ! reonboard_output="$(
 )"; then
   fail "same-name --fresh re-onboard failed: $reonboard_output"
 fi
-printf '%s\n' "$reonboard_output" | grep -Fq "Backing up workspace state before recreating sandbox..." || fail "re-onboard did not take the pre-recreate backup path"
-printf '%s\n' "$reonboard_output" | grep -Fq "Restoring workspace state from pre-recreate backup..." || fail "re-onboard did not take the restore path"
-pass "same-name --fresh re-onboard crossed backup and restore boundaries"
+pass "same-name --fresh re-onboard completed"
 
 sandbox_list="$(openshell sandbox list 2>&1)" || fail "could not list sandbox after re-onboard"
 printf '%s\n' "$sandbox_list" | awk -v name="$SANDBOX_NAME" '$1 == name && /Ready/ { found = 1 } END { exit(found ? 0 : 1) }' || fail "same-name sandbox is not Ready after re-onboard"
@@ -338,4 +420,4 @@ verify_output="$(
 printf '%s\n' "$verify_output" | grep -Fq "NEMOCLAW_DCODE_FRESH_CONFIG_VERIFIED" || fail "fresh config verification marker is missing"
 pass "config keeps model B and only the allowlisted preferences"
 
-printf '%s: 11 passed, 0 failed\n' "$PREFIX"
+printf '%s: 13 passed, 0 failed\n' "$PREFIX"

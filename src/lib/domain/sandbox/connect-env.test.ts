@@ -21,9 +21,18 @@ describe("sandbox connect environment helpers", () => {
     expect(NEMOCLAW_HERMES_LIGHT_SKIN_REVIEWED_HERMES_VERSIONS).toEqual([
       "v2026.6.19",
       "v2026.7.1",
-      "v2026.7.20",
+      "v2026.8.27",
     ]);
   });
+
+  it.each([{ HERMES_TUI_LIGHT: "0" }, { HERMES_TUI_THEME: "dark" }])(
+    "does not inspect Hermes config with explicit theme env %# (#6380)",
+    (env) => {
+      expect(
+        shouldInspectHermesLightSkinConfig({ name: "hermes" }, { COLORFGBG: "0;15", ...env }),
+      ).toBe(false);
+    },
+  );
 
   it("inspects Hermes config only when NemoClaw owns the theme decision (#6380)", () => {
     expect(
@@ -38,11 +47,6 @@ describe("sandbox connect environment helpers", () => {
         { COLORFGBG: "0;0", TERM_PROGRAM: "Apple_Terminal" },
       ),
     ).toBe(true);
-    for (const env of [{ HERMES_TUI_LIGHT: "0" }, { HERMES_TUI_THEME: "dark" }]) {
-      expect(
-        shouldInspectHermesLightSkinConfig({ name: "hermes" }, { COLORFGBG: "0;15", ...env }),
-      ).toBe(false);
-    }
     expect(shouldInspectHermesLightSkinConfig({ name: "openclaw" }, { COLORFGBG: "0;15" })).toBe(
       false,
     );

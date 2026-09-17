@@ -67,28 +67,75 @@ describe("package-managed gateway version gate (#8094)", () => {
     );
   });
 
-  it("adopts the package gateway when its version cannot be determined", () => {
-    // Pre-#8094 behaviour: only decline on positive evidence of a bad version,
-    // so an unreadable binary never turns a working host into a failing one.
+  it("probes the package gateway with the selected OpenShell env (#10514)", () => {
+    vi.stubEnv("OPENSHELL_GATEWAY", "hostile-gateway");
+    vi.stubEnv("OPENSHELL_WORKSPACE", "hostile-workspace");
+    vi.stubEnv("OPENSHELL_GATEWAY_ENDPOINT", "https://hostile.invalid");
+    vi.stubEnv("OPENSHELL_TOKEN", "hostile-token");
+    vi.stubEnv("OPENSHELL_DISABLE_TLS", "1");
+    vi.stubEnv("OPENSHELL_DISABLE_GATEWAY_AUTH", "1");
+    const selectedEnv: NodeJS.ProcessEnv = {
+      HOME: "/home/tester",
+      PATH: "/usr/bin",
+      OPENSHELL_GATEWAY: "nemoclaw",
+      OPENSHELL_LOCAL_TLS_DIR: "/recorded/tls",
+      OPENSHELL_WORKSPACE: "default",
+    };
+    let observedEnv: NodeJS.ProcessEnv | undefined;
+
+    try {
+      const verdict = checkUpstreamGatewayVersion(PACKAGE_BINARY, {
+        env: selectedEnv,
+        getUpstreamGatewayVersionBounds: () => BOUNDS,
+        platform: "linux",
+        spawnSyncImpl: (_command, _args, options) => {
+          observedEnv = options?.env;
+          return { status: 0, stdout: "openshell-gateway 0.0.85" };
+        },
+      });
+
+      expect(verdict.supported).toBe(true);
+      expect(observedEnv).toEqual(selectedEnv);
+      expect(observedEnv?.OPENSHELL_GATEWAY).toBe("nemoclaw");
+      expect(observedEnv?.OPENSHELL_WORKSPACE).toBe("default");
+      expect(observedEnv?.OPENSHELL_GATEWAY_ENDPOINT).toBeUndefined();
+      expect(observedEnv?.OPENSHELL_TOKEN).toBeUndefined();
+      expect(observedEnv?.OPENSHELL_DISABLE_TLS).toBeUndefined();
+      expect(observedEnv?.OPENSHELL_DISABLE_GATEWAY_AUTH).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("declines the package gateway when its version cannot be determined (#8926)", () => {
     const verdict = checkUpstreamGatewayVersion(
       PACKAGE_BINARY,
       resolveOptions("ignored", { getUpstreamGatewayVersion: () => null }),
     );
 
-    expect(verdict.supported).toBe(true);
+    expect(verdict).toMatchObject({
+      binaryPath: PACKAGE_BINARY,
+      supported: false,
+      version: null,
+    });
   });
 
-  it("adopts when the effective package gateway binary cannot be resolved", () => {
+  it("declines when the effective package gateway binary cannot be resolved (#8926)", () => {
     const verdict = checkUpstreamGatewayVersion(null, resolveOptions("0.0.91"));
 
-    expect(verdict.supported).toBe(true);
+    expect(verdict).toMatchObject({
+      binaryPath: "<unresolved>",
+      supported: false,
+      version: null,
+    });
   });
 
-  it("stops reporting a package unit whose gateway is out of window", () => {
+  it("blocks a package unit whose gateway is out of window (#8926)", () => {
     const warn = vi.fn();
 
-    // The unit file is present, so the pre-fix resolver adopted it outright.
-    expect(hasOpenShellGatewayUserService(resolveOptions("0.0.91", { warn }))).toBe(false);
+    expect(() => hasOpenShellGatewayUserService(resolveOptions("0.0.91", { warn }))).toThrow(
+      "outside the maximum 0.0.85",
+    );
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("0.0.91"));
   });
 
@@ -96,44 +143,44 @@ describe("package-managed gateway version gate (#8094)", () => {
     expect(hasOpenShellGatewayUserService(resolveOptions("0.0.85"))).toBe(true);
   });
 
-  it("falls back to the NemoClaw-managed unit when the package gateway is rejected", () => {
+  it("blocks the NemoClaw-managed fallback when the package gateway is rejected (#8926)", () => {
     const home = "/home/tester";
     const nemoclawUnit = getNemoclawOpenShellGatewayUserServicePath(home, {});
 
-    const resolved = hasOpenShellGatewayUserService(
-      resolveOptions("0.0.91", {
-        home,
-        env: {},
-        existsSync: (p: string) => packageOnly(p) || p === nemoclawUnit,
-        lstatSync: (() => ({ isSymbolicLink: () => false })) as never,
-        readFileSync: () => NEMOCLAW_OPENSHELL_GATEWAY_USER_SERVICE_MARKER_LINE,
-      }),
-    );
-
-    expect(resolved).toBe(true);
+    expect(() =>
+      hasOpenShellGatewayUserService(
+        resolveOptions("0.0.91", {
+          home,
+          env: {},
+          existsSync: (p: string) => packageOnly(p) || p === nemoclawUnit,
+          lstatSync: (() => ({ isSymbolicLink: () => false })) as never,
+          readFileSync: () => NEMOCLAW_OPENSHELL_GATEWAY_USER_SERVICE_MARKER_LINE,
+        }),
+      ),
+    ).toThrow("outside the maximum 0.0.85");
   });
 
-  it("falls back to the NemoClaw-managed unit when the package service identity is untrusted", () => {
+  it("blocks the NemoClaw-managed fallback when the package service identity is untrusted (#8926)", () => {
     const home = "/home/tester";
     const nemoclawUnit = getNemoclawOpenShellGatewayUserServicePath(home, {});
     const getUpstreamGatewayVersion = vi.fn(() => "0.0.85");
 
-    const resolved = hasOpenShellGatewayUserService(
-      resolveOptions("ignored", {
-        home,
-        env: {},
-        existsSync: (p: string) => packageOnly(p) || p === nemoclawUnit,
-        getUpstreamGatewayVersion,
-        lstatSync: (() => ({ isSymbolicLink: () => false })) as never,
-        readFileSync: () => NEMOCLAW_OPENSHELL_GATEWAY_USER_SERVICE_MARKER_LINE,
-        spawnSyncImpl: () => ({
-          status: 0,
-          stdout: trustedShowOutput("/opt/foreign/openshell-gateway"),
+    expect(() =>
+      hasOpenShellGatewayUserService(
+        resolveOptions("ignored", {
+          home,
+          env: {},
+          existsSync: (p: string) => packageOnly(p) || p === nemoclawUnit,
+          getUpstreamGatewayVersion,
+          lstatSync: (() => ({ isSymbolicLink: () => false })) as never,
+          readFileSync: () => NEMOCLAW_OPENSHELL_GATEWAY_USER_SERVICE_MARKER_LINE,
+          spawnSyncImpl: () => ({
+            status: 0,
+            stdout: trustedShowOutput("/opt/foreign/openshell-gateway"),
+          }),
         }),
-      }),
-    );
-
-    expect(resolved).toBe(true);
+      ),
+    ).toThrow("trusted OpenShell gateway");
     expect(getUpstreamGatewayVersion).not.toHaveBeenCalled();
   });
 
@@ -141,9 +188,9 @@ describe("package-managed gateway version gate (#8094)", () => {
     const warn = vi.fn();
     const options = resolveOptions("0.0.91", { warn });
 
-    hasOpenShellGatewayUserService(options);
-    hasOpenShellGatewayUserService(options);
-    hasOpenShellGatewayUserService(options);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect(() => hasOpenShellGatewayUserService(options)).toThrow("outside the maximum 0.0.85");
+    }
 
     expect(warn).toHaveBeenCalledTimes(1);
   });
@@ -152,17 +199,19 @@ describe("package-managed gateway version gate (#8094)", () => {
     const suppressedWarn = vi.fn();
     const laterWarn = vi.fn();
 
-    expect(
+    expect(() =>
       hasOpenShellGatewayUserService(
         resolveOptions("0.0.91", {
           suppressUnsupportedVersionWarning: true,
           warn: suppressedWarn,
         }),
       ),
-    ).toBe(false);
+    ).toThrow();
     expect(suppressedWarn).not.toHaveBeenCalled();
 
-    hasOpenShellGatewayUserService(resolveOptions("0.0.91", { warn: laterWarn }));
+    expect(() =>
+      hasOpenShellGatewayUserService(resolveOptions("0.0.91", { warn: laterWarn })),
+    ).toThrow();
     expect(laterWarn).toHaveBeenCalledOnce();
   });
 
@@ -177,7 +226,7 @@ describe("package-managed gateway version gate (#8094)", () => {
   it("checks the effective ExecStart when both package binaries exist", () => {
     const getUpstreamGatewayVersion = vi.fn(() => "0.0.91");
 
-    expect(
+    expect(() =>
       hasOpenShellGatewayUserService(
         resolveOptions("ignored", {
           existsSync: (p: string) =>
@@ -187,19 +236,24 @@ describe("package-managed gateway version gate (#8094)", () => {
           spawnSyncImpl: () => ({ status: 0, stdout: trustedShowOutput(PACKAGE_BINARY) }),
         }),
       ),
-    ).toBe(false);
+    ).toThrow("outside the maximum 0.0.85");
     expect(getUpstreamGatewayVersion).toHaveBeenCalledWith(PACKAGE_BINARY);
   });
 
-  it("preserves above-maximum development gateways on the development channel", () => {
-    expect(
-      checkUpstreamGatewayVersion(
-        PACKAGE_BINARY,
-        resolveOptions("openshell-gateway 0.0.91-dev.1", {
-          env: { NEMOCLAW_OPENSHELL_CHANNEL: "dev" },
-        }),
-      ).supported,
-    ).toBe(true);
+  it("rejects development gateways even on the development channel", () => {
+    const result = checkUpstreamGatewayVersion(
+      PACKAGE_BINARY,
+      resolveOptions("openshell-gateway 0.0.91-dev.1", {
+        env: { NEMOCLAW_OPENSHELL_CHANNEL: "dev" },
+      }),
+    );
+    expect(result).toMatchObject({
+      supported: false,
+      message: expect.stringContaining("development build"),
+    });
+    expect(result).toMatchObject({
+      message: expect.stringContaining("exact stable OpenShell 0.0.116"),
+    });
   });
 
   it("keeps the package unit paths the gate scans in sync with the resolver", () => {
@@ -227,9 +281,10 @@ describe("package-managed gateway version gate (#8094)", () => {
     );
 
     expect(result).toMatchObject({
-      attempted: false,
+      attempted: true,
       reason: expect.stringContaining("0.0.91"),
       serviceName: "openshell-gateway",
+      standaloneFallbackBlocked: true,
       started: false,
     });
     expect(getUpstreamGatewayVersion).toHaveBeenCalledTimes(2);

@@ -13,7 +13,6 @@ import {
   type PreUpgradeBackupSelectInput,
   resolveNotReadyOutcome,
   selectPreUpgradeBackupForCreate,
-  UnsafeCustomImagePluginBackupError,
 } from "./not-ready-recreate";
 import {
   fingerprintSandboxRegistryEntry,
@@ -194,18 +193,18 @@ describe("selectPreUpgradeBackupForCreate", () => {
     expect(note).not.toHaveBeenCalled();
   });
 
-  it.each([
-    "ready",
-    "not_ready",
-  ] as const)("throws before backup access when a %s same-name sandbox reports no OpenShell Id (#7736)", (state) => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
+  it.each(["ready", "not_ready"] as const)(
+    "throws before backup access when a %s same-name sandbox reports no OpenShell Id (#7736)",
+    (state) => {
+      process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
 
-    expect(() => select({ observation: { state, liveIdentityFingerprint: null } })).toThrow(
-      /reports no OpenShell Id/,
-    );
-    expect(getLatestBackupSpy).not.toHaveBeenCalled();
-    expect(note).not.toHaveBeenCalled();
-  });
+      expect(() => select({ observation: { state, liveIdentityFingerprint: null } })).toThrow(
+        /reports no OpenShell Id/,
+      );
+      expect(getLatestBackupSpy).not.toHaveBeenCalled();
+      expect(note).not.toHaveBeenCalled();
+    },
+  );
 
   it("throws before backup access when the source registry row changed (#7736)", () => {
     process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
@@ -249,23 +248,23 @@ describe("selectPreUpgradeBackupForCreate", () => {
       currentEntry: null,
       error: /source registry row is absent/,
     },
-  ] as const)("rejects a source registry row that $change after journal proof capture (#7736)", ({
-    currentEntry,
-    error,
-  }) => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    const onProofRequested = vi.fn();
-    const readRegistryEntry = vi.fn(() => currentEntry);
+  ] as const)(
+    "rejects a source registry row that $change after journal proof capture (#7736)",
+    ({ currentEntry, error }) => {
+      process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
+      const onProofRequested = vi.fn();
+      const readRegistryEntry = vi.fn(() => currentEntry);
 
-    expect(() => select({ onProofRequested, readRegistryEntry })).toThrow(error);
-    expect(onProofRequested).toHaveBeenCalledTimes(1);
-    expect(readRegistryEntry).toHaveBeenCalledTimes(1);
-    expect(onProofRequested.mock.invocationCallOrder[0]).toBeLessThan(
-      readRegistryEntry.mock.invocationCallOrder[0],
-    );
-    expect(getLatestBackupSpy).not.toHaveBeenCalled();
-    expect(note).not.toHaveBeenCalled();
-  });
+      expect(() => select({ onProofRequested, readRegistryEntry })).toThrow(error);
+      expect(onProofRequested).toHaveBeenCalledTimes(1);
+      expect(readRegistryEntry).toHaveBeenCalledTimes(1);
+      expect(onProofRequested.mock.invocationCallOrder[0]).toBeLessThan(
+        readRegistryEntry.mock.invocationCallOrder[0],
+      );
+      expect(getLatestBackupSpy).not.toHaveBeenCalled();
+      expect(note).not.toHaveBeenCalled();
+    },
+  );
 
   it("throws before backup access when the transaction records another sandbox (#7736)", () => {
     process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
@@ -288,52 +287,6 @@ describe("selectPreUpgradeBackupForCreate", () => {
 
     expect(select({ onProofRequested, sourceProof: null })).toBeNull();
     expect(onProofRequested).not.toHaveBeenCalled();
-  });
-
-  const CUSTOM_IMAGE_ENTRY: SandboxEntry = {
-    name: "my-assistant",
-    agent: "openclaw",
-    fromDockerfile: "/tmp/Dockerfile.custom",
-  };
-
-  it("blocks a legacy custom OpenClaw backup before installer recreation (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    expect(() => select({ existingSandboxEntry: CUSTOM_IMAGE_ENTRY })).toThrow(
-      UnsafeCustomImagePluginBackupError,
-    );
-
-    expect(note).not.toHaveBeenCalled();
-  });
-
-  it("accepts an authoritative custom OpenClaw backup for installer recreation (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      reconcileOpenClawImagePluginProvenance: true,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    expect(select({ existingSandboxEntry: CUSTOM_IMAGE_ENTRY })).toBe(BACKUP_PATH);
-  });
-
-  it("blocks custom OpenClaw installer recreation when no valid backup is readable (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue(null);
-
-    expect(() => select({ existingSandboxEntry: CUSTOM_IMAGE_ENTRY })).toThrow(
-      UnsafeCustomImagePluginBackupError,
-    );
-
-    expect(note).not.toHaveBeenCalled();
   });
 
   it("returns null and notes fresh-state recreate when installer restore intent finds no backup", () => {
@@ -446,49 +399,6 @@ describe("resolveNotReadyOutcome", () => {
       restoreBackupPath: BACKUP_PATH,
     });
   });
-
-  it("blocks live not-ready custom OpenClaw recreation with a legacy backup (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    const outcome = resolveNotReadyOutcome("my-assistant", note, {
-      name: "my-assistant",
-      agent: "openclaw",
-      fromDockerfile: "/tmp/Dockerfile.custom",
-    });
-
-    expect(outcome.kind).toBe("blocked");
-    expect(outcome).toMatchObject({
-      hints: expect.arrayContaining([expect.stringContaining("lacks verified plugin provenance")]),
-    });
-    expect(note).not.toHaveBeenCalled();
-  });
-
-  it("blocks an orphan sandbox when the requested target is custom OpenClaw (#6108)", () => {
-    process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE = "1";
-    getLatestBackupSpy.mockReturnValue({
-      agentType: "openclaw",
-      dir: "/sandbox/.openclaw",
-      backupPath: BACKUP_PATH,
-      openclawImagePluginInstalls: [],
-    } as unknown as ReturnType<typeof sandboxState.getLatestBackup>);
-
-    const outcome = resolveNotReadyOutcome("orphan", note, null, true);
-
-    expect(outcome.kind).toBe("blocked");
-    expect(outcome).toMatchObject({
-      hints: expect.arrayContaining([
-        expect.stringContaining("new sandbox name"),
-        expect.stringContaining("NEMOCLAW_RECREATE_WITHOUT_BACKUP=1"),
-      ]),
-    });
-    expect(note).not.toHaveBeenCalled();
-  });
 });
 
 describe("installerRestoreOnRecreateFromEnv", () => {
@@ -504,13 +414,14 @@ describe("installerRestoreOnRecreateFromEnv", () => {
     expect(installerRestoreOnRecreateFromEnv({})).toBe(false);
   });
 
-  it("returns false when the sentinel is set to any value other than '1'", () => {
-    for (const value of ["", "0", "true", "yes"]) {
+  it.each(["", "0", "true", "yes"])(
+    "returns false when the sentinel is set to any value other than '1' [case %#]",
+    (value) => {
       expect(
         installerRestoreOnRecreateFromEnv({
           NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE: value,
         }),
       ).toBe(false);
-    }
-  });
+    },
+  );
 });

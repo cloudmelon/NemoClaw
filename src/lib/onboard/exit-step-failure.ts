@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { Session } from "../state/onboard-session";
+import { isPortableExperimentalProfile } from "./experimental/portable-profile";
 import { printOnboardResumeHint } from "./resume-hint";
 
 export interface ExitStepFailureSessionDeps {
   loadSession(): Pick<Session, "lastStepStarted"> | null;
+  releaseOnboardLock?(): void;
   finalizeIncompleteOnboardStep(
     stepName: string,
     message?: string | null,
@@ -44,17 +46,19 @@ export function registerIncompleteOnboardExitFailureHandler(
   isComplete: () => boolean,
   message: string,
   processLike: OnboardExitFailureProcessLike = process,
+  portable = isPortableExperimentalProfile(),
 ): void {
-  const failIncompleteStep = (): void => {
-    if (isComplete()) return;
-    // A non-null return means a step was in progress, so the session records a
-    // resumable point — surface `--resume` for exit paths that don't print
-    // their own recovery guidance (#6003). When an explicit cancel has already
-    // cleared the session (or no step started), this is null and stays silent;
+  const failIncompleteStep = (force = false): void => {
+    if (!force && isComplete()) return;
+    // A non-null return means a step was in progress, so surface the
+    // profile-appropriate recovery command for exit paths that don't print
+    // their own guidance (#6003, #8873). When an explicit cancel has already
+    // cleared the session (or no step started), this is null and stays silent.
     // printOnboardResumeHint also self-dedupes against tailored hints.
     const interrupted = markLastStartedStepFailed(deps, message, true);
     if (!interrupted) return;
-    printOnboardResumeHint();
+    if (interrupted.status === "recovery_required") return;
+    printOnboardResumeHint(portable, undefined, interrupted.sandboxName);
   };
 
   processLike.once("exit", (code) => {
@@ -78,8 +82,15 @@ export function registerIncompleteOnboardExitFailureHandler(
     setImmediate(() => {
       removeListener("SIGINT", onSigint);
       removeListener("SIGTERM", onSigterm);
-      failIncompleteStep();
-      kill(pid, signal);
+      try {
+        failIncompleteStep(true);
+      } finally {
+        try {
+          deps.releaseOnboardLock?.();
+        } finally {
+          kill(pid, signal);
+        }
+      }
     });
   };
   const onSigint = (): void => handleSignal("SIGINT");

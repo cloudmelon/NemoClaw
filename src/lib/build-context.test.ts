@@ -79,6 +79,14 @@ describe("printSandboxCreateRecoveryHints", () => {
     expect(stderr()).toContain("reached the gateway");
   });
 
+  it("refreshes gateway trust before resuming a certificate mismatch", () => {
+    printSandboxCreateRecoveryHints("invalid peer certificate: BadSignature");
+
+    expect(stderr()).toMatch(
+      /Fix:  openshell gateway trust -g nemoclaw[\s\S]*Then: .*onboard --resume/u,
+    );
+  });
+
   // Manual / ARM64 E2E note (#3266):
   //
   // The misleading "failed to upload image tar into container" Docker 404 only
@@ -255,6 +263,22 @@ describe("printSandboxCreateRecoveryHints", () => {
     expect(out).toContain("network policy");
     expect(out).toContain("NEMOCLAW_WEB_SEARCH_ENABLED=0");
     expect(out).toContain("onboard --resume");
+  });
+
+  it("prints checkpoint resume recovery when the portable env is set (#9035)", () => {
+    const prev = process.env.NEMOCLAW_EXPERIMENTAL_PROFILE;
+    process.env.NEMOCLAW_EXPERIMENTAL_PROFILE = "portable";
+    try {
+      printSandboxCreateRecoveryHints("");
+      const out = stderr();
+      expect(out).toContain("onboard --resume");
+      expect(out).not.toContain("onboard --experimental-profile portable");
+      expect(out).not.toContain("Or:      nemoclaw onboard");
+    } finally {
+      prev === undefined
+        ? delete process.env.NEMOCLAW_EXPERIMENTAL_PROFILE
+        : (process.env.NEMOCLAW_EXPERIMENTAL_PROFILE = prev);
+    }
   });
 });
 

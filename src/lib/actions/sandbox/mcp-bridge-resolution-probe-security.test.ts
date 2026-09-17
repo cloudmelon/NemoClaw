@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import type { McpBridgeEntry } from "../../state/registry";
+import type { McpSourceEntry } from "./mcp-bridge-contracts";
 import {
   buildCredentialResolutionProbeCommand,
   classifyCredentialResolutionProbe,
@@ -15,16 +15,15 @@ import {
   PROBE_SANITIZED_ENV_VARS,
 } from "./mcp-bridge-resolution-probe";
 
-const baseEntry: McpBridgeEntry = {
+const baseEntry: McpSourceEntry = {
   server: "github",
   agent: "openclaw",
-  adapter: "mcporter",
+  adapter: "openclaw-config",
   url: "https://api.githubcopilot.com/mcp/",
   env: ["GITHUB_TOKEN"],
   providerName: "alpha-mcp-github",
   providerId: "11111111-2222-4333-8444-555555555555",
   policyName: "mcp-bridge-github",
-  addedAt: new Date(0).toISOString(),
 };
 
 function probeStdout(
@@ -53,7 +52,7 @@ function probeStdout(
 
 describe("MCP credential-resolution probe command security", () => {
   it("validates and silences proxy env before framing nonce-bound runtime curls (#6379)", () => {
-    const built = buildCredentialResolutionProbeCommand(baseEntry, "mcporter");
+    const built = buildCredentialResolutionProbeCommand(baseEntry, "openclaw-config", "v11");
     expect(built).not.toBeNull();
     const command = built?.command ?? "";
     const validationIndex = command.indexOf('[ -L "$proxy_env" ]');
@@ -70,7 +69,8 @@ describe("MCP credential-resolution probe command security", () => {
     expect(frameIndex).toBeGreaterThan(unsetIndex);
     expect(firstChildIndex).toBeGreaterThan(frameIndex);
     expect(command).toContain("nemoclaw-start node -e");
-    expect(command).toContain("'authorization: Bearer openshell:resolve:env:GITHUB_TOKEN'");
+    expect(command).toContain("'authorization: Bearer openshell:resolve:env:v11_GITHUB_TOKEN'");
+    expect(command).not.toContain("'authorization: Bearer openshell:resolve:env:GITHUB_TOKEN'");
     expect(command).toContain(`'authorization: Bearer ${MCP_PROBE_CONTROL_BEARER}'`);
     expect(command).toContain('"method":"initialize"');
     expect(command).toContain(`${MCP_PROBE_HTTP_MARKER}${built?.resultMarker}:`);
@@ -78,40 +78,70 @@ describe("MCP credential-resolution probe command security", () => {
     expect(command.trimEnd().endsWith("exit 0")).toBe(true);
   });
 
-  it("uses the selected adapter runtime without capturing endpoint bodies (#6379)", () => {
-    const mcporter = buildCredentialResolutionProbeCommand(baseEntry, "mcporter")?.command ?? "";
-    const hermes = buildCredentialResolutionProbeCommand(baseEntry, "hermes-config")?.command ?? "";
-    const deepagents =
-      buildCredentialResolutionProbeCommand(baseEntry, "deepagents-config")?.command ?? "";
+  it.each([
+    { adapter: "openclaw-config" as const, runtime: "nemoclaw-start node -e" },
+    { adapter: "hermes-config" as const, runtime: "/opt/hermes/.venv/bin/python -I -c" },
+    { adapter: "deepagents-config" as const, runtime: "/opt/venv/bin/python3 -I -c" },
+  ])(
+    "uses the $adapter runtime without capturing endpoint bodies (#6379)",
+    ({ adapter, runtime }) => {
+      const command =
+        buildCredentialResolutionProbeCommand(baseEntry, adapter, "v11")?.command ?? "";
 
-    expect(mcporter).toContain("nemoclaw-start node -e");
-    expect(hermes).toContain("/opt/hermes/.venv/bin/python -I -c");
-    expect(deepagents).toContain("/opt/venv/bin/python3 -I -c");
-    for (const command of [mcporter, hermes, deepagents]) {
+      expect(command).toContain(runtime);
       expect(command).toContain("'/dev/null'");
       expect(command).not.toContain("head -c");
       expect(command).not.toContain("mktemp");
-    }
-  });
+    },
+  );
 
   it("refuses missing credentials and unsafe persisted endpoints (#6379)", () => {
-    expect(buildCredentialResolutionProbeCommand({ ...baseEntry, env: [] }, "mcporter")).toBeNull();
+    expect(
+      buildCredentialResolutionProbeCommand({ ...baseEntry, env: [] }, "openclaw-config", "v11"),
+    ).toBeNull();
     expect(
       buildCredentialResolutionProbeCommand(
         { ...baseEntry, url: "http://api.githubcopilot.com/mcp/" },
-        "mcporter",
+        "openclaw-config",
+        "v11",
       ),
     ).toBeNull();
     expect(
       buildCredentialResolutionProbeCommand(
         { ...baseEntry, url: "https://host.openshell.internal:31337/mcp" },
-        "mcporter",
+        "openclaw-config",
+        "v11",
       ),
     ).toBeNull();
   });
 
+  it("probes a recorded trusted private endpoint and still refuses an unrecorded one (#11377)", () => {
+    const unrecordedPrivateEntry: McpSourceEntry = {
+      ...baseEntry,
+      url: "https://172.17.0.2:8443/mcp",
+      env: ["MCP_KEY"],
+    };
+    const trustedPrivateEntry: McpSourceEntry = {
+      ...unrecordedPrivateEntry,
+      trustedPrivateHost: "172.17.0.2",
+      allowedIps: ["172.17.0.2"],
+    };
+
+    const built = buildCredentialResolutionProbeCommand(
+      trustedPrivateEntry,
+      "openclaw-config",
+      "v11",
+    );
+    expect(built).not.toBeNull();
+    expect(built?.command).toContain("https://172.17.0.2:8443/mcp");
+    expect(built?.command).toContain("'authorization: Bearer openshell:resolve:env:v11_MCP_KEY'");
+    expect(
+      buildCredentialResolutionProbeCommand(unrecordedPrivateEntry, "openclaw-config", "v11"),
+    ).toBeNull();
+  });
+
   it("rejects duplicate and out-of-order result markers (#6379)", () => {
-    const built = buildCredentialResolutionProbeCommand(baseEntry, "mcporter");
+    const built = buildCredentialResolutionProbeCommand(baseEntry, "openclaw-config", "v11");
     expect(built).not.toBeNull();
     const resultMarker = built?.resultMarker ?? "missing-result-marker";
     const duplicated = classifyCredentialResolutionProbe(
@@ -154,7 +184,7 @@ describe("MCP credential-resolution probe command security", () => {
   });
 
   it("accepts only fresh nonce-bound markers after the trusted result frame (#6379)", () => {
-    const built = buildCredentialResolutionProbeCommand(baseEntry, "mcporter");
+    const built = buildCredentialResolutionProbeCommand(baseEntry, "openclaw-config", "v11");
     expect(built).not.toBeNull();
     const resultMarker = built?.resultMarker ?? "missing-result-marker";
     const probe = classifyCredentialResolutionProbe(

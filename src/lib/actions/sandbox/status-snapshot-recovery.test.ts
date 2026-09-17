@@ -11,7 +11,6 @@ import { collectSandboxStatusSnapshot, getSandboxStatusReport } from "./status-s
 const sandbox: SandboxEntry = {
   name: "alpha",
   agent: "openclaw",
-  policies: [],
   provider: "nvidia",
   model: "nvidia/nemotron",
   openshellDriver: "docker",
@@ -35,6 +34,12 @@ const clearPreflight: SandboxStatusPreflightResult = {
   exitCode: 0,
 };
 
+const intentionalStopPreflight: SandboxStatusPreflightResult = {
+  ...clearPreflight,
+  intentionalStopConfirmed: true,
+  suppressInferenceProbe: true,
+};
+
 const conflictPreflight: SandboxStatusPreflightResult = {
   failure: {
     layer: "sandbox_dashboard_port_conflict",
@@ -55,6 +60,7 @@ const healthyRoute: SandboxInferenceRouteHealth = {
 function recoveredLookup() {
   return Promise.resolve({
     state: "present",
+    phase: "Ready",
     output: "Phase: Ready",
     recoveredSandbox: true,
     recoverySandboxVia: "started-stopped-original",
@@ -73,7 +79,8 @@ function snapshotDeps(recoveryResult: unknown) {
     },
     probeProviderHealthImpl,
     probeSandboxInferenceGatewayHealthImpl,
-    recoverSandboxProcesses: vi.fn(() => recoveryResult) as never,
+    probeSandboxInferenceInvocationImpl: vi.fn(async () => ({ ok: true }) as const),
+    recoverSandboxProcesses: vi.fn(async () => recoveryResult) as never,
   };
 }
 
@@ -89,6 +96,7 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
       reconcile: () =>
         Promise.resolve({
           state: "present" as const,
+          phase: "Ready",
           output: "Phase: Ready",
         }),
     };
@@ -110,6 +118,7 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
       reconcile: () =>
         Promise.resolve({
           state: "present" as const,
+          phase: "Ready",
           output: "Phase: Ready",
         }),
     };
@@ -123,29 +132,30 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
     expect(deps.probeSandboxInferenceGatewayHealthImpl).not.toHaveBeenCalled();
   });
 
-  it.each([
-    "Provisioning",
-    "Failed",
-  ])("keeps the existing %s phase diagnosis ahead of markerless recovery (#7824)", async (phase) => {
-    const deps = {
-      ...snapshotDeps({
-        checked: true,
-        wasRunning: false,
-        recovered: false,
-        forwardRecovered: false,
-      }),
-      reconcile: () =>
-        Promise.resolve({
-          state: "present" as const,
-          output: `Phase: ${phase}`,
+  it.each(["Provisioning", "Failed"])(
+    "keeps the existing %s phase diagnosis ahead of markerless recovery (#7824)",
+    async (phase) => {
+      const deps = {
+        ...snapshotDeps({
+          checked: true,
+          wasRunning: false,
+          recovered: false,
+          forwardRecovered: false,
         }),
-    };
+        reconcile: () =>
+          Promise.resolve({
+            state: "present" as const,
+            phase,
+            output: `Phase: ${phase}`,
+          }),
+      };
 
-    const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
+      const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
 
-    expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
-    expect(snapshot.lookup.state).toBe("present");
-  });
+      expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
+      expect(snapshot.lookup.state).toBe("present");
+    },
+  );
 
   it("keeps a host preflight failure ahead of markerless recovery (#7824)", async () => {
     const deps = {
@@ -158,6 +168,7 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
       reconcile: () =>
         Promise.resolve({
           state: "present" as const,
+          phase: "Ready",
           output: "Phase: Ready",
         }),
     };
@@ -169,6 +180,33 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
 
     expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
     expect(snapshot.lookup.state).toBe("present");
+  });
+
+  it("does not recover delivery after provider-confirmed intentional stop (#11025)", async () => {
+    const deps = {
+      ...snapshotDeps({
+        checked: true,
+        wasRunning: false,
+        recovered: true,
+        forwardRecovered: true,
+      }),
+      reconcile: () =>
+        Promise.resolve({
+          state: "present" as const,
+          phase: "Ready",
+          output: "Phase: Ready",
+        }),
+    };
+
+    const snapshot = await collectSandboxStatusSnapshot("alpha", {
+      deps,
+      preflight: intentionalStopPreflight,
+    });
+
+    expect(deps.recoverSandboxProcesses).not.toHaveBeenCalled();
+    expect(snapshot.lookup.state).toBe("present");
+    expect(snapshot.inferenceHealth).toBeNull();
+    expect(deps.probeSandboxInferenceGatewayHealthImpl).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -190,17 +228,6 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
         forwardRecovered: false,
         secretBoundaryRefused: true,
         secretBoundaryReason: "persisted secret boundary refused recovery",
-      },
-    ],
-    [
-      "mcp-reconciliation",
-      {
-        checked: true,
-        wasRunning: true,
-        recovered: false,
-        forwardRecovered: false,
-        mcpReconciliationRefused: true,
-        mcpReconciliationReason: "MCP intent mismatch",
       },
     ],
     [
@@ -254,7 +281,9 @@ describe("collectSandboxStatusSnapshot Docker recovery", () => {
     const snapshot = await collectSandboxStatusSnapshot("alpha", { deps });
 
     expect(snapshot.lookup.state).toBe("present");
-    expect(deps.probeSandboxInferenceGatewayHealthImpl).toHaveBeenCalledWith("alpha");
+    expect(deps.probeSandboxInferenceGatewayHealthImpl).toHaveBeenCalledWith("alpha", {
+      gatewayName: "nemoclaw",
+    });
   });
 
   it("keeps a terminal runtime result neutral", async () => {

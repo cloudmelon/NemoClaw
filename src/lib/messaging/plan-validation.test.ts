@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { SandboxMessagingPlan } from "./manifest";
 import { compactSandboxMessagingPlanForPersistence } from "./persistence";
+import { hydrateDerivedSandboxMessagingPlanFields } from "./hydration";
 import {
   getActiveChannelIdsFromPlan,
   getConfiguredChannelIdsFromPlan,
@@ -100,7 +101,7 @@ describe("parseSandboxMessagingPlan", () => {
     const compact = compactSandboxMessagingPlanForPersistence(source);
     const parsed = parseSandboxMessagingPlan(compact);
 
-    expect(compact.networkPolicy).toEqual(source.networkPolicy);
+    expect(compact).not.toHaveProperty("networkPolicy");
     expect(compact).not.toHaveProperty("agentRender");
     expect(compact).not.toHaveProperty("buildSteps");
     expect(compact).not.toHaveProperty("runtimeSetup");
@@ -211,7 +212,7 @@ describe("parseSandboxMessagingPlan", () => {
 
     const compact = compactSandboxMessagingPlanForPersistence(source);
 
-    expect(compact.networkPolicy).toEqual(source.networkPolicy);
+    expect(compact).not.toHaveProperty("networkPolicy");
     expect(compact).not.toHaveProperty("agentRender");
     expect(compact).not.toHaveProperty("buildSteps");
     expect(compact).not.toHaveProperty("runtimeSetup");
@@ -226,6 +227,28 @@ describe("parseSandboxMessagingPlan", () => {
         inputs: [{ inputId: "allowedIds", value: "123" }],
       },
     ]);
+  });
+
+  it("drops legacy persisted policy references and regenerates transient policy from manifests", () => {
+    const compact = compactSandboxMessagingPlanForPersistence(makePlan());
+    const parsed = parseSandboxMessagingPlan({
+      ...compact,
+      networkPolicy: {
+        presets: ["stale-shadow"],
+        entries: [
+          {
+            channelId: "telegram",
+            presetName: "stale-shadow",
+            policyKeys: ["stale-shadow"],
+            source: "manifest",
+          },
+        ],
+      },
+    });
+
+    const hydrated = hydrateDerivedSandboxMessagingPlanFields(parsed!);
+    expect(hydrated.networkPolicy.presets).toEqual(["telegram"]);
+    expect(hydrated.networkPolicy.presets).not.toContain("stale-shadow");
   });
 
   it("rejects mismatched selectors, duplicate channels, and unsupported channels", () => {
@@ -243,6 +266,25 @@ describe("parseSandboxMessagingPlan", () => {
           channels: [
             makePlan().channels[0],
             { ...makePlan().channels[0], channelId: " TELEGRAM " },
+          ],
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it("rejects agent render entries owned by a different plan agent", () => {
+    expect(
+      parseSandboxMessagingPlan(
+        makePlan({
+          agentRender: [
+            {
+              channelId: "telegram",
+              agent: "hermes",
+              target: "~/.hermes/.env",
+              kind: "env-lines",
+              lines: [],
+              templateRefs: [],
+            },
           ],
         }),
       ),
@@ -366,7 +408,13 @@ describe("parseSandboxMessagingPlan", () => {
     expect(parseSandboxMessagingPlan(plan)).toBeNull();
   });
 
-  it("accepts and rejects channel host forward plans", () => {
+  it.each([
+    { channelId: "telegram", port: 0, label: "Telegram webhook" },
+    { channelId: "telegram", port: 70000, label: "Telegram webhook" },
+    { channelId: "telegram", port: 3978.5, label: "Telegram webhook" },
+    { channelId: "telegram", port: "3978", label: "Telegram webhook" },
+    { channelId: "telegram", port: 3978 },
+  ])("accepts and rejects channel host forward plans [case %#]", (hostForward) => {
     const source = makePlan({
       channels: [
         {
@@ -399,37 +447,26 @@ describe("parseSandboxMessagingPlan", () => {
       label: "Microsoft Teams webhook",
     });
 
-    for (const hostForward of [
-      { channelId: "telegram", port: 0, label: "Telegram webhook" },
-      { channelId: "telegram", port: 70000, label: "Telegram webhook" },
-      { channelId: "telegram", port: 3978.5, label: "Telegram webhook" },
-      { channelId: "telegram", port: "3978", label: "Telegram webhook" },
-      { channelId: "telegram", port: 3978 },
-    ]) {
-      const plan = makePlan() as unknown as { channels: Array<Record<string, unknown>> };
-      plan.channels[0] = {
-        ...plan.channels[0],
-        hostForward,
-      };
+    const plan = makePlan() as unknown as { channels: Array<Record<string, unknown>> };
+    plan.channels[0] = {
+      ...plan.channels[0],
+      hostForward,
+    };
 
-      expect(parseSandboxMessagingPlan(plan), JSON.stringify(hostForward)).toBeNull();
-    }
+    expect(parseSandboxMessagingPlan(plan), JSON.stringify(hostForward)).toBeNull();
   });
 
-  it("rejects malformed object arrays without throwing", () => {
-    for (const field of [
-      "credentialBindings",
-      "agentRender",
-      "buildSteps",
-      "stateUpdates",
-      "healthChecks",
-    ]) {
+  it.each(["credentialBindings", "agentRender", "buildSteps", "stateUpdates", "healthChecks"])(
+    "rejects null entries in the $field object array",
+    (field) => {
       const plan = makePlan() as unknown as Record<string, unknown>;
       plan[field] = [null];
 
       expect(parseSandboxMessagingPlan(plan), field).toBeNull();
-    }
+    },
+  );
 
+  it("rejects malformed nested object arrays without throwing", () => {
     const channelHooksPlan = makePlan() as unknown as { channels: { hooks: unknown[] }[] };
     channelHooksPlan.channels[0].hooks = [null];
     expect(parseSandboxMessagingPlan(channelHooksPlan), "channel hooks").toBeNull();

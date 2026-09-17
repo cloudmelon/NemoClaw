@@ -15,11 +15,8 @@ const REDACTED_URL_CANARY = "https://user:secret@example.test/hermes";
 type ConnectHarness = ReturnType<typeof createConnectHarness>;
 
 function connectCalls(harness: ConnectHarness, sandboxName = "alpha") {
-  return harness.spawnSyncSpy.mock.calls.filter(
-    ([command, args]) =>
-      command === "openshell" &&
-      Array.isArray(args) &&
-      args.join(" ") === `sandbox connect ${sandboxName}`,
+  return harness.startSandboxSessionSpy.mock.calls.filter(
+    ([request]) => request.kind === "connect" && request.sandboxName === sandboxName,
   );
 }
 
@@ -108,16 +105,10 @@ describe("Hermes sandbox connect light terminal skin", () => {
       display: { skin: NEMOCLAW_HERMES_LIGHT_SKIN_NAME },
     });
 
-    const connectCall = connectCalls(harness)[0];
-    expect(connectCall?.[2]).toEqual(
-      expect.objectContaining({
-        env: expect.objectContaining({
-          COLORFGBG: "0;15",
-          TERM_PROGRAM: "Apple_Terminal",
-        }),
-      }),
-    );
-    expect(connectCall?.[2]?.env).not.toEqual(expect.objectContaining({ HERMES_TUI_LIGHT: "1" }));
+    expect(process.env.COLORFGBG).toBe("0;15");
+    expect(process.env.TERM_PROGRAM).toBe("Apple_Terminal");
+    expect(process.env.HERMES_TUI_LIGHT).not.toBe("1");
+    expect(harness.createSessionExecutorSpy.mock.calls[0]?.[0].environment).toBeUndefined();
     expectConnectSucceeded(harness, exitSpy);
   });
 
@@ -229,7 +220,7 @@ describe("Hermes sandbox connect light terminal skin", () => {
       agentName: "hermes",
       registryEntries: [
         { name: "alpha", agent: "hermes" },
-        { name: "beta", agent: "hermes" },
+        { name: "beta", agent: "hermes", provider: "ollama-local", model: "qwen3-vl:4b" },
       ],
       sessionAgent: {
         name: "hermes",
@@ -378,9 +369,9 @@ describe("Hermes sandbox connect light terminal skin", () => {
 
     const skinWriteCall = skinWriteCalls(harness)[0];
     expect(skinWriteCall?.[0]).toEqual(["sandbox", "exec", "--name", "alpha", "--", "sh", "-s"]);
-    for (const part of (skinWriteCall?.[0] ?? []) as string[]) {
-      expect(part).not.toMatch(/[\n\r]/);
-    }
+    expect(((skinWriteCall?.[0] ?? []) as string[]).every((part) => !/[\n\r]/.test(part))).toBe(
+      true,
+    );
     const opts = skinWriteCall?.[1] as { input?: string; stdio?: unknown } | undefined;
     expect(opts?.input ?? "").toContain('mv -f "$tmp" "$skin_dir/nemoclaw-light.yaml"');
     expect(opts?.input ?? "").toContain("\n");

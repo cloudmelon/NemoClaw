@@ -117,24 +117,36 @@ describe("onboard session", () => {
     expect(dirStat.mode & 0o777).toBe(0o700);
   });
 
-  it.each([
-    true,
-    false,
-  ])("persists explicit observability intent when enabled=$enabled", (observabilityEnabled) => {
-    session.saveSession(
-      session.createSession({
-        observabilityEnabled,
-        observabilityRequestedExplicitly: true,
-      }),
+  it("refuses malformed persisted APF compatibility selection without replacing it (#9833)", () => {
+    session.saveSession(session.createSession({ apfInterceptorRequested: true }));
+    const malformed = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf8"));
+    malformed.apfInterceptorRequested = "true";
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(malformed), { mode: 0o600 });
+    const refusal = /saved APF selection is invalid/u;
+    expect(() => session.loadSession()).toThrow(refusal);
+    expect(fs.readFileSync(session.SESSION_FILE, "utf8")).toContain(
+      '"apfInterceptorRequested":"true"',
     );
-    const loaded = requireLoadedSession(session.loadSession());
-    const summary = requireDebugSummary(session.summarizeForDebug());
-
-    expect(loaded.observabilityEnabled).toBe(observabilityEnabled);
-    expect(loaded.observabilityRequestedExplicitly).toBe(true);
-    expect(summary.observabilityEnabled).toBe(observabilityEnabled);
-    expect(summary.observabilityRequestedExplicitly).toBe(true);
   });
+
+  it.each([true, false])(
+    "persists explicit observability intent when enabled=$enabled",
+    (observabilityEnabled) => {
+      session.saveSession(
+        session.createSession({
+          observabilityEnabled,
+          observabilityRequestedExplicitly: true,
+        }),
+      );
+      const loaded = requireLoadedSession(session.loadSession());
+      const summary = requireDebugSummary(session.summarizeForDebug());
+
+      expect(loaded.observabilityEnabled).toBe(observabilityEnabled);
+      expect(loaded.observabilityRequestedExplicitly).toBe(true);
+      expect(summary.observabilityEnabled).toBe(observabilityEnabled);
+      expect(summary.observabilityRequestedExplicitly).toBe(true);
+    },
+  );
 
   it("defaults legacy observability intent and provenance off", () => {
     const legacy = session.createSession() as unknown as Record<string, unknown>;
@@ -264,7 +276,9 @@ describe("onboard session", () => {
     session.markStepStarted("provider_selection");
     session.updateSession((current) => {
       current.checkpoint = {
-        schemaVersion: 3,
+        schemaVersion: 4,
+        profile: { kind: "selected", value: "default" },
+        runtimeAuthority: { kind: "unset" },
         sessionId: current.sessionId,
         machineState: "init",
         updatedAt: new Date().toISOString(),
@@ -414,7 +428,6 @@ describe("onboard session", () => {
       preferredInferenceApi: "openai-completions",
       compatibleEndpointReasoning: "true",
       nimContainer: "nim-123",
-      policyPresets: ["pypi", "npm"],
       apiKey: "nvapi-secret",
       metadata: {
         gatewayName: "nemoclaw",
@@ -432,7 +445,6 @@ describe("onboard session", () => {
     expect(loaded.preferredInferenceApi).toBe("openai-completions");
     expect(loaded.compatibleEndpointReasoning).toBe("true");
     expect(loaded.nimContainer).toBe("nim-123");
-    expect(loaded.policyPresets).toEqual(["pypi", "npm"]);
     expect(requireDebugSummary(session.summarizeForDebug()).compatibleEndpointReasoning).toBe(
       "true",
     );
@@ -736,7 +748,7 @@ describe("onboard session", () => {
     session.saveSession(created);
 
     const raw = JSON.parse(fs.readFileSync(session.SESSION_FILE, "utf-8"));
-    expect(raw.messagingPlan.networkPolicy).toEqual({ presets: [], entries: [] });
+    expect(raw.messagingPlan.networkPolicy).toBeUndefined();
     expect(raw.messagingPlan.agentRender).toBeUndefined();
     expect(raw.messagingPlan.buildSteps).toBeUndefined();
     expect(raw.messagingPlan.runtimeSetup).toBeUndefined();
@@ -1039,6 +1051,31 @@ describe("onboard session", () => {
     expect(session.loadSession()).toBeNull();
   });
 
+  it("keeps completed legacy checkpoint sessions readable as status evidence", () => {
+    const completed = session.createSession({ sessionId: "legacy-completed" });
+    completed.status = "complete";
+    completed.resumable = false;
+    completed.machine = {
+      version: 1,
+      state: "complete",
+      stateEnteredAt: completed.updatedAt,
+      revision: 8,
+    };
+    const raw = JSON.parse(JSON.stringify(completed)) as Record<string, unknown>;
+    raw.checkpoint = { schemaVersion: 3, sessionId: completed.sessionId };
+    fs.mkdirSync(path.dirname(session.SESSION_FILE), { recursive: true });
+    fs.writeFileSync(session.SESSION_FILE, JSON.stringify(raw, null, 2), { mode: 0o600 });
+
+    const loaded = requireLoadedSession(session.loadSession());
+    expect(loaded).toMatchObject({
+      sessionId: "legacy-completed",
+      status: "complete",
+      resumable: false,
+      machine: { state: "complete", revision: 8 },
+      checkpoint: null,
+    });
+  });
+
   it("acquires and releases the onboard lock", () => {
     const acquired = session.acquireOnboardLock("nemoclaw onboard");
     expect(acquired.acquired).toBe(true);
@@ -1260,12 +1297,20 @@ describe("onboard session", () => {
     }
   });
 
-  it("ignores malformed lock files when releasing the onboard lock", () => {
+  it("preserves a foreign lock that uses the local PID when no descriptor is held", () => {
     fs.mkdirSync(path.dirname(session.LOCK_FILE), { recursive: true });
-    fs.writeFileSync(session.LOCK_FILE, "{not-json", { mode: 0o600 });
+    const contents = JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      command: "foreign owner",
+      processGeneration: "foreign-generation",
+      hostIdentity: "foreign-host",
+      pidNamespaceIdentity: "foreign-namespace",
+    });
+    fs.writeFileSync(session.LOCK_FILE, contents, { mode: 0o600 });
 
     session.releaseOnboardLock();
-    expect(fs.existsSync(session.LOCK_FILE)).toBe(true);
+    expect(fs.readFileSync(session.LOCK_FILE, "utf8")).toBe(contents);
   });
 
   it("redacts sensitive values from persisted failure messages", () => {
@@ -1396,14 +1441,6 @@ describe("onboard session", () => {
     const created = session.createSession({ messagingPlan: plan });
     expect(created.messagingPlan).toEqual(plan);
     expect(created.provider).toBeNull();
-  });
-
-  it("filters non-string array entries in createSession overrides", () => {
-    const created = session.createSession({
-      policyPresets: ["pypi", 7, null, "npm"] as unknown as string[],
-    });
-
-    expect(created.policyPresets).toEqual(["pypi", "npm"]);
   });
 
   it("summarizes the session for debug output", () => {

@@ -14,19 +14,12 @@ import type { BackToSelection } from "../navigation";
 import { redact } from "../runner";
 import * as registry from "../state/registry";
 import { LOCAL_INFERENCE_TIMEOUT_SECS } from "./env";
+import type { UpsertProvider } from "./inference-providers/types";
 
 type RunOpenshell = (
   args: string[],
   options?: { ignoreError?: boolean; suppressOutput?: boolean; timeout?: number },
 ) => { status: number | null; stdout?: unknown; stderr?: unknown };
-
-type UpsertProvider = (
-  name: string,
-  type: string,
-  credentialEnv: string,
-  baseUrl: string | null,
-  env?: NodeJS.ProcessEnv,
-) => { ok: boolean; message?: string; status?: number };
 
 type SetupInferenceResult = { ok: true; retry?: undefined } | { retry: "selection" };
 
@@ -80,7 +73,10 @@ export async function selectBedrockRuntimeCustomAnthropic(
       envName: string,
       label: string,
       helpUrl: string | null,
+      validator?: ((value: string) => string | null) | null,
+      revalidateSandboxIdentity?: (operation: string) => void,
     ) => Promise<string | BackToSelection>;
+    credentialMutationGuard?: (operation: string) => void;
   } & BedrockRuntimeDependencies,
 ): Promise<
   | { action: "not-bedrock" }
@@ -104,6 +100,8 @@ export async function selectBedrockRuntimeCustomAnthropic(
       credentialEnv,
       `${options.label} API key`,
       options.helpUrl,
+      null,
+      options.credentialMutationGuard,
     );
     if (credentialResult === options.backToSelection) {
       return { action: "retry-selection" };
@@ -173,7 +171,7 @@ export async function setupBedrockRuntimeInference(
     return { handled: true, result: { retry: "selection" } };
   }
 
-  const providerResult = options.upsertProvider(
+  const providerResult = await options.upsertProvider(
     options.provider,
     "openai",
     adapter.credentialEnv,

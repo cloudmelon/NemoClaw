@@ -5,7 +5,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --output <json> --revision <sha> --cohort <id> --platform <linux/amd64|linux/arm64> --openclaw-base <exact-ref> --hermes-base <exact-ref> --dcode-base <exact-ref> [--source-root <absolute-dir>] [--cache-to <absolute-dir>] [--cache-from <absolute-dir>]" >&2
+  echo "usage: $0 --output <json> --revision <sha> --cohort <id> --platform <linux/amd64|linux/arm64> --openclaw-base <exact-ref> --hermes-base <exact-ref> --dcode-base <exact-ref> [--runtime-user <root|sandbox>] [--source-root <absolute-dir>] [--cache-to <absolute-dir>] [--cache-from <absolute-dir> --audit-evidence-from <absolute-dir>]" >&2
   exit 2
 }
 
@@ -19,8 +19,15 @@ dcode_base=""
 source_root="$PWD"
 cache_to=""
 cache_from=""
+audit_evidence_from=""
+runtime_user="sandbox"
 while (($# > 0)); do
   case "$1" in
+    --audit-evidence-from)
+      (($# >= 2)) || usage
+      audit_evidence_from="$2"
+      shift 2
+      ;;
     --cache-to)
       (($# >= 2)) || usage
       cache_to="$2"
@@ -34,6 +41,11 @@ while (($# > 0)); do
     --revision)
       (($# >= 2)) || usage
       revision="$2"
+      shift 2
+      ;;
+    --runtime-user)
+      (($# >= 2)) || usage
+      runtime_user="$2"
       shift 2
       ;;
     --cohort)
@@ -81,10 +93,12 @@ done
 [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || usage
 [[ "$cohort" =~ ^protected-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}$ ]] || usage
 [[ "$platform" == "linux/amd64" || "$platform" == "linux/arm64" ]] || usage
+[[ "$runtime_user" == "root" || "$runtime_user" == "sandbox" ]] || usage
 case "$platform" in
   linux/amd64) npm_target_cpu="x64" ;;
   linux/arm64) npm_target_cpu="arm64" ;;
 esac
+target_arch="${platform#linux/}"
 npm_target_os="linux"
 npm_target_libc="glibc"
 [[ "$openclaw_base" =~ ^ghcr[.]io/nvidia/nemoclaw/sandbox-base@sha256:[a-f0-9]{64}$ ]] || usage
@@ -92,6 +106,13 @@ npm_target_libc="glibc"
 [[ "$dcode_base" =~ ^ghcr[.]io/nvidia/nemoclaw/langchain-deepagents-code-sandbox-base@sha256:[a-f0-9]{64}$ ]] || usage
 [[ "$source_root" == /* && "$source_root" != *$'\n'* && -d "$source_root" && ! -L "$source_root" ]] || usage
 source_root="$(cd -- "$source_root" && pwd -P)"
+controller_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+trusted_audit_config="$controller_root/ci/reviewed-npm-audit.json"
+trusted_audit_exceptions="$controller_root/ci/npm-audit-exceptions.json"
+trusted_receipt_verifier="$controller_root/scripts/lib/npm-audit-receipt.mts"
+[[ -f "$trusted_audit_config" && ! -L "$trusted_audit_config" ]] || usage
+[[ -f "$trusted_audit_exceptions" && ! -L "$trusted_audit_exceptions" ]] || usage
+[[ -f "$trusted_receipt_verifier" && ! -L "$trusted_receipt_verifier" ]] || usage
 seed_helper="$source_root/scripts/checks/materialize-locked-npm-cache-seed.mts"
 source_lockfile="$source_root/nemoclaw/package-lock.json"
 source_seed_dir="$source_root/tools/mcp-tool-discovery-runtime/npm-cache-seed"
@@ -159,7 +180,14 @@ if [[ -n "$cache_from" ]]; then
   }
 fi
 
-for command in docker jq node sha256sum; do
+if [[ -n "$audit_evidence_from" ]]; then
+  [[ -n "$cache_from" && "$audit_evidence_from" == /* && "$audit_evidence_from" != *$'\n'* && -d "$audit_evidence_from" && ! -L "$audit_evidence_from" ]] || usage
+  audit_evidence_from="$(cd -- "$audit_evidence_from" && pwd -P)"
+elif [[ -n "$cache_from" ]]; then
+  usage
+fi
+
+for command in curl docker jq node sha256sum; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "ERROR: protected managed-image build requires $command" >&2
     exit 1
@@ -192,9 +220,50 @@ trap restore_worktree EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+audit_receipt=""
+audit_raw_report=""
+audit_policy_result=""
+audit_receipt_sha256=""
+audit_policy_result_sha256=""
+validate_audit_evidence() {
+  local directory="$1"
+  [[ -d "$directory" && ! -L "$directory" && -z "$(find "$directory" -type l -print -quit)" ]] || {
+    echo "ERROR: protected managed-image reviewed audit evidence is missing or unsafe" >&2
+    exit 1
+  }
+  audit_receipt="$directory/mcporter-runtime.receipt.json"
+  audit_raw_report="$directory/mcporter-runtime.raw.json"
+  [[ -f "$audit_receipt" && -s "$audit_receipt" && -f "$audit_raw_report" && -s "$audit_raw_report" ]] || {
+    echo "ERROR: protected managed-image reviewed audit evidence is incomplete" >&2
+    exit 1
+  }
+  audit_receipt_sha256="$(sha256sum "$audit_receipt" | awk '{print $1}')"
+  audit_policy_result="$work_dir/mcporter-runtime.policy.json"
+  node --no-warnings "$trusted_receipt_verifier" \
+    --receipt "$audit_receipt" \
+    --package-json "$source_root/agents/openclaw/mcporter-runtime/package.json" \
+    --package-lock "$source_root/agents/openclaw/mcporter-runtime/package-lock.json" \
+    --raw-report "$audit_raw_report" \
+    --exceptions "$trusted_audit_exceptions" \
+    --graph mcporter-runtime \
+    --audit-config "$trusted_audit_config" \
+    --registry https://registry.yarnpkg.com \
+    --threshold high \
+    --result "$audit_policy_result"
+  [[ -f "$audit_policy_result" && -s "$audit_policy_result" && ! -L "$audit_policy_result" ]] || {
+    echo "ERROR: protected managed-image reviewed audit policy result is missing or unsafe" >&2
+    exit 1
+  }
+  audit_policy_result_sha256="$(sha256sum "$audit_policy_result" | awk '{print $1}')"
+}
+
+if [[ -n "$cache_from" ]]; then
+  validate_audit_evidence "$audit_evidence_from"
+fi
+
 if [[ -n "$cache_from" ]]; then
   imported_seed="$work_dir/npm-cache-seed-import"
-  node --experimental-strip-types --no-warnings "$seed_helper" copy \
+  node --no-warnings "$seed_helper" copy \
     --lockfile "$source_lockfile" \
     --seed "$cache_from/npm-cache-seed" \
     --output "$imported_seed" \
@@ -207,7 +276,7 @@ if [[ -n "$cache_from" ]]; then
   cp -pR -- "$imported_seed" "$source_seed_dir"
 
   imported_mcp_seed="$work_dir/mcp-runtime-npm-cache-seed-import"
-  node --experimental-strip-types --no-warnings "$seed_helper" copy \
+  node --no-warnings "$seed_helper" copy \
     --lockfile "$source_mcp_lockfile" \
     --seed "$cache_from/mcp-runtime-npm-cache-seed" \
     --output "$imported_mcp_seed" \
@@ -220,7 +289,7 @@ if [[ -n "$cache_from" ]]; then
   cp -pR -- "$imported_mcp_seed" "$source_mcp_seed_dir"
 
   imported_messaging_seed="$work_dir/messaging-npm-cache-seed-import"
-  node --experimental-strip-types --no-warnings "$seed_helper" copy \
+  node --no-warnings "$seed_helper" copy \
     --lockfile "$source_messaging_lockfile" \
     --seed "$cache_from/messaging-npm-cache-seed" \
     --output "$imported_messaging_seed" \
@@ -235,6 +304,105 @@ fi
 
 contracts="$work_dir/contracts.jsonl"
 : >"$contracts"
+
+confirm_build_retry_state() {
+  local agent="$1"
+  local image_repository="$2"
+  local manifest_status
+  local registry_host="${image_repository%%/*}"
+  local repository_path="${image_repository#*/}"
+  local manifest_url="http://${registry_host}/v2/${repository_path}/manifests/${revision}"
+
+  if ! manifest_status="$(curl \
+    --silent \
+    --show-error \
+    --output /dev/null \
+    --write-out '%{http_code}' \
+    --head \
+    --connect-timeout 5 \
+    --max-time 15 \
+    --header 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+    "$manifest_url")"; then
+    echo "::error::Protected managed-image build retry state check failed agent=${agent} transport=curl" >&2
+    return 1
+  fi
+
+  case "$manifest_status" in
+    200)
+      echo "::error::Protected managed-image build retry state agent=${agent} revision-tag=present" >&2
+      return 1
+      ;;
+    404)
+      echo "::notice::Protected managed-image build retry state agent=${agent} revision-tag=absent"
+      return 0
+      ;;
+    *)
+      echo "::error::Protected managed-image build retry state check failed agent=${agent} registry-http=${manifest_status}" >&2
+      return 1
+      ;;
+  esac
+}
+
+run_build_with_retry() {
+  local agent="$1"
+  local image_repository="$2"
+  shift 2
+  local -a build_command=("$@")
+  local attempt_log="$work_dir/${agent}-build-attempt.log"
+  local max_attempts=2
+  local attempt
+  local build_status
+  local failure_class
+  local last_line
+  local log_status
+  local outcome
+  local -a pipeline_status=()
+
+  for ((attempt = 1; attempt <= max_attempts; attempt += 1)); do
+    : >"$attempt_log"
+    if "${build_command[@]}" 2>&1 | tee "$attempt_log"; then
+      if [[ "$attempt" == 1 ]]; then
+        outcome="passed-first-attempt"
+      else
+        outcome="passed-after-retry"
+      fi
+      echo "::notice::Protected managed-image build outcome=${outcome} agent=${agent} attempt=${attempt}/${max_attempts}"
+      return 0
+    else
+      pipeline_status=("${PIPESTATUS[@]}")
+      build_status="${pipeline_status[0]}"
+      log_status="${pipeline_status[1]}"
+    fi
+
+    if [[ "$log_status" != 0 ]]; then
+      echo "::error::Protected managed-image build outcome=failed-no-retry agent=${agent} attempt=${attempt}/${max_attempts} evidence-exit=${log_status}" >&2
+      return "$log_status"
+    fi
+
+    last_line="$(awk 'NF { line=$0 } END { sub(/\r$/, "", line); print line }' "$attempt_log")"
+    if [[ "$last_line" =~ ^ERROR:\ failed\ to\ build:\ failed\ to\ solve:\ stream\ error:\ stream\ ID\ [0-9]+\;\ INTERNAL_ERROR\;\ received\ from\ peer$ ]]; then
+      failure_class="buildkit-http2-internal-error"
+    elif grep -Eq '^(#[0-9]+ )?[0-9]+([.][0-9]+)? ERROR: curl failed: curl: \(6\) Could not resolve host: registry[.]npmjs[.]org$' "$attempt_log"; then
+      failure_class="npm-registry-dns-resolution"
+    else
+      echo "::error::Protected managed-image build outcome=failed-no-retry agent=${agent} attempt=${attempt}/${max_attempts} docker-exit=${build_status}" >&2
+      return "$build_status"
+    fi
+
+    if [[ "$attempt" == "$max_attempts" ]]; then
+      echo "::error::Protected managed-image build outcome=exhausted agent=${agent} attempt=${attempt}/${max_attempts} failure=${failure_class} docker-exit=${build_status}" >&2
+      return "$build_status"
+    fi
+
+    if ! confirm_build_retry_state "$agent" "$image_repository"; then
+      echo "::error::Protected managed-image build outcome=failed-no-retry agent=${agent} attempt=${attempt}/${max_attempts} failure=state-check" >&2
+      return "$build_status"
+    fi
+
+    echo "::warning::Protected managed-image build outcome=transient-external agent=${agent} attempt=${attempt}/${max_attempts} retry-in=2s failure=${failure_class}" >&2
+    sleep 2
+  done
+}
 
 build_agent() {
   local agent="$1"
@@ -264,6 +432,16 @@ build_agent() {
     fi
   fi
 
+  if [[ "$agent" == "openclaw" && -n "$audit_receipt" ]]; then
+    cache_args+=(
+      --secret "id=nemoclaw-mcporter-audit-receipt,src=${audit_receipt}"
+      --secret "id=nemoclaw-mcporter-audit-raw-report,src=${audit_raw_report}"
+      --secret "id=nemoclaw-mcporter-audit-policy-result,src=${audit_policy_result}"
+      --build-arg "NEMOCLAW_MCPORTER_AUDIT_RECEIPT_SHA256=${audit_receipt_sha256}"
+      --build-arg "NEMOCLAW_MCPORTER_AUDIT_POLICY_RESULT_SHA256=${audit_policy_result_sha256}"
+    )
+  fi
+
   local base_digest="${base_reference##*@}"
   docker buildx imagetools inspect "$base_reference" --raw >"$exact_base_raw"
   local actual_base
@@ -277,29 +455,35 @@ build_agent() {
     -f "$dockerfile_path" \
     --build-arg "BASE_IMAGE=${base_reference}" \
     --build-arg "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION=1" \
-    --build-arg "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=root"
+    --build-arg "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=${runtime_user}" \
+    --build-arg "TARGETARCH=${target_arch}"
 
-  docker buildx build \
-    --file "$dockerfile_path" \
-    --platform "$platform" \
-    --push \
-    --provenance=false \
-    --sbom=false \
-    --metadata-file "$metadata" \
-    ${cache_args[@]+"${cache_args[@]}"} \
-    --tag "${image_repository}:${revision}" \
-    --label "org.opencontainers.image.source=https://github.com/NVIDIA/NemoClaw" \
-    --label "org.opencontainers.image.revision=${revision}" \
-    --label "io.nvidia.nemoclaw.agent=${agent}" \
-    --label "io.nvidia.nemoclaw.managed-image.contract=1" \
-    --label "io.nvidia.nemoclaw.managed-image.platform=${platform}" \
-    --label "io.nvidia.nemoclaw.managed-image.startup-profile=1" \
-    --label "io.nvidia.nemoclaw.managed-image.capabilities=1" \
-    --label "io.nvidia.nemoclaw.managed-image.cohort=${cohort}" \
-    --build-arg "BASE_IMAGE=${base_reference}" \
-    --build-arg "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION=1" \
-    --build-arg "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=root" \
-    "$source_root"
+  local -a build_command=(docker buildx build
+    --file "$dockerfile_path"
+    --platform "$platform"
+    --push
+    --provenance=false
+    --sbom=false
+    --metadata-file "$metadata"
+    ${cache_args[@]+"${cache_args[@]}"}
+    --tag "${image_repository}:${revision}"
+    --label "org.opencontainers.image.source=https://github.com/NVIDIA/NemoClaw"
+    --label "org.opencontainers.image.revision=${revision}"
+    --label "io.nvidia.nemoclaw.agent=${agent}"
+    --label "io.nvidia.nemoclaw.managed-image.contract=1"
+    --label "io.nvidia.nemoclaw.managed-image.platform=${platform}"
+    --label "io.nvidia.nemoclaw.managed-image.startup-profile=1"
+    --label "io.nvidia.nemoclaw.managed-image.capabilities=1"
+    --label "io.nvidia.nemoclaw.managed-image.cohort=${cohort}"
+    --build-arg "BASE_IMAGE=${base_reference}"
+    # Dockerfile defaults preserve direct Podman x86 builds. Pass the selected
+    # Buildx target explicitly so that default cannot override linux/arm64.
+    --build-arg "TARGETARCH=${platform#linux/}"
+    --build-arg "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION=1"
+    --build-arg "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=${runtime_user}"
+    --build-arg "TARGETARCH=${target_arch}"
+    "$source_root")
+  run_build_with_retry "$agent" "$image_repository" "${build_command[@]}"
 
   local digest
   digest="$(jq -er '."containerimage.digest"' "$metadata")"
@@ -329,11 +513,16 @@ build_agent() {
     --arg cohort "$cohort" \
     --arg image_id "$image_id" \
     --arg platform "$platform" \
+    --arg runtime_user "$runtime_user" \
     --arg revision "$revision" '
       length == 1 and
       .[0].Id == $image_id and
       ((.[0].Config.User // "") as $user |
-        $user == "" or $user == "root" or $user == "0") and
+        if $runtime_user == "root" then
+          $user == "" or $user == "root" or $user == "0"
+        else
+          $user == "sandbox"
+        end) and
       .[0].Config.Labels["io.nvidia.nemoclaw.agent"] == $agent and
       .[0].Config.Labels["io.nvidia.nemoclaw.managed-image.contract"] == "1" and
       .[0].Config.Labels["io.nvidia.nemoclaw.managed-image.platform"] == $platform and
@@ -377,19 +566,19 @@ build_agent \
   "$dcode_base"
 
 if [[ -n "$cache_to" ]]; then
-  node --experimental-strip-types --no-warnings "$seed_helper" export \
+  node --no-warnings "$seed_helper" export \
     --lockfile "$source_lockfile" \
     --output "$cache_to/npm-cache-seed" \
     --os "$npm_target_os" \
     --cpu "$npm_target_cpu" \
     --libc "$npm_target_libc"
-  node --experimental-strip-types --no-warnings "$seed_helper" export \
+  node --no-warnings "$seed_helper" export \
     --lockfile "$source_mcp_lockfile" \
     --output "$cache_to/mcp-runtime-npm-cache-seed" \
     --os "$npm_target_os" \
     --cpu "$npm_target_cpu" \
     --libc "$npm_target_libc"
-  node --experimental-strip-types --no-warnings "$seed_helper" export \
+  node --no-warnings "$seed_helper" export \
     --lockfile "$source_messaging_lockfile" \
     --output "$cache_to/messaging-npm-cache-seed" \
     --os "$npm_target_os" \

@@ -1,7 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { captureHostCommand } from "../../actions/sandbox/doctor-host-command";
+import {
+  captureHostCommand,
+  captureOpenShellHostCommand,
+  openShellSandboxNeedsLifecycleStart,
+} from "../../actions/sandbox/doctor-host-command";
+import { dockerCapture, dockerRun } from "../../adapters/docker/run";
+import {
+  DEFAULT_GATEWAY_BIND_ADDRESS,
+  getGatewayConnectHost,
+  parseGatewayBindAddress,
+} from "../../core/gateway-address";
 import {
   isDockerRuntimeDown,
   printDockerRuntimeDownGuidance,
@@ -14,17 +24,32 @@ import {
 } from "../docker-driver-sandbox-recovery";
 import { createDockerManagedBootstrapSurface } from "../managed-bootstrap/docker-runtime";
 import {
+  DOCKER_NETWORK_IPAM_INSPECT_FORMAT,
+  parseDockerNetworkIpamEntries,
+  resolveDockerDriverNetworkName,
+} from "../experimental/docker-network-authority";
+import {
+  hasPortableAgentSandboxLifecycleReceipt,
+  recoverPortableAgentSandboxLifecycle,
+  requalifyPortableAgentSandboxAuthority,
+  stopPortableAgentSandboxLifecycle,
+} from "../experimental/portable-agent-lifecycle";
+import { withMcpLifecycleLock } from "../../state/mcp-lifecycle-lock-acquisition";
+import { resolveHermesPortableLifecycleLockOptions } from "../experimental/portable-lifecycle-lock";
+import { queryOpenShellDockerSandboxRuntimeSnapshot } from "../openshell-docker-sandbox-containers";
+import { validateSandboxGpuPreflight } from "../sandbox-gpu-preflight";
+import {
   MANAGED_IMAGE_CAPABILITY_CONTRACT_VERSION,
   MANAGED_IMAGE_PLATFORMS,
   MANAGED_IMAGE_REPOSITORIES,
   MANAGED_IMAGE_STARTUP_PROFILE_CONTRACT_VERSION,
-} from "../managed-image/contract";
-import { queryOpenShellDockerSandboxRuntimeSnapshot } from "../openshell-docker-sandbox-containers";
-import {
   RUNTIME_PROVIDER_BUNDLE_CONTRACT_VERSION,
   type RuntimeProviderBundle,
   type RuntimeProviderCleanupInput,
   type RuntimeProviderCommandCapture,
+  type RuntimeProviderContainerEngineOperation,
+  type RuntimeProviderNvidiaContainerInput,
+  type RuntimeProviderOwnedContainerCleanupOptions,
   type RuntimeProviderDoctorCheck,
   type RuntimeProviderLifecycleInput,
   type RuntimeProviderLifecycleResult,
@@ -35,7 +60,8 @@ import {
   type RuntimeProviderWorkloadProfile,
 } from "./contract";
 import { createDockerLlamaCppHostLocalOperation } from "./docker-llama-cpp-operation";
-import { createDockerStateMutationSurface } from "./docker-state-mutation";
+import { createDockerPrivilegedSandboxControl } from "./docker-privileged-sandbox-control";
+import { cleanupOwnedContainer, ownedContainerRunArguments } from "./owned-container-resource";
 import { createDockerRuntimeProviderSnapshotSurface } from "./snapshot";
 
 type DockerOpResult = { status?: number | null };
@@ -47,23 +73,163 @@ type DockerRemoveImage = (
 ) => { status: number | null };
 
 export interface DockerRuntimeProviderDependencies {
+  readonly captureSandboxLifecycle: (
+    action: "start" | "stop",
+    sandboxName: string,
+    gatewayName: string,
+    environment: NodeJS.ProcessEnv,
+  ) => ReturnType<typeof captureOpenShellHostCommand>;
+  /** True only when OpenShell reports a phase that requires a lifecycle start. */
+  readonly sandboxNeedsLifecycleStart: (
+    sandboxName: string,
+    gatewayName: string,
+    environment: NodeJS.ProcessEnv,
+  ) => boolean;
   readonly captureHostCommand: (
     command: string,
     args: string[],
     timeout?: number,
   ) => RuntimeProviderCommandCapture;
   readonly findLabeledSandboxContainers: typeof findLabeledSandboxContainers;
+  readonly hasPortableLifecycleReceipt: typeof hasPortableAgentSandboxLifecycleReceipt;
   readonly isRuntimeDown: typeof isDockerRuntimeDown;
   readonly printRuntimeDownGuidance: typeof printDockerRuntimeDownGuidance;
   readonly recoverSandbox: typeof recoverDockerDriverSandbox;
+  readonly recoverPortableSandbox: typeof recoverPortableAgentSandboxLifecycle;
+  readonly requalifyPortableSandbox: typeof requalifyPortableAgentSandboxAuthority;
   readonly queryRuntimeSnapshot: typeof queryOpenShellDockerSandboxRuntimeSnapshot;
   readonly removeImage: DockerRemoveImage;
   readonly stopContainer: DockerStop;
+  readonly stopPortableSandbox: typeof stopPortableAgentSandboxLifecycle;
   readonly unpauseContainer: DockerUnpause;
+  readonly withLifecycleLock: typeof withMcpLifecycleLock;
 }
 
 const DOCKER_OPERATION_TIMEOUT_MS = 30_000;
 const AT_REST_STATUS_PREFIXES = ["Exited", "Created", "Dead"] as const;
+
+function inspectDockerGatewayNetwork(networkName: string) {
+  const raw = dockerCapture(
+    ["network", "inspect", "--format", DOCKER_NETWORK_IPAM_INSPECT_FORMAT, networkName],
+    { ignoreError: true },
+  );
+  for (const entry of parseDockerNetworkIpamEntries(raw) ?? []) {
+    if (entry.gatewayIp && !entry.gatewayIp.includes(":")) return entry;
+  }
+  return undefined;
+}
+
+function dockerGatewayUsesHostGatewayRoute(): boolean {
+  if (process.platform !== "linux") return true;
+  const info = dockerCapture(
+    ["info", "--format", "{{.OperatingSystem}}\n{{range .Labels}}{{.}}\n{{end}}"],
+    { ignoreError: true },
+  );
+  return /Docker Desktop|com\.docker\.desktop\./iu.test(info);
+}
+
+function runDockerGatewayCommand(
+  args: readonly string[],
+  timeoutMs: number,
+  options?: { maxOutputBytes: number; environment?: Record<string, string> },
+) {
+  const result = dockerRun([...args], {
+    ...(options
+      ? {
+          maxBuffer: options.maxOutputBytes,
+          killSignal: "SIGKILL" as const,
+          env: options.environment,
+        }
+      : {}),
+    timeout: timeoutMs,
+    ignoreError: true,
+    suppressOutput: true,
+  });
+  const error = result.error as NodeJS.ErrnoException | undefined;
+  return {
+    status: result.status ?? null,
+    signal: result.signal,
+    error: error?.message,
+    errorCode: error?.code ?? null,
+    timedOut: error?.code === "ETIMEDOUT",
+    stderr: result.stderr,
+    stdout: result.stdout,
+  };
+}
+
+function ensureDockerGatewayProbeImageCached(image: string) {
+  const inspect = runDockerGatewayCommand(["image", "inspect", image], 10_000);
+  if (inspect.status === 0) return { ok: true as const, alreadyCached: true };
+  if (inspect.status === null || inspect.errorCode) {
+    return {
+      ok: false as const,
+      reason: "inspect_unavailable" as const,
+      details: inspect.error ?? String(inspect.stderr ?? "").trim(),
+    };
+  }
+  const pull = runDockerGatewayCommand(["pull", image], 120_000);
+  if (pull.status === 0) return { ok: true as const, alreadyCached: false };
+  return {
+    ok: false as const,
+    reason: pull.timedOut ? ("pull_timeout" as const) : ("pull_failed" as const),
+    details: pull.error ?? String(pull.stderr ?? "").trim(),
+  };
+}
+
+function captureDockerContainerEngineOperation(
+  deps: DockerRuntimeProviderDependencies,
+  supportedOperations: ReadonlySet<RuntimeProviderContainerEngineOperation>,
+  operation: RuntimeProviderContainerEngineOperation,
+  args: readonly string[],
+  timeoutMs?: number,
+): RuntimeProviderCommandCapture {
+  if (!supportedOperations.has(operation)) {
+    throw new Error(`Docker provider does not register the '${operation}' engine operation.`);
+  }
+  return deps.captureHostCommand("docker", [...args], timeoutMs);
+}
+
+function captureDockerNvidiaContainer(
+  deps: DockerRuntimeProviderDependencies,
+  supportedOperations: ReadonlySet<RuntimeProviderContainerEngineOperation>,
+  operation: RuntimeProviderContainerEngineOperation,
+  input: RuntimeProviderNvidiaContainerInput,
+  timeoutMs?: number,
+): RuntimeProviderCommandCapture {
+  return captureDockerContainerEngineOperation(
+    deps,
+    supportedOperations,
+    operation,
+    [
+      "run",
+      "--rm",
+      ...ownedContainerRunArguments(input.resource),
+      "--gpus",
+      "all",
+      "--entrypoint",
+      input.entrypoint,
+      input.image,
+      ...input.command,
+    ],
+    timeoutMs,
+  );
+}
+
+function cleanupDockerNvidiaContainer(
+  deps: DockerRuntimeProviderDependencies,
+  supportedOperations: ReadonlySet<RuntimeProviderContainerEngineOperation>,
+  operation: RuntimeProviderContainerEngineOperation,
+  resource: RuntimeProviderNvidiaContainerInput["resource"],
+  options: RuntimeProviderOwnedContainerCleanupOptions,
+) {
+  return cleanupOwnedContainer(
+    resource,
+    `^/${resource.name}$`,
+    (args, timeout) =>
+      captureDockerContainerEngineOperation(deps, supportedOperations, operation, args, timeout),
+    options,
+  );
+}
 
 function loadDockerStop(): DockerStop {
   return (require("../../adapters/docker") as { dockerStop: DockerStop }).dockerStop;
@@ -81,22 +247,47 @@ function resolveDependencies(
   overrides: Partial<DockerRuntimeProviderDependencies> = {},
 ): DockerRuntimeProviderDependencies {
   return {
+    captureSandboxLifecycle:
+      overrides.captureSandboxLifecycle ??
+      ((action, sandboxName, gatewayName, environment) =>
+        captureOpenShellHostCommand(
+          ["sandbox", action, "-g", gatewayName, sandboxName],
+          environment,
+          DOCKER_OPERATION_TIMEOUT_MS,
+        )),
+    sandboxNeedsLifecycleStart:
+      overrides.sandboxNeedsLifecycleStart ??
+      ((sandboxName, gatewayName, environment) =>
+        openShellSandboxNeedsLifecycleStart(
+          sandboxName,
+          gatewayName,
+          environment,
+          DOCKER_OPERATION_TIMEOUT_MS,
+        )),
     captureHostCommand:
       overrides.captureHostCommand ??
       ((command, args, timeout) => captureHostCommand(command, args, timeout)),
     findLabeledSandboxContainers:
       overrides.findLabeledSandboxContainers ?? findLabeledSandboxContainers,
+    hasPortableLifecycleReceipt:
+      overrides.hasPortableLifecycleReceipt ?? hasPortableAgentSandboxLifecycleReceipt,
     isRuntimeDown: overrides.isRuntimeDown ?? isDockerRuntimeDown,
     printRuntimeDownGuidance: overrides.printRuntimeDownGuidance ?? printDockerRuntimeDownGuidance,
     recoverSandbox: overrides.recoverSandbox ?? recoverDockerDriverSandbox,
+    recoverPortableSandbox:
+      overrides.recoverPortableSandbox ?? recoverPortableAgentSandboxLifecycle,
+    requalifyPortableSandbox:
+      overrides.requalifyPortableSandbox ?? requalifyPortableAgentSandboxAuthority,
     queryRuntimeSnapshot:
       overrides.queryRuntimeSnapshot ?? queryOpenShellDockerSandboxRuntimeSnapshot,
     removeImage:
       overrides.removeImage ??
       ((reference, options) => loadDockerRemoveImage()(reference, options)),
     stopContainer: overrides.stopContainer ?? ((name, options) => loadDockerStop()(name, options)),
+    stopPortableSandbox: overrides.stopPortableSandbox ?? stopPortableAgentSandboxLifecycle,
     unpauseContainer:
       overrides.unpauseContainer ?? ((name, options) => loadDockerUnpause()(name, options)),
+    withLifecycleLock: overrides.withLifecycleLock ?? withMcpLifecycleLock,
   };
 }
 
@@ -124,6 +315,14 @@ function dockerLifecyclePreflight(
   input: RuntimeProviderLifecycleInput,
   deps: DockerRuntimeProviderDependencies,
 ): RuntimeProviderLifecycleResult | null {
+  try {
+    if (deps.hasPortableLifecycleReceipt(input.sandboxName, input.environment)) return null;
+  } catch (error) {
+    return {
+      exitCode: 1,
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
   if (!deps.isRuntimeDown(input.sandboxName)) return null;
   deps.printRuntimeDownGuidance(input.sandboxName, { retryCommand: action });
   return { exitCode: 1 };
@@ -137,10 +336,69 @@ function isAtRestStatus(status: string): boolean {
   return AT_REST_STATUS_PREFIXES.some((prefix) => status.startsWith(prefix));
 }
 
-function startDockerSandbox(
+function isGpuBackupSibling(name: string): boolean {
+  return /-nemoclaw-gpu-backup-\d+$/u.test(name);
+}
+
+async function startDockerSandbox(
   input: RuntimeProviderLifecycleInput,
   deps: DockerRuntimeProviderDependencies,
-): RuntimeProviderLifecycleResult {
+): Promise<RuntimeProviderLifecycleResult> {
+  return deps.withLifecycleLock(
+    input.sandboxName,
+    () => startDockerSandboxUnlocked(input, deps),
+    dockerLifecycleLockOptions(input, deps),
+  );
+}
+
+function dockerLifecycleLockOptions(
+  input: RuntimeProviderLifecycleInput,
+  deps: DockerRuntimeProviderDependencies,
+): { readonly stateDir: string } | undefined {
+  if (input.sandbox.agent !== "hermes") return undefined;
+  return resolveHermesPortableLifecycleLockOptions(
+    input.sandboxName,
+    input.environment,
+    deps.hasPortableLifecycleReceipt,
+  );
+}
+
+async function startDockerSandboxUnlocked(
+  input: RuntimeProviderLifecycleInput,
+  deps: DockerRuntimeProviderDependencies,
+): Promise<RuntimeProviderLifecycleResult> {
+  try {
+    if (input.sandbox.agent === "hermes") {
+      await deps.requalifyPortableSandbox(input.sandboxName, {
+        env: input.environment,
+        readRegistry: (name) => input.readRegistry?.(name) ?? null,
+      });
+    }
+    const portable = await deps.recoverPortableSandbox(
+      input.sandboxName,
+      {
+        agent: input.sandbox.agent,
+        gatewayName: input.sandbox.gatewayName ?? "nemoclaw",
+        lifecycleGeneration: input.sandbox.lifecycleGeneration,
+        openshellDriver: input.sandbox.openshellDriver,
+        provider: input.sandbox.provider,
+      },
+      {
+        env: input.environment,
+        log: input.log,
+        readRegistry: (name) => input.readRegistry?.(name) ?? null,
+      },
+    );
+    if (portable.kind !== "not-installed") {
+      return input.sandbox.agent === "hermes"
+        ? ({ exitCode: 0, hermesPortableVerified: true } as RuntimeProviderLifecycleResult & {
+            readonly hermesPortableVerified: true;
+          })
+        : { exitCode: 0 };
+    }
+  } catch (error) {
+    return { exitCode: 1, message: error instanceof Error ? error.message : String(error) };
+  }
   const containers = deps.findLabeledSandboxContainers(input.sandboxName);
   const paused = containers.find((container) => isPausedStatus(container.status));
   if (paused) {
@@ -155,6 +413,49 @@ function startDockerSandbox(
       };
     }
     input.log(`  Container '${paused.name}' unpaused.`);
+    return { exitCode: 0 };
+  }
+
+  // Docker container status alone does not decide whether the sandbox needs a
+  // lifecycle start: OpenShell owns the sandbox phase, and a container can run
+  // while its sandbox is still `Stopped` — for example after something started
+  // the container behind OpenShell's back. Reporting "already running" for that
+  // pair skips the only operation that advances the phase, so every later
+  // `start` waits out the readiness timeout and the sandbox never recovers
+  // (#11790). Read the phase only when no container is at rest; an at-rest
+  // container already needs the same start and the extra probe would be waste.
+  const containerAtRest = containers.some((container) => isAtRestStatus(container.status));
+  const stoppedPhaseWithRunningContainer =
+    !containerAtRest &&
+    containers.length > 0 &&
+    deps.sandboxNeedsLifecycleStart(
+      input.sandboxName,
+      input.sandbox.gatewayName ?? "nemoclaw",
+      input.environment,
+    );
+  const hasGpuBackupSibling = containers.some((container) => isGpuBackupSibling(container.name));
+  if (stoppedPhaseWithRunningContainer || (containerAtRest && !hasGpuBackupSibling)) {
+    if (stoppedPhaseWithRunningContainer) {
+      input.log(
+        `  Sandbox '${input.sandboxName}' is still stopped while its container runs; starting it through OpenShell.`,
+      );
+    }
+    const result = deps.captureSandboxLifecycle(
+      "start",
+      input.sandboxName,
+      input.sandbox.gatewayName ?? "nemoclaw",
+      input.environment,
+    );
+    if (result.status !== 0 || result.error) {
+      const detail = oneLine(result.output || result.error?.message || "unknown failure");
+      return {
+        exitCode: 1,
+        message:
+          `  OpenShell could not start sandbox '${input.sandboxName}'` +
+          ` (exit ${String(result.status ?? "unknown")}): ${detail}.`,
+      };
+    }
+    input.log(`  Sandbox '${input.sandboxName}' started through OpenShell.`);
     return { exitCode: 0 };
   }
 
@@ -181,11 +482,71 @@ function startDockerSandbox(
   return { exitCode: 0 };
 }
 
-function stopDockerSandbox(
+async function stopDockerSandbox(
   input: RuntimeProviderLifecycleInput,
   hooks: RuntimeProviderLifecycleStopHooks,
   deps: DockerRuntimeProviderDependencies,
-): RuntimeProviderLifecycleStopOutcome {
+): Promise<RuntimeProviderLifecycleStopOutcome> {
+  return deps.withLifecycleLock(
+    input.sandboxName,
+    () => stopDockerSandboxUnlocked(input, hooks, deps),
+    dockerLifecycleLockOptions(input, deps),
+  );
+}
+
+async function stopDockerSandboxUnlocked(
+  input: RuntimeProviderLifecycleInput,
+  hooks: RuntimeProviderLifecycleStopHooks,
+  deps: DockerRuntimeProviderDependencies,
+): Promise<RuntimeProviderLifecycleStopOutcome> {
+  try {
+    const portable = await deps.stopPortableSandbox(
+      input.sandboxName,
+      {
+        agent: input.sandbox.agent,
+        gatewayName: input.sandbox.gatewayName ?? "nemoclaw",
+        lifecycleGeneration: input.sandbox.lifecycleGeneration,
+        openshellDriver: input.sandbox.openshellDriver,
+        provider: input.sandbox.provider,
+      },
+      hooks.beforeStop,
+      {
+        env: input.environment,
+        log: input.log,
+        readRegistry: (name) => input.readRegistry?.(name) ?? null,
+      },
+    );
+    if (portable.kind === "already-stopped") {
+      const registryHermes = input.sandbox.agent === "hermes";
+      const portableHermes = portable.portableAgent === "hermes";
+      if (registryHermes !== portableHermes) {
+        throw new Error("Portable stop authority disagrees with the registered sandbox agent");
+      }
+      return portableHermes
+        ? ({
+            exitCode: 0,
+            state: "already-stopped",
+            hermesPortableVerified: true,
+          } as RuntimeProviderLifecycleStopOutcome & { readonly hermesPortableVerified: true })
+        : { exitCode: 0, state: "already-stopped" };
+    }
+    if (portable.kind === "stopped") {
+      const registryHermes = input.sandbox.agent === "hermes";
+      const portableHermes = portable.portableAgent === "hermes";
+      if (registryHermes !== portableHermes) {
+        throw new Error("Portable stop authority disagrees with the registered sandbox agent");
+      }
+      return portableHermes
+        ? ({
+            exitCode: 0,
+            state: "stopped",
+            hermesPortableVerified: true,
+          } as RuntimeProviderLifecycleStopOutcome & { readonly hermesPortableVerified: true })
+        : { exitCode: 0, state: "stopped" };
+    }
+  } catch (error) {
+    return { exitCode: 1, message: error instanceof Error ? error.message : String(error) };
+  }
   const containers = deps.findLabeledSandboxContainers(input.sandboxName);
   if (containers.length === 0) {
     return {
@@ -200,23 +561,44 @@ function stopDockerSandbox(
   if (stoppable.length === 0) return { exitCode: 0, state: "already-stopped" };
 
   hooks.beforeStop();
+  const emergency = stoppable.filter(
+    (container) => container.status.startsWith("Restarting") || isGpuBackupSibling(container.name),
+  );
+  const authoritative = stoppable.filter((container) => !emergency.includes(container));
   const failures: string[] = [];
-  for (const container of stoppable) {
-    input.log(`  Stopping container '${container.name}'…`);
-    const result = deps.stopContainer(container.name, {
+  for (const container of emergency) {
+    const stopped = deps.stopContainer(container.name, {
       ignoreError: true,
       timeout: DOCKER_OPERATION_TIMEOUT_MS,
     });
-    if (result.status !== 0) {
-      failures.push(`${container.name} (exit ${result.status ?? "unknown"})`);
+    if (stopped.status !== 0) {
+      failures.push(`${container.name} (exit ${stopped.status ?? "unknown"})`);
     }
   }
-  if (failures.length > 0) {
+  if (authoritative.length === 0) {
+    return failures.length === 0
+      ? { exitCode: 0, state: "stopped" }
+      : { exitCode: 1, message: `  docker stop failed for: ${failures.join(", ")}.` };
+  }
+  const result = deps.captureSandboxLifecycle(
+    "stop",
+    input.sandboxName,
+    input.sandbox.gatewayName ?? "nemoclaw",
+    input.environment,
+  );
+  if (result.status !== 0 || result.error) {
+    const detail = oneLine(result.output || result.error?.message || "unknown failure");
     return {
       exitCode: 1,
-      message: `  docker stop failed for: ${failures.join(", ")}.`,
+      message:
+        `  OpenShell could not stop sandbox '${input.sandboxName}'` +
+        ` (exit ${String(result.status ?? "unknown")}): ${detail}.`,
     };
   }
+  if (failures.length > 0) {
+    return { exitCode: 1, message: `  docker stop failed for: ${failures.join(", ")}.` };
+  }
+  input.log(`  Sandbox '${input.sandboxName}' stopped through OpenShell.`);
   return { exitCode: 0, state: "stopped" };
 }
 
@@ -303,7 +685,58 @@ export function createDockerRuntimeProviderBundle(
 ): RuntimeProviderBundle {
   const providerId = "docker";
   const deps = resolveDependencies(overrides);
+  const containerEngineOperations = new Set<RuntimeProviderContainerEngineOperation>([
+    "host-doctor",
+    "gateway-inspection",
+    "host-local-inference",
+    "sandbox-lifecycle",
+    "workload-cleanup",
+  ]);
   const futureReason = "This operation is intentionally deferred to a later provider slice.";
+  const projectGatewayHostRuntime: RuntimeProviderBundle["gateway"]["prepareHostRuntime"] = (
+    input,
+  ) => {
+    const bindAddress = parseGatewayBindAddress(
+      "NEMOCLAW_GATEWAY_BIND_ADDRESS",
+      DEFAULT_GATEWAY_BIND_ADDRESS,
+      input.environment,
+    );
+    const connectHost = getGatewayConnectHost(bindAddress);
+    return {
+      providerId,
+      openShellDriver: "docker",
+      bindAddress,
+      grpcHost: connectHost,
+      sshGatewayHost: connectHost,
+      portCheckHost: bindAddress,
+      socketPath: null,
+      requiredServerIpSans: [],
+      sandboxHostAddress: null,
+      usesHostGatewayRoute: false,
+      resourceOwnership: {
+        label: "openshell.ai/managed-by",
+        value: "openshell",
+      },
+      gatewayConfig: {
+        sandboxNamespace: "scoped",
+        hostGatewayIp: null,
+        includeSupervisorBin: true,
+        processOwnership: "scoped-namespace",
+      },
+      network: {
+        sandboxSourceCidrs: () => {
+          const network = inspectDockerGatewayNetwork(
+            resolveDockerDriverNetworkName(input.environment),
+          );
+          return network?.subnet ? [network.subnet] : [];
+        },
+        inspect: inspectDockerGatewayNetwork,
+        usesHostGatewayRoute: dockerGatewayUsesHostGatewayRoute,
+        run: runDockerGatewayCommand,
+        ensureProbeImageCached: ensureDockerGatewayProbeImageCached,
+      },
+    };
+  };
   return {
     identity: {
       contractVersion: RUNTIME_PROVIDER_BUNDLE_CONTRACT_VERSION,
@@ -318,11 +751,14 @@ export function createDockerRuntimeProviderBundle(
       directLifecycle: true,
       legacyGatewayContainerInspection: false,
       workloadImageCleanup: true,
+      readOnlyHostMounts: { supported: true, hostPlatforms: ["linux"] },
     },
     preflightDoctor: {
       providerId,
       supported: true,
       inspectHost: () => inspectDockerHost(deps),
+      validateSandboxGpu: (config, exitProcess) =>
+        validateSandboxGpuPreflight(config, {}, exitProcess),
       preflightLifecycle: (action, input) => dockerLifecyclePreflight(action, input, deps),
     },
     gateway: {
@@ -330,11 +766,16 @@ export function createDockerRuntimeProviderBundle(
       supported: true,
       launcher: "nemoclaw",
       inspectLegacyContainer: false,
+      finalSandboxLiveness: "openshell-and-docker",
+      ownsHostReadiness: false,
+      observeHostRuntime: projectGatewayHostRuntime,
+      prepareHostRuntime: projectGatewayHostRuntime,
     },
     workload: {
       providerId,
       supported: true,
       profile: COMPLETE_MANAGED_IMAGE_V1_PROFILE,
+      managedStateMountDriverId: "docker",
       acceptsReceipt: (receipt) => acceptsReceipt(COMPLETE_MANAGED_IMAGE_V1_PROFILE, receipt),
     },
     hostLocalInference: {
@@ -347,6 +788,8 @@ export function createDockerRuntimeProviderBundle(
       providerId,
       supported: true,
       channelStopTransport: "docker-kubectl-first",
+      containerMutationTimeoutMs: DOCKER_OPERATION_TIMEOUT_MS,
+      privilegedSandboxControl: createDockerPrivilegedSandboxControl(),
       start: (input) => startDockerSandbox(input, deps),
       verifyStarted: (input, verifyGateway) => verifyGateway(input.sandboxName),
       stop: (input, hooks) => stopDockerSandbox(input, hooks, deps),
@@ -366,7 +809,6 @@ export function createDockerRuntimeProviderBundle(
         "workload-cleanup",
       ],
     },
-    stateMutation: createDockerStateMutationSurface(),
     bootstrap: createDockerManagedBootstrapSurface(providerId),
     snapshot: createDockerRuntimeProviderSnapshotSurface(providerId, {
       captureHostCommand: deps.captureHostCommand,
@@ -390,6 +832,32 @@ export function createDockerRuntimeProviderBundle(
         { operation: "sandbox-lifecycle", engineId: "docker", displayName: "Docker" },
         { operation: "workload-cleanup", engineId: "docker", displayName: "Docker" },
       ],
+      capture: (operation, args, timeoutMs) =>
+        captureDockerContainerEngineOperation(
+          deps,
+          containerEngineOperations,
+          operation,
+          args,
+          timeoutMs,
+        ),
+      nvidiaContainer: {
+        capture: (operation, input, timeoutMs) =>
+          captureDockerNvidiaContainer(
+            deps,
+            containerEngineOperations,
+            operation,
+            input,
+            timeoutMs,
+          ),
+        cleanup: (operation, resource, options) =>
+          cleanupDockerNvidiaContainer(
+            deps,
+            containerEngineOperations,
+            operation,
+            resource,
+            options,
+          ),
+      },
     },
   };
 }
@@ -399,6 +867,11 @@ export function createKubernetesRuntimeProviderBundle(
 ): RuntimeProviderBundle {
   const providerId = "kubernetes";
   const deps = resolveDependencies(overrides);
+  const containerEngineOperations = new Set<RuntimeProviderContainerEngineOperation>([
+    "host-doctor",
+    "gateway-inspection",
+    "workload-cleanup",
+  ]);
   const futureReason = "This operation is intentionally deferred to a later provider slice.";
   const profile = {
     support: null,
@@ -420,11 +893,18 @@ export function createKubernetesRuntimeProviderBundle(
       directLifecycle: false,
       legacyGatewayContainerInspection: true,
       workloadImageCleanup: true,
+      readOnlyHostMounts: {
+        supported: false,
+        reason:
+          "Kubernetes hostPath semantics have not passed NemoClaw security and lifecycle qualification.",
+      },
     },
     preflightDoctor: {
       providerId,
       supported: true,
       inspectHost: () => inspectDockerHost(deps),
+      validateSandboxGpu: (config, exitProcess) =>
+        validateSandboxGpuPreflight(config, {}, exitProcess),
       preflightLifecycle: () => null,
     },
     gateway: {
@@ -432,6 +912,14 @@ export function createKubernetesRuntimeProviderBundle(
       supported: true,
       launcher: "openshell",
       inspectLegacyContainer: true,
+      finalSandboxLiveness: "openshell-and-docker",
+      ownsHostReadiness: false,
+      observeHostRuntime: () => {
+        throw new Error("The Kubernetes provider does not launch a host-managed gateway.");
+      },
+      prepareHostRuntime: () => {
+        throw new Error("The Kubernetes provider does not launch a host-managed gateway.");
+      },
     },
     workload: {
       providerId,
@@ -459,7 +947,6 @@ export function createKubernetesRuntimeProviderBundle(
         "workload-cleanup",
       ],
     },
-    stateMutation: unsupported(providerId, futureReason),
     bootstrap: unsupported(providerId, futureReason),
     snapshot: unsupported(providerId, futureReason),
     recovery: unsupported(providerId, futureReason),
@@ -481,6 +968,14 @@ export function createKubernetesRuntimeProviderBundle(
         { operation: "gateway-inspection", engineId: "docker", displayName: "Docker" },
         { operation: "workload-cleanup", engineId: "docker", displayName: "Docker" },
       ],
+      capture: (operation, args, timeoutMs) =>
+        captureDockerContainerEngineOperation(
+          deps,
+          containerEngineOperations,
+          operation,
+          args,
+          timeoutMs,
+        ),
     },
   };
 }

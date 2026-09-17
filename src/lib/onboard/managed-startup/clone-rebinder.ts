@@ -4,6 +4,7 @@
 import { createHash } from "node:crypto";
 
 import { cloneAndDeepFreeze } from "../../core/immutable";
+import { rebindLoopbackDashboardUrlPort } from "../../dashboard/url";
 import { resolveContextWindowForModel } from "../../inference/context-window";
 import { rebindSandboxMessagingPlanForClone } from "../../messaging/clone-rebind";
 import { isValidName } from "../../name-validation";
@@ -19,6 +20,10 @@ import {
   type ManagedStartupProfile,
   validateManagedStartupProfile,
 } from "./profile";
+
+export const managedStartupCloneRebinderDependencies = {
+  resolveContextWindowForModel,
+};
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const MANAGED_INFERENCE_API_SET = new Set([
@@ -123,7 +128,7 @@ function optionalCurrentString(value: unknown, label: string): string | null {
 function currentInference(
   profile: ManagedStartupProfile,
   current: ManagedStartupCloneCurrentState,
-): ManagedStartupProfile["inference"] {
+): NonNullable<ManagedStartupProfile["inference"]> {
   const provider = requireCurrentString(current.provider, "inference provider");
   const model = requireCurrentString(current.model, "inference model");
   const preferredApi = optionalCurrentString(
@@ -152,13 +157,14 @@ function currentInference(
     model,
     routedBaseUrl: resolved.inferenceBaseUrl,
     upstreamEndpointUrl,
-    api: resolved.inferenceApi as ManagedStartupProfile["inference"]["api"],
+    api: resolved.inferenceApi as NonNullable<ManagedStartupProfile["inference"]>["api"],
     primaryModelRef: profile.agent === "openclaw" ? resolved.primaryModelRef : null,
     compatibility:
       profile.agent === "openclaw"
         ? (JSON.parse(JSON.stringify(resolved.inferenceCompat ?? {})) as ManagedStartupJsonObject)
         : null,
-    inputModalities: profile.agent === "openclaw" ? profile.inference.inputModalities : null,
+    inputModalities:
+      profile.agent === "openclaw" ? (profile.inference?.inputModalities ?? ["text"]) : null,
   };
 }
 
@@ -176,8 +182,8 @@ function currentWebSearch(
   profile: ManagedStartupProfile,
   current: ManagedStartupCloneCurrentState,
 ): Extract<ManagedStartupProfile["agentConfig"], { agent: "openclaw" | "hermes" }>["webSearch"] {
-  if (profile.agentConfig.agent === "langchain-deepagents-code") {
-    fail("DCode cannot carry web-search state");
+  if (profile.agentConfig.agent !== "openclaw" && profile.agentConfig.agent !== "hermes") {
+    fail(`${profile.agentConfig.agent} cannot carry web-search state`);
   }
   const enabled = current.webSearchEnabled === true;
   const configuredProvider = current.webSearchProvider;
@@ -205,6 +211,9 @@ function currentAgentConfig(
   profile: ManagedStartupProfile,
   current: ManagedStartupCloneCurrentState,
 ): ManagedStartupProfile["agentConfig"] {
+  if (profile.agentConfig.agent === "pi") {
+    return profile.agentConfig;
+  }
   if (profile.agentConfig.agent !== "langchain-deepagents-code") {
     return {
       ...profile.agentConfig,
@@ -242,9 +251,14 @@ function currentSourceDashboard(
     };
   }
   if (profile.dashboard.agent === "hermes") {
+    if (current.hermesDashboardEnabled === true && profile.dashboard.browserUrl === undefined) {
+      fail(
+        "current source Hermes dashboard has no recorded browser URL; rerun onboarding before cloning the sandbox",
+      );
+    }
     if (current.hermesDashboardEnabled !== true) {
       return {
-        agent: "hermes",
+        ...profile.dashboard,
         mode: "disabled",
         url: profile.dashboard.url,
         publicPort: null,
@@ -261,9 +275,12 @@ function currentSourceDashboard(
       profile.agent,
     );
     return {
-      agent: "hermes",
+      ...profile.dashboard,
       mode: "loopback-forwarded",
       url: urlAtPort(profile.dashboard.url, publicPort),
+      ...(profile.dashboard.browserUrl === undefined
+        ? {}
+        : { browserUrl: rebindLoopbackDashboardUrlPort(profile.dashboard.browserUrl, publicPort) }),
       publicPort,
       internalPort,
       tuiEnabled: current.hermesDashboardTui === true,
@@ -321,10 +338,10 @@ function reconcileCurrentSourceProfile(
         ? (currentReasoningEffort ?? "default")
         : "default";
     if (
-      profile.inference.upstreamProvider !== current.provider ||
-      profile.inference.model !== current.model
+      profile.inference?.upstreamProvider !== current.provider ||
+      profile.inference?.model !== current.model
     ) {
-      contextWindow = resolveContextWindowForModel(
+      contextWindow = managedStartupCloneRebinderDependencies.resolveContextWindowForModel(
         requireCurrentString(current.provider, "inference provider"),
         requireCurrentString(current.model, "inference model"),
       );
@@ -371,12 +388,23 @@ function destinationDashboard(
       return {
         ...dashboard,
         url: urlAtPort(dashboard.url, destinationDashboardPort),
+        ...(dashboard.browserUrl === undefined
+          ? {}
+          : {
+              browserUrl: rebindLoopbackDashboardUrlPort(
+                dashboard.browserUrl,
+                destinationDashboardPort,
+              ),
+            }),
       };
     }
     const port = requireDestinationPort(destinationDashboardPort, profile.agent);
     return {
       ...dashboard,
       url: urlAtPort(dashboard.url, port),
+      ...(dashboard.browserUrl === undefined
+        ? {}
+        : { browserUrl: rebindLoopbackDashboardUrlPort(dashboard.browserUrl, port) }),
       publicPort: port,
     };
   }
@@ -392,8 +420,8 @@ function destinationMessagingPlan(
   destinationSandboxName: string,
 ): ManagedStartupJsonObject | null {
   if (profile.messaging.plan === null) return null;
-  if (profile.agent === "langchain-deepagents-code") {
-    fail("langchain-deepagents-code cannot carry a messaging plan");
+  if (profile.agent === "langchain-deepagents-code" || profile.agent === "pi") {
+    fail(`${profile.agent} cannot carry a messaging plan`);
   }
   const rebound = rebindSandboxMessagingPlanForClone({
     sourceSandboxName,
@@ -419,6 +447,7 @@ function destinationInference(
     input.destinationHermesInferenceProvider,
     "destination Hermes inference provider",
   );
+  if (profile.inference === null) fail("Hermes tool gateways require inference configuration");
   return {
     ...profile.inference,
     upstreamProvider: provider,

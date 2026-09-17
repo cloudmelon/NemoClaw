@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as agentRuntime from "../../../agent/runtime";
-import { withMcpLifecycleLock } from "../../../state/mcp-lifecycle-lock";
+import { inspectPortableAgentReceiptDisposition } from "../../../onboard/experimental/portable-agent-lifecycle";
+import { withSandboxLifecycleLock } from "../lifecycle/lock";
 import { connectSandbox } from "../connect";
 import {
   prepareHermesCronRestoreRecovery,
@@ -13,14 +14,25 @@ const RECOVERY_LOCK_TIMEOUT_MS = 30_000;
 
 /** Re-establish a Hermes gate before gateway repair, then validate and release it. */
 export async function recoverSandboxWithHermesCronRestore(sandboxName: string): Promise<void> {
-  await withMcpLifecycleLock(
+  await withSandboxLifecycleLock(
     sandboxName,
     async () => {
+      const portable = inspectPortableAgentReceiptDisposition(sandboxName);
+      if (portable.kind === "hermes") {
+        await connectSandbox(sandboxName, {
+          probeOnly: true,
+          requireLaunchReadinessPublication: false,
+        });
+        return;
+      }
       const agent = agentRuntime.getSessionAgent(sandboxName);
       if (agent?.name === "hermes") {
         prepareHermesCronRestoreRecovery(sandboxName);
       }
-      await connectSandbox(sandboxName, { probeOnly: true });
+      await connectSandbox(sandboxName, {
+        probeOnly: true,
+        requireLaunchReadinessPublication: false,
+      });
       if (agent?.name !== "hermes") return;
 
       const outcome = recoverHermesCronRestore(sandboxName);

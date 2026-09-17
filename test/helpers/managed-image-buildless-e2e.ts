@@ -9,6 +9,7 @@ import path from "node:path";
 
 import { expect } from "vitest";
 
+import { getBuildIdentity } from "../../src/lib/core/version";
 import {
   MANAGED_IMAGE_CAPABILITY_CONTRACT_VERSION,
   MANAGED_IMAGE_CONTRACT_VERSION,
@@ -30,7 +31,7 @@ const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const MANAGED_IMAGE_PLATFORM = "linux/amd64" as const;
 const MODEL = "nvidia/test-managed-model";
 const PROVIDER = "nvidia-prod";
-const SOURCE_REVISION = "2f03907c3a7ec151d7f5d4bb2a73abafc2849f83";
+const SOURCE_REVISION = getBuildIdentity({ rootDir: REPO_ROOT }).sourceRevision;
 const CATALOG_RELEASE = "v0.0.97";
 const AUTHENTICATED_PROXY_ENVIRONMENT = {
   HTTP_PROXY: "http://upper-http:upper-secret@upper-http.example.test:18080",
@@ -74,6 +75,7 @@ interface ChildPayload {
     agent?: string | null;
     dashboardPort?: number | null;
     imageTag?: string | null;
+    lifecycleLiveIdentityFingerprint?: string | null;
     name?: string;
     workload?: {
       schemaVersion?: number;
@@ -92,6 +94,7 @@ interface ChildPayload {
     };
   }>;
   runnerCommands: string[];
+  sandboxId: string;
   spawnCalls: SpawnCall[];
 }
 
@@ -126,6 +129,7 @@ function childSource(
   agent: ShippedManagedImageAgent,
   sandboxName: string,
   catalog: ManagedImageContractCatalog,
+  recreate: boolean,
 ): string {
   const source = (relativePath: string) => JSON.stringify(path.join(REPO_ROOT, relativePath));
   return String.raw`
@@ -136,6 +140,7 @@ const path = require("node:path");
 
 const agentName = ${JSON.stringify(agent)};
 const sandboxName = ${JSON.stringify(sandboxName)};
+const recreate = ${JSON.stringify(recreate)};
 const catalogTemplate = ${JSON.stringify(catalog)};
 const catalogRelease = ${JSON.stringify(CATALOG_RELEASE)};
 const model = ${JSON.stringify(MODEL)};
@@ -146,7 +151,17 @@ const managedBootstrapCalls = [];
 const registerCalls = [];
 const runnerCommands = [];
 const spawnCalls = [];
-let sandboxCreated = false;
+let existingEntryAvailable = recreate;
+let registeredSandbox = null;
+let managedHermesVolume = recreate ? {
+  Name: "nemoclaw-hermes-state-v1-" + sandboxName,
+  Labels: {
+    "io.nvidia.nemoclaw.hermes-state.managed": "true",
+    "io.nvidia.nemoclaw.hermes-state.schema": "1",
+    "io.nvidia.nemoclaw.hermes-state.sandbox": sandboxName,
+    "io.nvidia.nemoclaw.hermes-state.target": "/sandbox/.hermes",
+  },
+} : null;
 
 // The protected live-E2E job intentionally runs source without build:cli.
 // Route the root CLI's generated shared-boundary import back to its canonical
@@ -177,6 +192,15 @@ const replace = (target, name, value) => {
   if (target[name] !== value) throw new Error("could not install test boundary for " + name);
 };
 const childProcess = require("node:child_process");
+const fixtureMocks = require(${source("test/helpers/onboard-script-mocks.cjs")});
+fixtureMocks.mockStandaloneGatewayTeardownAuthority();
+const createdSandbox = fixtureMocks.createCreatedSandboxFixture({
+  sandboxName,
+  sandboxId: "fixture-managed-sandbox",
+  lifecycleState: recreate ? "created" : "absent",
+});
+const forwardService = fixtureMocks.installForwardServiceReachabilityFixture();
+createdSandbox.installRuntimeObservation();
 
 const coreVersion = require(${source("src/lib/core/version.ts")});
 replace(coreVersion, "getVersion", () => catalogRelease);
@@ -195,7 +219,6 @@ const resolveRuntimeCapabilities = workloadRuntime.resolveSandboxWorkloadRuntime
 replace(workloadRuntime, "resolveSandboxWorkloadRuntimeCapabilities", (plan, profiles) =>
   resolveRuntimeCapabilities(plan, profiles, "x64"),
 );
-
 const agentOnboard = require(${source("src/lib/agent/onboard.ts")});
 replace(agentOnboard, "createAgentSandbox", () => poison("agentOnboard.createAgentSandbox"));
 const buildContextStage = require(${source("src/lib/onboard/build-context-stage.ts")});
@@ -402,21 +425,67 @@ replace(managedBootstrap, "createDockerManagedBootstrapAdapter", () => {
 
 const runner = require(${source("src/lib/runner.ts")});
 runner.run = (command, options = {}) => {
+  const argv = Array.isArray(command) ? command.map(String) : [];
   const normalized = normalize(command);
   runnerCommands.push(normalized);
+  const providerResult = fixtureMocks.mockNvidiaProviderGetRun(command, "nemoclaw");
+  if (providerResult !== null) return providerResult;
+  if (
+    normalized.includes("sandbox delete") &&
+    createdSandbox.state.lifecycleState === "created"
+  ) {
+    createdSandbox.delete();
+    forwardService.release();
+    existingEntryAvailable = false;
+  }
   if (/(?:^|\s)docker(?:\s+buildx)?\s+build(?:\s|$)/u.test(normalized)) {
     return poison("docker build");
   }
-  return { status: 0, stdout: "", stderr: "" };
+  if (argv[0] === "docker" && argv[1] === "volume") {
+    const volumeName = argv.at(-1);
+    if (argv[2] === "inspect") {
+      return managedHermesVolume
+        ? { status: 0, stdout: JSON.stringify(managedHermesVolume) + "\n", stderr: "" }
+        : { status: 1, stdout: "", stderr: "Error response from daemon: no such volume" };
+    }
+    if (argv[2] === "create") {
+      const labels = {};
+      for (let index = 3; index < argv.length - 1; index += 1) {
+        if (argv[index] !== "--label") continue;
+        const [name, ...value] = argv[index + 1].split("=");
+        labels[name] = value.join("=");
+        index += 1;
+      }
+      managedHermesVolume = { Name: volumeName, Labels: labels };
+      return { status: 0, stdout: volumeName + "\n", stderr: "" };
+    }
+  }
+  return createdSandbox.run(command) ?? { status: 0, stdout: "", stderr: "" };
 };
+const doctorHostCommand = require(${source("src/lib/actions/sandbox/doctor-host-command.ts")});
+replace(doctorHostCommand, "captureHostCommand", (command, args) =>
+  runner.run([command, ...args]),
+);
 runner.runFile = (file, args = []) => runner.run([file, ...args]);
 runner.runCapture = (command) => {
   const normalized = normalize(command);
   runnerCommands.push(normalized);
-  if (normalized.includes("sandbox get " + sandboxName)) {
-    return sandboxCreated ? "ID: " + sandboxName + "-id" : "";
+  const createdIdentity = createdSandbox.capture(command);
+  if (createdIdentity !== null) return createdIdentity;
+  if (normalized.includes("policy get") && normalized.includes("--output json")) {
+    return JSON.stringify({
+      scope: "sandbox",
+      sandbox: sandboxName,
+      status: "effective",
+      policy_source: "sandbox",
+      hash: "fixture-policy",
+      active_version: 1,
+      policy: {},
+    });
   }
-  if (normalized.includes("sandbox list")) return sandboxName + " Ready";
+  if (normalized.includes("gateway info")) {
+    return "Gateway endpoint: http://127.0.0.1:8080";
+  }
   if (normalized.includes("forward list")) {
     return sandboxName + " 127.0.0.1 18789 23189 running";
   }
@@ -435,23 +504,74 @@ runner.runCapture = (command) => {
     .mockOnboardRunCapture(command);
   return mocked === null ? "" : mocked;
 };
-runner.runCaptureEx = (command) => ({
-  status: 0,
-  stdout: runner.runCapture(command),
-  stderr: "",
-});
+runner.runCaptureEx = (command) => {
+  const normalized = normalize(command);
+  const globalPolicyHistory =
+    normalized.includes("policy list") && normalized.includes("--global");
+  const sandboxPolicy = {
+    scope: "sandbox",
+    sandbox: sandboxName,
+    status: "effective",
+    policy_source: "sandbox",
+    policy: {},
+  };
+  const stdout = globalPolicyHistory
+    ? ""
+    : normalized.includes("policy get")
+      ? JSON.stringify(sandboxPolicy)
+      : runner.runCapture(command);
+  const stderr = globalPolicyHistory ? "No global policy history found\n" : "";
+  return { status: 0, stdout, stderr, exitCode: 0, timedOut: false };
+};
 
 const registry = require(${source("src/lib/state/registry.ts")});
-registry.getSandbox = () => null;
+const sourceEntry = recreate ? fixtureMocks.sandboxLifecycleFixture({
+  name: sandboxName,
+  agent: "hermes",
+  gpuEnabled: false,
+  openshellDriver: "docker",
+  imageTag: catalogTemplate.hermes.reference,
+  model,
+  provider,
+  toolDisclosure: "progressive",
+  workload: {
+    schemaVersion: 1,
+    kind: "managed-image",
+    reference: catalogTemplate.hermes.reference,
+    platform: "linux/amd64",
+    release: catalogRelease,
+    sourceRevision: catalogTemplate.hermes.source.revision,
+    sourceCohort: catalogTemplate.hermes.source.cohort,
+    capabilityContractVersion: 1,
+    startupProfileContractVersion: 1,
+    encodedProfile: "existing-profile",
+    startupProfileSha256: "0".repeat(64),
+    credentialProxyReplayRequired: true,
+    shared: true,
+  },
+}, { sandboxName, sandboxId: createdSandbox.state.sandboxId }) : null;
+registry.getSandbox = () => registeredSandbox ?? (existingEntryAvailable ? sourceEntry : null);
 registry.getDefault = () => null;
 registry.listExtraProviders = () => [];
 registry.registerSandbox = (entry) => {
   registerCalls.push(entry);
+  registeredSandbox = entry;
   return true;
 };
 registry.updateSandbox = () => true;
 registry.setDefault = () => true;
 registry.removeSandbox = () => true;
+const createFixture = fixtureMocks.installVerifiedSandboxCreateFixture(registry, {
+  sandboxName,
+  provider,
+  model,
+  preferredInferenceApi: "openai-completions",
+  getSandbox: registry.getSandbox,
+  registerSandbox: (entry) => {
+    registerCalls.push(entry);
+    registeredSandbox = entry;
+  },
+});
 
 const preflight = require(${source("src/lib/onboard/preflight.ts")});
 preflight.checkPortAvailable = async () => ({ ok: true });
@@ -461,10 +581,17 @@ credentials.prompt = async () => "";
 childProcess.spawn = (command, args = [], options = {}) => {
   const argv = Array.isArray(args) ? args.map(String) : [];
   const normalized = normalize([command, ...argv]);
+  const forwardSpawn = forwardService.recordSpawn([command, argv, options]);
   if (/(?:^|\s)docker(?:\s+buildx)?\s+build(?:\s|$)/u.test(normalized)) {
     return poison("docker build");
   }
-  if (normalized.includes("sandbox create")) sandboxCreated = true;
+  if (!forwardSpawn && normalized.includes("sandbox create")) {
+    if (createdSandbox.state.lifecycleState === "deleted") {
+      createdSandbox.recreate([command, ...argv]);
+    } else {
+      createdSandbox.create([command, ...argv]);
+    }
+  }
   spawnCalls.push({ command: String(command), args: argv });
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
@@ -479,21 +606,60 @@ childProcess.spawn = (command, args = [], options = {}) => {
   return child;
 };
 
+const sandboxCommandCli = require(
+  ${source("src/lib/adapters/openshell/sandbox-command-cli.ts")},
+);
+const createCommandExecutor = sandboxCommandCli.createCliOpenShellSandboxCommandExecutor;
+replace(sandboxCommandCli, "createCliOpenShellSandboxCommandExecutor", (deps) => {
+  const executor = createCommandExecutor(deps);
+  return {
+    ...executor,
+    runBuffered: async (request) => {
+      const gatewayArgs = request.target.kind === "named" ? ["-g", request.target.gatewayName] : [];
+      const command = [
+        "openshell",
+        "sandbox",
+        "exec",
+        "--name",
+        request.sandboxName,
+        ...gatewayArgs,
+        "--",
+        ...request.command,
+      ];
+      const stdout = runner.runCapture(command);
+      return {
+        outcome: { kind: "completed", exitCode: 0 },
+        stdout: String(stdout || ""),
+        stderr: "",
+      };
+    },
+  };
+});
+
 const { loadAgent } = require(${source("src/lib/agent/defs.ts")});
-const { createSandboxWithTemporaryManagedRuntime } = require(${source("src/lib/onboard.ts")});
+const { createSandbox } = require(${source("src/lib/onboard.ts")});
 
 (async () => {
   process.env.OPENSHELL_GATEWAY = "nemoclaw";
-  await createSandboxWithTemporaryManagedRuntime(
-    null,
-    model,
-    provider,
-    "openai-completions",
-    sandboxName,
-    null,
-    [],
-    null,
-    loadAgent(agentName),
+  await createSandbox(
+    ...fixtureMocks.sandboxCreateArgsWithVerifiedReservation(
+      [
+        null,
+        model,
+        provider,
+        "openai-completions",
+        sandboxName,
+        null,
+        [],
+        null,
+        loadAgent(agentName),
+        null,
+        null,
+        null,
+        [],
+      ],
+      createFixture,
+    ),
   );
   console.log(JSON.stringify({
     agent: agentName,
@@ -502,6 +668,7 @@ const { createSandboxWithTemporaryManagedRuntime } = require(${source("src/lib/o
     managedBootstrapCalls,
     registerCalls,
     runnerCommands,
+    sandboxId: createdSandbox.state.sandboxId,
     spawnCalls,
   }));
 })().catch((error) => {
@@ -518,6 +685,9 @@ function writeRuntimeStubs(fakeBin: string, dockerLog: string): void {
       "#!/usr/bin/env bash",
       'if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then',
       '  printf "%s\\n" "openshell 0.0.96"',
+      "fi",
+      'if [ "${1:-}" = "policy" ] && [ "${2:-}" = "list" ] && [[ " $* " = *" --global "* ]]; then',
+      '  printf "%s\\n" "No global policy history found" >&2',
       "fi",
       "exit 0",
       "",
@@ -556,8 +726,9 @@ function runManagedOnboard(
   root: string,
   agent: ShippedManagedImageAgent,
   catalog: ManagedImageContractCatalog,
+  recreate = false,
 ): { dockerCommands: string[]; payload: ChildPayload } {
-  const fixture = path.join(root, agent);
+  const fixture = path.join(root, recreate ? `${agent}-recreate` : agent);
   const fakeBin = path.join(fixture, "bin");
   const home = path.join(fixture, "home");
   const script = path.join(fixture, "managed-onboard.cjs");
@@ -566,7 +737,7 @@ function runManagedOnboard(
   fs.mkdirSync(fakeBin, { recursive: true });
   fs.mkdirSync(home, { recursive: true });
   writeRuntimeStubs(fakeBin, dockerLog);
-  fs.writeFileSync(script, childSource(agent, sandboxName, catalog));
+  fs.writeFileSync(script, childSource(agent, sandboxName, catalog, recreate));
 
   const result = spawnSync(process.execPath, ["--require", SOURCE_REQUIRE_HOOK, script], {
     cwd: REPO_ROOT,
@@ -577,6 +748,8 @@ function runManagedOnboard(
       HOME: home,
       NEMOCLAW_HOME: path.join(home, ".nemoclaw"),
       NEMOCLAW_NON_INTERACTIVE: "1",
+      NEMOCLAW_RECREATE_SANDBOX: recreate ? "1" : "0",
+      NEMOCLAW_RECREATE_WITHOUT_BACKUP: recreate ? "1" : "0",
       NEMOCLAW_TEST_DOCKER_LOG: dockerLog,
       NEMOCLAW_TEST_NO_SLEEP: "1",
       NODE_OPTIONS: nodeOptionsWithoutSourceLoader(process.env.NODE_OPTIONS),
@@ -605,6 +778,7 @@ function runManagedOnboard(
 function assertManagedLaunch(
   result: ReturnType<typeof runManagedOnboard>,
   agent: ShippedManagedImageAgent,
+  expectedHermesVolumeCreate = true,
 ): void {
   const expectedContract = contractFor(agent);
   expect(result.payload.agent).toBe(agent);
@@ -648,6 +822,25 @@ function assertManagedLaunch(
   const fromIndex = createArgs.indexOf("--from");
   expect(createArgs[fromIndex + 1]).toBe(expectedContract.reference);
   expect(createArgs.join(" ")).not.toContain("Dockerfile");
+  if (agent === "hermes") {
+    const driverConfigIndex = createArgs.indexOf("--driver-config-json");
+    expect(driverConfigIndex).toBeGreaterThanOrEqual(0);
+    expect(JSON.parse(createArgs[driverConfigIndex + 1]!) as unknown).toMatchObject({
+      docker: {
+        mounts: [
+          {
+            type: "volume",
+            source: "nemoclaw-hermes-state-v1-managed-hermes",
+            target: "/sandbox/.hermes",
+            read_only: false,
+          },
+        ],
+      },
+    });
+    expect(
+      result.payload.runnerCommands.some((command) => command.startsWith("docker volume create ")),
+    ).toBe(expectedHermesVolumeCreate);
+  }
 
   expect(createArgs.filter((arg) => arg.startsWith("NEMOCLAW_STARTUP_PROFILE_B64="))).toEqual([]);
   const encodedProfile = bootstrapRequest?.encodedProfile;
@@ -675,6 +868,26 @@ function assertManagedLaunch(
     expect(result.payload.runnerCommands.every((command) => !command.includes("/health"))).toBe(
       true,
     );
+    const sandboxExecCommands = result.payload.runnerCommands.filter((command) =>
+      command.includes("sandbox exec --name"),
+    );
+    expect(sandboxExecCommands).toHaveLength(1);
+    expect(sandboxExecCommands[0]).toContain(
+      `sandbox exec --name ${bootstrapRequest?.sandboxName} -g nemoclaw -- /usr/local/bin/dcode identity`,
+    );
+  } else {
+    expect(
+      result.payload.runnerCommands.some((command) =>
+        command.includes(`sandbox get -g nemoclaw ${bootstrapRequest?.sandboxName}`),
+      ),
+    ).toBe(true);
+    expect(
+      result.payload.runnerCommands.some((command) =>
+        command.includes(
+          `sandbox exec --name ${bootstrapRequest?.sandboxName} -g nemoclaw -- true`,
+        ),
+      ),
+    ).toBe(true);
   }
   expect(createArgs.filter((arg) => arg.startsWith("NEMOCLAW_CORPORATE_CA_B64="))).toEqual([]);
   expect(profile.proxy).toMatchObject({
@@ -707,7 +920,10 @@ function assertManagedLaunch(
       result.payload.registerCalls,
     )}`,
   ).toBeDefined();
-  expect(registration?.agent).toBe(agent === "openclaw" ? null : agent);
+  expect(registration?.agent).toBe(agent);
+  expect(registration?.lifecycleLiveIdentityFingerprint).toBe(
+    createHash("sha256").update(result.payload.sandboxId).digest("hex"),
+  );
   if (agent === "langchain-deepagents-code") {
     expect(registration?.dashboardPort).toBe(0);
   }
@@ -749,11 +965,32 @@ export function runManagedImageBuildlessE2e(): void {
 
     const hermes = runManagedOnboard(root, "hermes", catalog);
 
+    const recreatedHermes = runManagedOnboard(root, "hermes", catalog, true);
+
     const dcode = runManagedOnboard(root, "langchain-deepagents-code", catalog);
 
     assertManagedLaunch(openclaw, "openclaw");
     assertManagedLaunch(hermes, "hermes");
+    assertManagedLaunch(recreatedHermes, "hermes", false);
     assertManagedLaunch(dcode, "langchain-deepagents-code");
+    const recreateDeleteIndex = recreatedHermes.payload.runnerCommands.findIndex((command) =>
+      command.includes("sandbox delete"),
+    );
+    const volumeInspectIndex = recreatedHermes.payload.runnerCommands.findIndex((command) =>
+      command.startsWith("docker volume inspect "),
+    );
+    const recreateCreateIndex = recreatedHermes.payload.spawnCalls.findIndex(
+      ({ args }) => args[0] === "sandbox" && args[1] === "create",
+    );
+    expect(recreateDeleteIndex).toBeGreaterThanOrEqual(0);
+    expect(volumeInspectIndex).toBeGreaterThanOrEqual(0);
+    expect(volumeInspectIndex).toBeLessThan(recreateDeleteIndex);
+    expect(recreateCreateIndex).toBeGreaterThanOrEqual(0);
+    expect(
+      recreatedHermes.payload.runnerCommands.some((command) =>
+        command.startsWith("docker volume rm "),
+      ),
+    ).toBe(false);
   } finally {
     fs.rmSync(root, { force: true, recursive: true });
   }

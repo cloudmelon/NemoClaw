@@ -5,7 +5,6 @@ import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { ExecutionEvidence } from "../registry/parity-evidence.ts";
 import { redactString } from "./redaction.ts";
 
 export type TargetContract = string | readonly string[];
@@ -132,24 +131,16 @@ export class ArtifactSink {
   async writeText(relativePath: string, text: string): Promise<string> {
     const target = this.pathFor(relativePath);
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, redactString(text, this.redactionValues), "utf8");
+    await fs.writeFile(target, this.redact(text), "utf8");
     return target;
+  }
+
+  redact(text: string): string {
+    return redactString(text, this.redactionValues);
   }
 
   async writeJson(relativePath: string, value: unknown): Promise<string> {
     return this.writeText(relativePath, `${JSON.stringify(value, null, 2)}\n`);
-  }
-
-  async writeExecutionEvidence(resultId: string, evidence: ExecutionEvidence): Promise<string> {
-    if (!/^[a-z0-9][a-z0-9-]{0,127}$/u.test(resultId)) {
-      throw new Error(`execution result id is not artifact-safe: ${resultId}`);
-    }
-    if (resultId !== evidence.resultId) {
-      throw new Error(
-        `execution result id '${resultId}' does not match evidence result '${evidence.resultId}'`,
-      );
-    }
-    return this.writeJson(path.join("execution", `${resultId}.json`), evidence);
   }
 }
 

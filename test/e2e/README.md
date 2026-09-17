@@ -8,39 +8,88 @@ Direct E2E coverage runs through Vitest.
 Interactive TUI targets require `expect`. The unified workflow installs it
 before those targets run; local runners must provide it themselves.
 
-- `.github/workflows/e2e.yaml` selects the default workflow E2E jobs on each push
-  to `main` and supports trusted manual dispatches for specific PR head commits.
-  Push runs skip the Jetson nvmap and DGX Spark llama.cpp jobs because their
-  required workflow dispatch flags cannot be set by a push event.
+- `.github/workflows/e2e.yaml` compares the commits before and after each push to `main`.
+  It selects targets and jobs that own changed files, then publishes the `Relevant E2E` check.
+  It also supports trusted manual dispatches for the latest PR commit.
+  Full manual runs dispatched against `main` publish the `Release qualification` check for the candidate commit SHA.
+  Each trusted push to `main` selects the CPU-only `jetson-nvmap-gpu` proof.
 - `.github/workflows/hosted-runner-recovery.yaml` evaluates first-attempt
   failures from approved `main` workflows and requests one full rerun only when
   every non-passing job has authenticated GitHub-hosted runner-loss evidence.
 - `.github/workflows/e2e-main-retry.yaml` evaluates eligible `E2E main` push
-  attempts, requests at most two failed-job reruns, and uploads attempt evidence.
+  attempts and uploads attempt evidence. It never authorizes a broad failed-job
+  rerun; retry decisions belong to bounded operation-level policies.
 - The `staging-brev-launchable` job in `.github/workflows/e2e.yaml` validates
   the baked candidate without installing or copying NemoClaw source.
-- `.github/workflows/macos-e2e.yaml`, `.github/workflows/wsl-e2e.yaml`, and
-  `.github/workflows/sandbox-images-and-e2e.yaml` call focused E2E targets directly.
-  `.github/workflows/e2e.yaml` selects free-standing jobs, including
-  `whatsapp-qr-compact` and `ollama-auth-proxy`.
+- The explicit-only `staging-brev-launchable-identity` job verifies a real
+  Launchable boot, SSH access, the image and baked runtime identity.
+  It does not run onboarding or inference and does not satisfy release
+  qualification.
+- `.github/workflows/platform-vitest-main.yaml` publishes `CI / Platform Compatibility` for Ubuntu 26.04, macOS, and WSL.
+  Its independent macOS live job and WSL shard 1 run live E2E only when the workflow tests `main` and Docker is available.
+  This workflow does not publish or satisfy `Release qualification`.
+- `.github/workflows/portable-profile-e2e.yaml` publishes experimental portable-profile evidence.
+- `.github/workflows/podman-cpu-proof.yaml` publishes PR-only experimental runtime evidence.
+- `.github/workflows/sandbox-images.yaml` provides reusable sandbox-image build and test evidence.
+  `.github/workflows/e2e.yaml` selects free-standing jobs, including `whatsapp-qr-compact` and `ollama-auth-proxy`.
+
+The `agent-turn-latency` target checks the configured host CLI with both text and
+JSON output, including explicit local mode and a requested timeout. For inline
+messages, the fixture keeps the host pipe open while the wrapper closes the dispatch
+child's stdin. The fixture holds its writer open until command completion, so
+inheriting that pipe blocks until the test timeout, regardless of the model-time cap.
+File-message turns use a relative symlink chain to a file with spaces in its path,
+with competing stdin, in both output formats. Each turn must return the answer
+from the selected input. Parser combinations and stdin aliases belong to the
+unit and real-child tests; this target does not repeat native file-permission errors.
+The first JSON turn also requires at most 60 seconds outside OpenClaw's reported
+agent duration. Missing or inconsistent timing fails that bound.
+These cases are selectable for both Docker and Podman through the existing runtime
+matrix. Host stdin is preserved for nonempty message-file arguments because only
+the sandbox can resolve their paths.
 
 ## CI execution shape
 
 ### Candidate CLI Artifact
 
 The candidate CLI comes from the source commit that an E2E run tests.
-The `generate-matrix` job builds it once.
+The `generate-matrix` job prepares it once through the shared `ci-compile-artifacts` action.
+Main CI and PR CI use that action too. It always produces the CLI and full plugin,
+with Node.js 24.18.1, and verifies the embedded source revision and source maps.
+E2E loads the action from a separate checkout of the trusted workflow revision.
+The existing E2E artifact handoff retains the CLI and shared-module payload during this migration.
 The job publishes root `dist/` and `nemoclaw/dist/shared/` in one content-addressed artifact.
 The boundary validator derives artifact consumers from jobs that use the pinned preparation action.
 It excludes `generate-matrix` and the no-build and trusted-build jobs in `E2E_JOB_POLICY`.
 Each selected consumer restores the artifact instead of running `npm run build:cli`.
 Each consumer runs the pinned preparation action with `build-cli: "false"` to install Node.js and project dependencies.
+The shared compiler uses native GitHub caching of `dist/` and `nemoclaw/dist/`
+for main CI, PR CI, and E2E candidate preparation. Its key includes the checkout
+SHA, trusted recipe revision, action content, Node version, and runner platform.
+A full cache match skips dependency installation and compilation; a miss rebuilds
+the same output. Both paths verify output completeness and source identity.
+A rejected cache hit fails the job. The job summary gives its key and a cache-deletion command.
+Delete that cache, then rerun the failed jobs to rebuild on a miss.
+Rerunning before deletion restores the same invalid entry.
+Main CI and main E2E can reuse an entry for the same source and recipe.
+PR caches remain scoped to their merge refs, so manual E2E can miss a PR CI entry.
+Cache eviction and concurrent misses can cause additional builds. Each workflow
+prepares once before its parallel consumers.
+
+Manual PR E2E accepts source branches only in `NVIDIA/NemoClaw`.
+The workflow checks the PR source repository through GitHub before candidate execution.
+Repository writers are trusted to populate compiled caches before their changes merge.
+Maintainers must review and adopt fork contributions onto a repository branch before manual E2E.
+Ordinary fork PR CI remains available in its separate cache scope.
+
 The `managed-image-protected-runtime` qualification does not use this artifact.
 It builds the CLI from the trusted workflow checkout and never executes or restores the candidate CLI.
 
 #### Artifact Identity
 
-For a pull request (PR) run, `checkout_sha` identifies the candidate source commit.
+For a pull request (PR) run, `checkout_sha` identifies the selected head or exact base source
+commit. A base replay sets `checkout_sha` equal to `base_sha` and keeps the same trusted workflow
+SHA and selectors as the failed head run.
 The trusted workflow runs from `github.workflow_sha`.
 A push or manual run uses `github.sha` when `checkout_sha` is empty.
 
@@ -68,6 +117,7 @@ Before the action restores root `dist/` and `nemoclaw/dist/shared/` into the wor
 - The upload digest is present and well formed.
 - The candidate SHA matches the expected commit.
 - The manifest matches the source, workflow run, toolchain contract, and payload.
+- The restore action uses the pinned Node.js 24.18.1 process to stream each file as binary data when it verifies SHA-256 digests.
 - The archive contains no path traversal, links, special files, or files outside root `dist/` and `nemoclaw/dist/shared/`.
 - Neither root `dist/` nor `nemoclaw/dist/` already exists, including as a dangling symbolic link.
 - The candidate checkout's `nemoclaw/` path is a directory and is not a symbolic link.
@@ -78,6 +128,65 @@ If a pre-restore check fails, the action stops before it adds either directory t
 After the checks pass, the action restores root `dist/` and `nemoclaw/dist/shared/`, then runs `bin/nemoclaw.js --version`.
 If the version command fails, the action stops before the live test runs.
 This boundary keeps candidate source separate from the trusted workflow implementation.
+
+The `base-image-publication` job selects managed-image authority before any stock-onboarding consumer starts.
+
+For a manual same-repository PR run, the trusted planner compares immutable base and candidate commit trees against the reviewed image-input paths.
+When those paths are unchanged, the job selects the nearest fully successful cohort publication from the PR base's first-parent history.
+It downloads the complete cohort and Deep Agents Code base contracts by immutable artifact ID.
+It binds each artifact to the selected workflow run, attempt, revision, artifact ID, and digest.
+The cohort validator requires OpenClaw, Hermes, and LangChain Deep Agents Code on `linux/amd64` and `linux/arm64`.
+Only then does it emit `managed_image_revision` and the complete cohort receipt.
+
+When a reviewed image input changed, the planner validates every returned managed-image PR workflow run for the candidate commit and selects the newest successful run by run ID.
+An earlier failed run does not block a later successful run.
+Every returned run must belong to the same open PR and an NVIDIA/NemoClaw source branch.
+The planner downloads one `managed-pr-contract-*` artifact for each shipped agent.
+It binds every artifact to the workflow run, attempt, candidate commit, artifact ID, and digest.
+It requires every shipped agent once, one candidate revision, one release, and one cohort before it assembles the candidate catalog.
+No matching successful run, invalid or duplicated run metadata, or incomplete, duplicated, mixed, or substituted artifact evidence stops before any stock-onboarding consumer starts.
+Manual PR E2E does not fall back to local Dockerfile builds.
+
+Unchanged runs pass the selected base revision and complete cohort receipt to every stock-onboarding consumer.
+Changed-input runs pass the authenticated candidate catalog separately to those consumers.
+The candidate CLI artifact cannot contain the catalog.
+The GitHub token remains available only to the trusted planner and is not included in the candidate CLI artifact.
+The candidate catalog qualifies `linux/amd64` only, so a changed-input manual PR run does not dispatch the Jetson target.
+The trusted publication job reports this exclusion before the Jetson job is skipped.
+
+The same-repository `Images / Build, Test, and Publish Managed Images` PR workflow also runs the
+OpenClaw managed-image MCP discovery and lifecycle scope in two independent matrix jobs. Each job
+assembles one exact candidate catalog from the workflow's published contracts, uses a fresh runner
+and sandbox, records the authenticated discovery diagnostics, scans the evidence for fixture
+credentials, and must pass.
+These are two required acceptance executions, not retries; either failure remains a failed check.
+The concurrent-add probe retries only the rejected command after status proves that the other
+command committed one coherent bridge. The rejected command must report either the exact portable
+host-lock timeout or the reviewed Hermes restart transport failure. The retry runs once, has its own
+command artifact, and must succeed idempotently from the verified committed source.
+The workflow records one publication cohort before its PR producer matrix runs. Failed-job reruns
+reuse that cohort and replace only the stable run-scoped artifact owned by each retried agent.
+Consumers accept one complete cohort from the same run at the current or an earlier attempt. They
+reject mixed cohorts, another run, a future attempt, and another candidate revision.
+The managed-image scope does not claim trusted-private DNS-rebinding coverage: host and sandbox
+`/etc/hosts` fixtures do not control the OpenShell supervisor's egress resolver. Full MCP bridge E2E
+coverage retains that assertion for environments with supervisor-authoritative DNS.
+
+The same workflow publishes each Pi pull-request candidate by immutable digest after validating the
+local image, removes registry credentials, validates the anonymously pullable digest, and uploads a
+`managed-candidate-contract-*` artifact bound to the pull-request head. Pi remains outside the
+`managed-pr-contract-*` all-agent catalog pattern and every release alias. The checked-in Pi
+qualification receipts may consume these candidate contracts only when the recorded image-source
+paths are unchanged through the receipt commit.
+
+Pi full lifecycle qualification runs on Linux AMD64. Linux ARM64 remains release-gated by its native
+managed-image build, startup, publication, and checked-in receipt. The receipt refresh check requires
+the Linux AMD64 and Linux ARM64 receipts to identify one source revision, release, and publication
+cohort.
+
+The gateway restart fixture restarts the user service it stopped. If no service was selected, the candidate CLI startup code starts the registered gateway.
+A selected service that cannot restart remains selected for cleanup; recovery does not switch to another startup path.
+Restart inputs are checked before stopping the gateway. A failed start ends the test before health polling. Sandbox readiness, retained state, and agent turns remain separate assertions.
 
 #### Timing Baseline
 
@@ -94,7 +203,7 @@ This baseline measures only the replaced build step.
 Artifact upload, download, validation, and the dependency on `generate-matrix` add runtime and can affect the workflow critical path.
 Do not use the build-step median to claim savings in runner time or workflow elapsed time.
 
-A manual PR E2E run tests candidate code but executes `.github/workflows/e2e.yaml` from `main`.
+A manual PR E2E run tests candidate code but executes `.github/workflows/e2e.yaml` from trusted `main`.
 The PR run cannot measure this workflow change before merge.
 After merge, use a passing `main` run and complete these steps:
 
@@ -112,13 +221,23 @@ The historical fixtures retain these version boundaries:
 
 | Fixture | Required boundary |
 | --- | --- |
-| `openshell-gateway-upgrade` | Retain the historical installer commit and SHA-256 digest, sandbox image digest, and reviewed OpenClaw npm URL and SHA-512 integrity. Install the historical package before testing the candidate upgrade path. |
+| `openshell-gateway-upgrade` | Retain one v0.0.89 fixture with a pinned installer commit and digest, sandbox image digest, and reviewed OpenClaw archive. Prove that the current gateway upgrade leaves its sandbox Ready, preserves a workspace marker, keeps the raw gateway credential out of the sandbox environment, `/sandbox/.openclaw/openclaw.json`, and recursive `auth-profiles.json` files below `/sandbox/.openclaw/agents`, and supports authenticated agent turns before and after the upgrade. |
 | `rebuild-openclaw` | Retain the reviewed old-base build in the target. Build and create the old sandbox before testing the candidate rebuild path. |
 
 These targets may restore the shared artifact for the candidate CLI.
 They must not replace a historical installer, package, image, or version boundary with that artifact.
 The gateway fixture already binds its remote historical inputs to immutable commits and cryptographic digests.
 The workflow does not republish those inputs as artifacts.
+Deterministic tests own installer identity, OpenShell release asset selection,
+NemoClaw restore behavior, and Dockerfile patch behavior. The live target does not
+assert OpenClaw database tables, migration checkpoints, or other third-party
+storage details.
+
+The retained live target owns the released-gateway upgrade and usable-survivor
+boundary. Deterministic rebuild-flow tests own post-backup recreate failure,
+preserved backup and registry state, recovery-journal retention, and successful
+retry; stale-recovery tests own fail-closed behavior when no authoritative live
+policy remains.
 
 ### Hermes Sandbox Image Artifact
 
@@ -131,30 +250,64 @@ registry writes disabled. After the build, it scans the completed image for
 node-tar and verifies the sandbox-readable installed files. It then uploads the
 compressed image as the one-day `hermes-isolation-image` artifact.
 
-The 90-minute `test-hermes-sandbox-image` job and the
-`state-dir-guard-metadata` job download and load that artifact instead of
-rebuilding the image. Within the Hermes test job, the secret-boundary and
-root-entrypoint steps have 45- and 30-minute budgets respectively.
+The 90-minute `test-hermes-sandbox-image` job downloads and loads that artifact instead of
+rebuilding the image.
+Within that job, the secret-boundary and root-entrypoint steps have 45- and 30-minute budgets respectively.
 
-The former top-level `test/e2e/test-*.sh` suite has been removed. Keep real
-shell, installer, process, Docker, OpenShell, `/proc`, and sandbox boundaries in
-E2E tests when those boundaries are the behavior under test.
+To reproduce root-entrypoint failures locally, load the run's `hermes-isolation-image` artifact into Docker and run:
 
-## Platform Vitest main watch
+```bash
+NEMOCLAW_HERMES_TEST_IMAGE=nemoclaw-hermes-production NEMOCLAW_RUN_LIVE_E2E=1 \
+  npx vitest run --project e2e-live test/e2e/live/hermes-root-entrypoint-smoke.test.ts
+```
 
-`.github/workflows/platform-vitest-main.yaml` runs the full Vitest suite in
-four independent shards on each of macOS and WSL, with `fail-fast` disabled.
-Each macOS shard has a 30-minute budget and each WSL shard has a 90-minute
-budget. The additional root-required WSL contracts run only on shard 1.
+For Rancher Desktop, also set `DOCKER_HOST=unix://$HOME/.rd/docker.sock`.
+Use a native image for process-identity checks; QEMU can cause the startup guard to reject a valid PID 1.
+To build a native image from the checkout with its pinned published base, run `docker build -f agents/hermes/Dockerfile -t nemoclaw-hermes-local .`.
+Then set `NEMOCLAW_HERMES_TEST_IMAGE=nemoclaw-hermes-local` in the test command.
+Refusal scenarios execute startup as PID 1.
+They require exit code 1 for root preparation or 78 for non-root layout repair.
+They then start the retained container with a verification script to check the refusal reason and filesystem state.
+This second pass does not launch Hermes again.
+The sandbox user owns the config directory and can remove its history file.
+Sticky-bit protection prevents the gateway user from removing sandbox-owned config files.
+
+The former root-level `test/e2e-test.sh` and `test/e2e-gateway-isolation.sh` suites have been
+removed. Their production-image security coverage now belongs to
+`test/e2e-runtime/managed-image-openclaw-security.test.ts` and the
+`managed-image-openclaw-security` job in `.github/workflows/sandbox-images.yaml`. Keep real shell,
+installer, process, Docker, OpenShell, `/proc`, and sandbox boundaries in E2E tests when those
+boundaries are the behavior under test.
+
+## Platform Evidence
+
+`.github/workflows/platform-vitest-main.yaml` publishes the `CI / Platform Compatibility` workflow.
+It runs the Ubuntu 26.04 compatibility contracts and the full Vitest suite in four shards on macOS and WSL.
+The matrix disables `fail-fast`.
+Each macOS Vitest shard has a 30-minute budget. The independent macOS live E2E
+job has a 150-minute budget, including its 70-minute live test and cleanup.
+The first WSL shard has a 180-minute budget for root-required contracts and live E2E; the other shards have 90 minutes.
+
+The independent macOS job and WSL shard 1 run focused live E2E only when the run tests `main` and Docker is available.
+Otherwise, the workflow records the skip and retains the platform contract evidence.
+Therefore, the workflow is platform evidence, not `Release qualification`.
+Only a full manual `.github/workflows/e2e.yaml` run can publish the release check.
+
+The live steps give candidate test code the job-scoped `GITHUB_TOKEN` and repository `NVIDIA_INFERENCE_API_KEY`.
+The macOS step sets both in its process environment.
+The WSL step uses the trusted PowerShell helper to forward both into the WSL test process.
+The workflow sets these credentials only for the live steps, but candidate code can copy either value while a step runs.
+GitHub invalidates `GITHUB_TOKEN` after the job.
+`NVIDIA_INFERENCE_API_KEY` remains valid until it expires or is revoked; the workflow does not revoke it.
 
 ## Retired Brev source-install coverage
 
 Issue #7490 retired the generic Brev source-install lane. The unified workflow
-and exact-staging Launchable job own its product coverage:
+and staging Launchable job own its product coverage:
 
 | Legacy suite | Disposition | Current owner |
 |---|---|---|
-| `full` | Launchable E2E | `staging-brev-launchable` runs `full-e2e` in preinstalled mode against the exact baked candidate. |
+| `full` | Launchable E2E | `staging-brev-launchable` runs `full-e2e` in preinstalled mode against the baked candidate. |
 | `credential-sanitization` | Unified E2E | `credential-sanitization` |
 | `telegram-injection` | Unified E2E | `telegram-injection` |
 | `messaging-providers` | Unified E2E | `messaging-providers` |
@@ -163,7 +316,22 @@ and exact-staging Launchable job own its product coverage:
 | `gpu` | Unified E2E | `gpu-e2e` runs on the dedicated GPU runner. |
 | `all` | Retired | The selector only duplicated `credential-sanitization` and `telegram-injection`. |
 
-The retired nightly caller no longer runs. Each push to `main` starts a workflow that selects the default workflow E2E jobs.
+The retired nightly caller no longer runs. The explicit
+`E2E / Issue 9880 Staging Reproduction` workflow is a temporary issue-specific
+exception: its host-side Vitest controller reads the accepted staging image handoff,
+creates a temporary workspace on the configured Launchable, runs five bounded fresh
+OpenClaw CLI sessions against the baked image, deletes the workspace, and uploads
+redacted evidence, and confirms that the workflow-owned workspace is absent. It
+constructs the Brev controller only in the issue target and binds credential-bearing
+execution and deletion to the workspace ID recorded during creation. The live test,
+cleanup, workflow step, and workflow job timeouts each contain their nested operation
+budgets. Each Brev subprocess receives only the temporary workflow `HOME` and its
+command-specific environment. The workflow removes that `HOME` after the scenario.
+Cleanup gives the unique create request a two-minute visibility window. It records the
+first exact-name workspace ID, verifies that ID again, and deletes only that ID.
+It does not restore source copying, source installation, the legacy suite selector,
+or scheduled Brev coverage.
+Each push to `main` selects E2E work from the changed files.
 Manual GPU validation must use `gpu-e2e`.
 It must not provision a generic Brev VM.
 
@@ -194,6 +362,286 @@ discovery command locally to inspect the generated test matrix:
 npx tsx tools/e2e/credential-free-tests.mts
 ```
 
+### External gateway health
+
+`external-gateway-health` is an explicit-only retained job for the external
+OpenShell target work in issue #9872. The trusted workflow downloads and
+verifies the exact OpenShell SDK archive with package-read permission. The
+candidate job receives the archive but no package credential. It calls a local
+OpenShell 0.0.116 gateway over HTTPS with an explicit CA. The target confirms
+that its configured authentication file path does not exist before and after
+the health request. A successful request proves that public health does not
+require a credential read or make an authenticated gateway call.
+
+Use `jobs=external-gateway-health` for the manual pull request E2E run. The
+target records the expected release, reported release, public health status,
+and transport. It also stops the gateway and removes its temporary state.
+
+## Catalogue Targets
+
+Every catalogue profile installs a lockfile-selected reviewed OpenShell SDK archive before restoring the candidate CLI.
+The shared package job downloads and verifies the active SDK and any approved transition replacement with package-read permission.
+Catalogue jobs receive the run-scoped archives without package credentials and reject a missing artifact or more than one approved transition pair.
+Catalogue and external-gateway health jobs add each reviewed archive to npm's cache, then reinstall dependencies from the lockfile with package scripts disabled.
+This preserves the locked dependency versions and avoids npm resolving a new peer dependency graph during SDK installation.
+Both jobs verify that the SDK connection API loads before running tests.
+This keeps the private optional dependency available for SDK-backed commands such as configuration export.
+
+The `network-policy` target also owns live configuration-export evidence for #10938, #11854, and PR #11065.
+After restricted OpenClaw onboarding with two read-only agents, it invokes the candidate `config export` command through the real SDK connection.
+It compares the ordered agent roster, sandbox name, immutable managed image, hosted endpoint, and explicit policy with the fixture's registered and effective state.
+It then changes the fixture's recorded sandbox fingerprint and requires export to fail without creating a file.
+The fixture restores the registry in `finally` and removes private export files through its existing cleanup registry.
+The exported effective policy comes from the SDK configuration response and is compared with the
+independent CLI policy observation. This covers the SDK connection and complete export observation boundary; the deterministic adapter tests remain the owners of individual wire shapes and malformed responses.
+The assertion budget is unchanged. Nine export assertions replace nine redundant checks in the same target:
+
+- Two CLI-file and two OpenShell-version checks are covered by the retained successful onboarding checks.
+- Two intermediate process-start comparisons are covered by the retained comparison after all policy and traffic probes.
+- The approved HTTP status check is redundant with the marker server response, which always returns that marker with status 200.
+- Two web-fetch success-marker checks duplicate the retained probe exit-status check; the probe rejects missing approved content and unexpected denied-port access.
+
+The `security-posture-hermes` target owns the corresponding live Hermes export evidence for #11286.
+After canonical hosted-inference onboarding, it invokes `config export` through both the `nemoclaw`
+and `nemohermes` launchers and requires the validated documents to have identical specs. It checks
+the Hermes agent type, immutable managed image, hosted route, effective policy, and omission of
+credential values. It then changes the fixture's recorded sandbox fingerprint and requires both
+launchers to fail without publishing a file before restoring the registry. The assertion budget is
+unchanged because this contract replaces a redundant nonempty-log assertion in the same scenario.
+
+The `sandbox-operations` target owns live final-gateway cleanup on the Docker-backed OpenShell
+boundary. It leaves one sandbox live after removing only its local registry entry, then requires a
+`destroy --cleanup-gateway` of the registered sandbox to preserve the gateway, report the live
+sandbox and recovery commands, and exit nonzero. After cleanup, it onboards and destroys one final
+sandbox,
+requires the bounded command to finish, and proves both the sandbox and gateway runtime are absent.
+Deterministic destroy tests own the exact 30-second retry schedule and delayed-list sequence.
+
+`tools/e2e/target-catalogue.mts` declares live E2E targets that share one execution shape.
+Each entry owns these target properties:
+
+- Stable catalogue ID, target ID, shard, and Vitest file.
+- Outcome-first display name for GitHub Actions.
+- Source paths that select the target after a push to `main`.
+- Execution profile, runner or key into the trusted runner-routing map, and timeout.
+- OpenShell install mode, non-interactive installer selection, and CLI artifact use.
+- Reviewed host packages, host preparation, and optional cloudflared prerequisite.
+- Runner telemetry and one reviewed artifact layout.
+- PR Review Advisor selection. Standard-profile targets are selectable by default; a credentialed target must set `prAdvisorSelectable` before the Advisor may recommend its logical target ID.
+- Optional Vitest title selector.
+- Target-specific environment variables.
+- Full-run qualification membership.
+
+Host preparation is the reviewed E2E runner preparation mode.
+`none` makes no runner-level change.
+`hermes-swap` provisions swap for the remaining measured Hermes execution lanes.
+Targets that require cloudflared set `cloudflared: true` in the catalogue.
+The reusable workflow installs the pinned amd64 Debian package after validating its SHA-256 digest and package metadata.
+The installation step does not receive a catalogue profile credential.
+
+The test file is always one owning path.
+List each additional source file or directory whose change requires the target.
+Changes to shared catalogue execution paths select every catalogue target.
+
+Most entries use one ID for catalogue selection, evidence, and artifacts.
+Matrix-style targets use one target ID for evidence and artifacts, with separate catalogue IDs and shards for each concrete execution.
+
+The `double-onboard-hermes` and `onboard-resume-hermes` entries run the existing
+onboarding scenarios with Hermes and API port 8643. `double-onboard-hermes`
+retains one sandbox identity check and proves dashboard and API forward ownership
+after reuse. `onboard-resume-hermes` retains its before-and-after resume evidence.
+The original entries retain OpenClaw coverage.
+
+Give each entry one `displayName` in the form `<area>: <observable outcome>`.
+Do not include this implementation metadata or workflow text in the display name:
+
+- The target ID or an issue number.
+- `Catalogue`, `live`, or `E2E`.
+- A test path.
+- A runner or sandbox ID.
+
+`E2E_TARGET_CATALOGUE` is one logical target set.
+The planner partitions that set into GitHub Actions matrices, one for each execution profile.
+The execution profile owns the credentials available to its target step:
+
+- `standard` displays `no provider credential` and receives no NVIDIA API credential.
+- `nvidia-api` displays `NVIDIA API key` and receives `NVIDIA_API_KEY` on trusted `main` runs and authenticated same-repository PR runs.
+- `nvidia-inference` displays `NVIDIA inference API key` and receives `NVIDIA_INFERENCE_API_KEY` on trusted `main` runs and authenticated same-repository PR runs.
+- `github-read` displays `GitHub read token` and receives the job-scoped `GITHUB_TOKEN` only for the target step when `trusted_main` is `true`.
+  The reusable workflow enforces this boundary; an authenticated same-repository PR caller sets `trusted_main` to `true`.
+- `brave-nvidia-inference` displays `Brave and NVIDIA inference API keys` and receives `BRAVE_API_KEY` and `NVIDIA_INFERENCE_API_KEY` on trusted `main` runs and authenticated same-repository PR runs.
+
+`common-egress-agent` runs 4 isolated scenario shards.
+The Personal public-fetch shard exercises ordinary onboarding with an explicit Personal selection; it does not exercise Portable profile selection.
+It uses OpenClaw as one representative agent witness, runs with `nvidia-inference`, sets web search to `none`, and receives neither a Brave Search nor a Tavily Search API key.
+The Personal agent assertion disables the ordinary agent-attempt shell artifact because OpenClaw stdout can contain fetched content and the complete URL. OpenShell SSH configuration stays in a private temporary file outside the artifact directory. The assertion attempts removal after it finishes and fails if the directory remains. A failed agent attempt retains only schema metadata, the attempt number, failure class, exit code, signal, timeout state, and one allowlisted diagnostic summary.
+Raw OpenClaw session and trajectory JSONL stay inside the sandbox. Reduced agent evidence artifacts retain schema metadata, the source hostname and protocol, bounded aggregate counts, and status booleans while omitting fetched content, complete URLs and queries, tool names, and provider values.
+The live assertions require `web_fetch` for one fixed public reference, reject `web_search` and Brave Search or Tavily Search use, permit public access from curl, and deny loopback and link-local targets.
+
+GitHub Actions renders each catalogue execution as `<display name> / <credential boundary>`.
+All catalogue profiles call `.github/workflows/e2e-standard-profile.yaml`.
+Each target selects its runner through the catalogue.
+The reusable workflow validates the catalogue plan before candidate checkout.
+It derives the artifact path and upload name from the target ID, shard, and reviewed layout.
+It then owns checkout, Docker authentication, reviewed host preparation, setup, CLI artifact restoration, OpenShell installation, runner telemetry, Vitest execution, evidence manifest creation, artifact upload, and Docker credential cleanup.
+Catalogue entries may request only the reviewed `expect` and `iptables` host packages.
+The reusable workflow installs those packages through the pinned host-dependency action before workspace preparation.
+An optional `selector` limits execution to matching tests in the target's declared Vitest file.
+A host package or selector alone does not require a dedicated workflow job.
+When a target selects non-interactive installation, the reusable workflow sets `NEMOCLAW_NON_INTERACTIVE=1` for its OpenShell install step.
+The reusable workflow sets `NEMOCLAW_E2E_EXPECTED_SHA` to the candidate commit for every target.
+TUI exact-ref checks use this shared value instead of a target-specific checkout variable.
+On an exact-revision manual PR run, `NEMOCLAW_E2E_RISK_SIGNAL_EXPECTED_SHA` carries that commit to the risk-signal reporter; it remains empty on main push runs.
+The standard layout writes product evidence and `evidence-manifest.json` under `e2e-artifacts/live/<target-id>`.
+When `shard` is not `default`, the standard layout adds the shard directory.
+The security-posture matrix uses the reviewed flat-shard layout to preserve its existing artifact names.
+The `gpu-double-onboard`, `gpu-e2e`, and `llama-cpp-generic-gpu` targets keep the standard layout and select `linux-amd64-gpu-rtxpro6000-latest-1` through the catalogue.
+The llama.cpp target compares the selected model's authenticated `/v1/models` `meta.n_ctx`
+with the generated OpenClaw primary model's context window, with no explicit context override.
+It retains the compared values in `qualification-evidence.json`. The existing agent turn proves
+inference through the managed route and backend, replacing two duplicate raw chat smoke tests.
+The GPU memory-offload assertion also rejects a missing matching process because its memory value
+is then `NaN`; a separate process-existence assertion is unnecessary. Authentication denial,
+runtime ownership, Ready state, and cleanup assertions remain unchanged.
+The `gpu-e2e` target also qualifies configuration export for an attached native Linux Ollama daemon.
+A separate OpenClaw scenario disables direct sandbox GPU and uses normal onboarding to create the
+managed proxy on the target's shared port. It stops the installer service before starting a fixture-owned
+daemon on port 11439 and preparing the selected `qwen2.5:0.5b` model. It exports twice through
+the candidate CLI and real SDK, validates both documents, compares their specs, selected model name and digest,
+checks credential omission, and requires a stopped daemon to prevent publication. Inference-provider
+definitions omit internal endpoints; the sandbox's explicit network policy is preserved. Private YAML is
+removed through the cleanup registry; retained evidence contains only the selected model, ports,
+managed image, and result booleans. The existing CUDA, authentication, and inference lifecycle
+scenarios remain separate. The export fixture requires service shutdown and model preparation to succeed
+before export. Onboarding and model preparation each have a 20-minute limit within the 75-minute
+scenario. It retries read-only daemon readiness checks on connection refusal or curl
+timeout, for at most 20 reads. It records each attempt and stops on any other failure; model
+preparation, onboarding, and export mutations are not retried.
+After stopped-daemon refusal, cleanup restores the fixture daemon so sandbox destruction can unload
+models through the saved endpoint. It destroys the sandbox before stopping that daemon.
+Retained workflow jobs are exceptions to the catalogue shape.
+Keep one only for a multi-job handoff, an unrepresented credential boundary, or an execution contract the reusable profile cannot represent.
+
+The `brave-search` target qualifies configuration export after normal Brave-enabled OpenClaw onboarding.
+It validates two exports through the public schema, compares their specs, and requires a `BRAVE_API_KEY` reference without credential values or internal transports.
+The target retains checks of the materialized OpenClaw search configuration, credential isolation, real agent search, direct Brave API results, and disabled-search reuse.
+Private YAML files are removed during cleanup; artifacts retain redacted command results and an allowlisted qualification summary.
+The export assertions replace redundant checks within the same Brave lifecycle.
+Live policy qualification and a real Brave response cover the initial policy command and hostname substring.
+Successful agent execution and its answer cover the negative diagnostic-text check.
+Retained sandbox identity, materialized configuration, and HTTP egress cover the reused status command.
+Complete JSON parsing and expected configuration fields cover config-read exit codes; valid exact UUID continuity covers sandbox-read exit codes.
+The retained nonzero HTTP response covers the extra egress command exit check.
+The lower direct assertion count is recorded in the census; transitive coverage remains unchanged.
+
+For manual PR qualification, select `jobs=brave-search` with Docker and leave `targets` empty.
+Confirm that the target executes: an unavailable optional Brave credential can remove it from the plan.
+Trusted `main` controls the 45-minute job limit.
+Changes to `brave-search-helpers.ts` select the target through its catalogue ownership metadata.
+
+### Catalogue Execution Evidence
+
+Every catalogue execution writes `evidence-manifest.json` in its target artifact directory.
+The manifest uses kind `nemoclaw-e2e-evidence-v1`.
+It records `targetId`, the candidate repository and commit, the trusted workflow repository and commit, the GitHub Actions run ID and attempt, the job status, the artifact directory, and `productEvidenceFileCount`.
+A successful target must write at least one product evidence file before the workflow writes a successful manifest.
+If the target reports success without product evidence, manifest creation fails instead of certifying an empty run.
+A catalogue Vitest selection that runs no tests exits nonzero before manifest creation, including when every selected test skips.
+Failed targets still write a manifest for diagnosis, and the existing artifact upload publishes the manifest with the target artifacts.
+The manifest is secret-free diagnostic evidence.
+It does not replace the workflow job result or the strict `Release qualification` aggregate.
+
+Run the planner locally to render the complete default selection as a Markdown table:
+
+```bash
+npx tsx tools/e2e/workflow-plan.mts --summary
+```
+
+Add the existing `--jobs` or `--targets` selector to render a filtered plan:
+
+```bash
+npx tsx tools/e2e/workflow-plan.mts --summary --jobs hermes-e2e
+npx tsx tools/e2e/workflow-plan.mts --summary --targets ubuntu-repo-cloud-openclaw
+```
+
+The command renders a Markdown summary to standard output.
+To publish that output in a GitHub Actions job, append it to `$GITHUB_STEP_SUMMARY`:
+
+```bash
+npx tsx tools/e2e/workflow-plan.mts --summary >> "$GITHUB_STEP_SUMMARY"
+```
+
+The workflow's `--ci-output` mode uses the same renderer for its job summary.
+The table includes the typed registry matrix, shared test matrix, catalogue profile matrices, retained workflow jobs, and staging Brev execution.
+
+Each execution row declares three coverage fields:
+
+- `agentRuntime` names the agent runtime that the execution asserts. Use `none` when the execution does not start an agent. Use `unresolved` only with an `unresolvedReason`.
+- `observableOutcome` names the behavior that produces the evidence. Catalogue targets use their outcome-oriented `displayName` as this value.
+- `environmentOrInferenceEndpoint` names the host boundary or inference endpoint that distinguishes the evidence.
+
+Typed registry tests derive each human-readable execution title as
+`<observableOutcome> [<agentRuntime>; <environmentOrInferenceEndpoint>]`.
+Typed registry tests prefix that title with the stable target ID. Workflows use
+the ID prefix for selection, while the semantic tuple makes the test purpose and
+evidence boundary visible in Vitest and GitHub Actions.
+
+Keep coverage metadata with the execution owner:
+
+- Catalogue targets declare it in `tools/e2e/target-catalogue.mts`.
+- Executable typed targets declare it in `test/e2e/registry/definitions/baseline.ts`.
+- Shared credential-free tests declare it in `tools/e2e/credential-free-tests.mts`.
+- Retained workflow jobs and staging Brev declare it in `.github/workflows/e2e.yaml`.
+
+Single workflow jobs use the `E2E_AGENT_RUNTIME`, `E2E_OBSERVABLE_OUTCOME`,
+`E2E_ENVIRONMENT_OR_INFERENCE_ENDPOINT`, and optional `E2E_UNRESOLVED_REASON`
+environment entries. Matrix jobs put variant-specific values in the corresponding
+snake-case include entries and use `coverage_variant` when one job contributes
+multiple rows. `tools/e2e/workflow-plan.mts` composes and validates these sources.
+Do not add a separate hand-maintained execution list.
+
+The typed registry contains executable matrix cells only. Each cell must name
+executable platform, install, runtime, and onboarding routes plus resolved
+coverage metadata. A declared lifecycle route must also be executable. Registry
+construction rejects invalid cells. Selecting a removed or unknown target ID
+fails and lists the available IDs. Proposed platform, agent, or runtime
+combinations stay in their owned planning issue until fixtures and execution
+ownership exist. Explicit-only workflow rows keep their coverage dimensions but
+do not join the default release matrix.
+
+The report also groups repeated observable outcomes. Those rows are retained only when agent runtime or environment provides distinct evidence. Validation rejects two rows with the same three coverage dimensions.
+
+## Launch-readiness locked-image acceptance
+
+Use the repository helper to test an existing OpenClaw sandbox without
+rebuilding its locked image:
+
+```bash
+scripts/test-launch-readiness-lease.sh <openclaw-sandbox>
+```
+
+Run this helper on Linux after the sandbox's final durable home and state
+volume is mounted and after final policy and network provisioning is complete.
+The launch-readiness lease path that it validates is currently Linux-only.
+The helper must run as the same numeric user that later runs `launch`, and that user must own the sandbox's NemoClaw state.
+The host must provide that user a secure, independently writable OS runtime authority under `/run/user/<numeric-uid>`; do not redirect it with environment variables.
+The host must provide the util-linux `script` command and GNU `timeout` command.
+
+The helper rebuilds the candidate CLI, runs `connect --probe-only`, and then
+runs two logical `launch` sessions during the same fixed lease. Each logical
+session may retry once with a fresh run ID and input only when the OpenClaw
+session store contains a structured transient provider-unavailability record
+and cleanup succeeds. Authentication, authorization, policy, malformed-response,
+cleanup, and unknown failures stop the acceptance test without retrying.
+Each successful real pseudo-terminal attempt sends two distinct messages and
+`/exit`, then requires process exit status `0`. The OpenClaw session store must
+append two nonempty `user` and `assistant` record pairs in one session. The helper
+does not compare message content. Terminal output is a bounded failure diagnostic only.
+Deterministic unit tests separately prove selection of the complete preflight
+and lease paths, stale-producer exclusion, the fixed time-unsafe quarantine,
+refusal to recover when prior evidence cannot be durably fenced, and the named
+performance stages.
+
 ## Inactive Windows MXC OpenClaw qualification
 
 `windows-mxc-openclaw-process-container.test.ts` is an explicit local
@@ -201,36 +649,61 @@ qualification target for epic #8178. It exercises an operator-supplied native
 Windows OpenShell package and a staged OpenClaw artifact through the OpenShell
 `process_container` driver. It does not register MXC, call `wxc-exec.exe`
 directly, or establish Windows support.
-The generated driver configuration requests the stricter less-privileged
-AppContainer mode and records that choice in the receipt.
+The generated driver configuration records the prototype configuration
+qualified by this target: normal AppContainer mode,
+`privateNetworkClientServer`, the host egress proxy, and an
+operator-supplied supervisor relay. This configuration broadens the candidate
+sandbox relative to the earlier less-privileged probe and is not a production
+default.
 
 The target requires a Windows x64 host that passes the minimum MXC candidate
 check. It rejects a dirty NemoClaw checkout and requires exact expected
-identities for that checkout, the OpenShell CLI and gateway, the
-OpenShell-supplied `wxc-exec.exe`, the complete OpenClaw artifact tree, Node.js,
-and the OpenClaw entrypoint. Compute the canonical artifact-tree digest after
-staging:
+identities for that checkout, the original OpenShell distribution artifact,
+the extracted OpenShell CLI, gateway, supervisor relay, separately rooted
+`wxc-exec.exe`, complete OpenClaw artifact tree, Node.js, and OpenClaw
+entrypoint. It observes these paths through the inactive native stable-file
+boundary before sandbox mutation but does not mint the provider-owned authority
+required to qualify or activate the distribution. The target also requires an
+existing work root and records the operator's exact host-preparation declaration.
+It observes whether the test process is elevated but does not change host ACLs or elevation.
+Compute the canonical artifact-tree digest after staging:
+
+The OpenClaw artifact, share, and host-state directories must be fresh siblings
+directly beneath the declared drive root. This matches the current package's
+shallow-share requirement and the qualified workaround for MXC parent-path
+traversal. The generated agent environment redirects `TEMP` and `TMP` into a
+test-owned directory beneath the writable share; it does not expose the host
+temporary directory to the sandbox. Host-only configuration remains outside
+the sandbox share.
 
 ```powershell
 npx tsx tools/e2e/windows-mxc-openclaw-artifact-tree.mts $env:NEMOCLAW_WINDOWS_MXC_OPENCLAW_ROOT
 ```
 
-Set the following environment variables to paths or exact lowercase identity
+Set the following environment variables to paths or lowercase identity
 values. Do not put credentials in them.
 
 | Variable | Meaning |
 | --- | --- |
-| `E2E_ARTIFACT_DIR` | Existing directory for the secret-free qualification receipt |
+| `E2E_ARTIFACT_DIR` | Existing directory outside the NemoClaw checkout for secret-free qualification receipts |
 | `NEMOCLAW_E2E_EXPECTED_SHA` | Exact 40-character NemoClaw checkout revision |
+| `NEMOCLAW_WINDOWS_MXC_OPENSHELL_DISTRIBUTION_ARTIFACT` | Original OpenShell distribution artifact path |
+| `NEMOCLAW_WINDOWS_MXC_OPENSHELL_DISTRIBUTION_ROOT` | Root of the extracted OpenShell distribution |
+| `NEMOCLAW_WINDOWS_MXC_OPENSHELL_DISTRIBUTION_SHA256` | Expected original OpenShell distribution artifact SHA-256 |
 | `NEMOCLAW_WINDOWS_MXC_OPENSHELL_CLI` | Extracted `openshell.exe` path |
 | `NEMOCLAW_WINDOWS_MXC_OPENSHELL_GATEWAY` | Extracted `openshell-gateway.exe` path |
-| `NEMOCLAW_WINDOWS_MXC_WXC_EXEC` | `wxc-exec.exe` supplied for that OpenShell package |
+| `NEMOCLAW_WINDOWS_MXC_OPENSHELL_RELAY` | Extracted `openshell-supervisor-relay.exe` path from the same package |
+| `NEMOCLAW_WINDOWS_MXC_ROOT` | Root of the separately supplied MXC distribution |
+| `NEMOCLAW_WINDOWS_MXC_WXC_EXEC` | `wxc-exec.exe` beneath the separate MXC root |
 | `NEMOCLAW_WINDOWS_MXC_OPENSHELL_VERSION` | Exact OpenShell package version |
 | `NEMOCLAW_WINDOWS_MXC_OPENSHELL_REVISION` | Exact 40-character OpenShell source revision |
 | `NEMOCLAW_WINDOWS_MXC_OPENSHELL_CLI_SHA256` | Expected OpenShell CLI SHA-256 |
 | `NEMOCLAW_WINDOWS_MXC_OPENSHELL_GATEWAY_SHA256` | Expected OpenShell gateway SHA-256 |
+| `NEMOCLAW_WINDOWS_MXC_OPENSHELL_RELAY_SHA256` | Expected OpenShell supervisor relay SHA-256 |
 | `NEMOCLAW_WINDOWS_MXC_WXC_EXEC_SHA256` | Expected `wxc-exec.exe` SHA-256 |
-| `NEMOCLAW_WINDOWS_MXC_OPENCLAW_ROOT` | Staged native OpenClaw artifact root |
+| `NEMOCLAW_WINDOWS_MXC_HOST_PREPARATION` | declaration `wxc-host-prep-prepare-system-drive`; the target records but does not perform or verify this persistent host mutation |
+| `NEMOCLAW_WINDOWS_MXC_WORK_ROOT` | Existing Windows drive root for fresh, test-owned sibling share and host-state directories |
+| `NEMOCLAW_WINDOWS_MXC_OPENCLAW_ROOT` | Staged native OpenClaw artifact root directly beneath the declared drive root |
 | `NEMOCLAW_WINDOWS_MXC_NODE` | Node.js executable beneath the artifact root |
 | `NEMOCLAW_WINDOWS_MXC_OPENCLAW_ENTRY` | OpenClaw entrypoint beneath the artifact root |
 | `NEMOCLAW_WINDOWS_MXC_OPENCLAW_VERSION` | Expected OpenClaw version |
@@ -238,23 +711,25 @@ values. Do not put credentials in them.
 | `NEMOCLAW_WINDOWS_MXC_NODE_SHA256` | Expected Node.js SHA-256 |
 | `NEMOCLAW_WINDOWS_MXC_OPENCLAW_ENTRY_SHA256` | Expected OpenClaw entrypoint SHA-256 |
 
-The target creates a random OpenClaw gateway token for readiness checks. It
-passes that token through the MXC agent environment; current OpenShell
+The target creates a random OpenClaw gateway token for readiness, forwarding,
+and chat checks. It passes that token through the MXC agent environment. Current OpenShell
 `process_container` packaging can therefore expose its encoded configuration,
 including the token, to privileged host process inspection while `wxc-exec.exe`
 starts the sandbox. The token is never written to the receipt or supplied in
 the OpenClaw command arguments, is not reused, and is useful only for the
-temporary loopback OpenClaw gateway. Cleanup attempts sandbox deletion, stops
+temporary loopback OpenClaw gateway. The host client uses a temporary config
+file that is deleted before a passing receipt is written. Cleanup attempts sandbox deletion, stops
 the recorded OpenClaw process, clears the in-memory environment value, and
-removes the runtime home, state, configuration, and gateway logs. A direct
+removes both test-owned run directories, including the MXC agent environment
+file, runtime home, state, configuration, and gateway logs. A direct
 process-tree termination is an emergency cleanup fallback only. The host-side
 OpenShell processes receive an allowlist of Windows runtime variables rather
 than the complete caller environment. Before using a termination fallback,
 the host binds the process ID to the expected executable, command arguments,
 and creation time. For OpenClaw, it also validates the probe-parent ancestry.
 The host rejects a mismatched or reused PID. The fallback uses the
-`taskkill.exe` beneath the validated Windows system root. If either the
-OpenClaw process or OpenShell gateway needs that fallback, the qualification
+`taskkill.exe` beneath the validated Windows system root. If the OpenClaw
+process, OpenShell forward, or OpenShell gateway needs that fallback, the qualification
 fails. The delete retry and process-termination paths are failure containment,
 not compatibility workarounds that permit a passing result; their presence does
 not assume a specific upstream defect. Remove them only when failed or partial
@@ -270,13 +745,52 @@ npx vitest run --project e2e-live test/e2e/live/windows-mxc-openclaw-process-con
 ```
 
 The target verifies OpenClaw startup and in-sandbox health, read-write and denied
-filesystem behavior, registry cleanup, and termination of the recorded
-OpenClaw process on sandbox delete. After preflight and local setup succeed, it
+filesystem behavior, an authenticated host-loopback forward, and one
+provider-credential-free mock-backed agent turn that returns exactly `CHAT_OK`. It keeps
+the forward active while deleting the sandbox and requires the listener,
+forward process, sandbox registry entry, and recorded OpenClaw process to stop.
+The target starts forwarding only after in-sandbox OpenClaw health, the
+OpenClaw process identity, filesystem enforcement, and the sandbox registry
+entry pass. After the owned host listener appears, the target makes at most 12
+authenticated health observations at one-second intervals. It observes again
+only while the owned forward process remains active and OpenClaw reports a
+nonzero structured transport error with kind `closed`, code `1006`, and reason
+`no close reason`. Authentication, authorization, policy, timeout,
+malformed-output, forward-process exit, and all other failures stop the qualification. The
+target writes a secret-free `windows-mxc-forward-health-readiness-<run-id>.json`
+artifact with the bound, delay, sanitized attempt outcomes, and final result.
+It does not inspect OpenShell terminal wording or repeat the forward mutation.
+The complete create, forward, chat, and cleanup flow runs twice to detect stale
+state. After preflight and local setup succeed, it
 writes a secret-free receipt for either verdict and records whether sensitive
-runtime artifacts were removed. When that cleanup succeeds, a failed run retains
-only non-sensitive probe files for diagnosis.
-Gateway mTLS, governed egress, managed inference, gateway-restart recovery, and
-production activation remain outside this target.
+runtime artifacts were removed. Receipt schema version 4 retains the observed
+gateway-configuration digest and also classifies startup
+as not observed, spawn failed, exited before readiness, health timeout, or ready.
+The ready outcome means that the in-sandbox health probe succeeded.
+It does not mean that the qualification passed.
+Use `verdict` and `startup.versionExitCode` to diagnose the result.
+A nonzero version exit code produces a failed qualification.
+It retains only bounded numeric child and version exit codes; it does not retain
+child output, error text, command arguments, paths, or credentials. Cleanup
+removes both test-owned run directories for every verdict because MXC can write
+the temporary gateway token to its agent environment file. A failed run retains
+the secret-free receipt and any secret-free forward-readiness artifact written
+before the failure.
+The host-preparation declaration is operator evidence, not an ACL attestation.
+Gateway mTLS, governed egress policy enforcement, managed inference,
+gateway-restart recovery, standard-user operation, and production activation
+remain outside this target.
+
+If a failed receipt has a non-null `cleanup.retainedSandboxName`, OpenShell did
+not confirm removal of that sandbox. The retained process environment can
+hold the temporary gateway token until sandbox deletion is confirmed. Inspect
+the registry and delete only the recorded name:
+
+```powershell
+$receipt = Get-Content "C:\path\to\receipt.json" -Raw | ConvertFrom-Json
+& $env:NEMOCLAW_WINDOWS_MXC_OPENSHELL_CLI sandbox list -o json
+& $env:NEMOCLAW_WINDOWS_MXC_OPENSHELL_CLI sandbox delete $receipt.cleanup.retainedSandboxName
+```
 
 The retired `hermes-dashboard` selector remains a compatibility alias for
 `hermes-e2e` in both selector inputs. Reports use the canonical
@@ -284,29 +798,91 @@ The retired `hermes-dashboard` selector remains a compatibility alias for
 the manually selected `mock`, `internal-nvidia`, or `public-nvidia` inference
 mode.
 
-## Current OpenClaw plugin EXDEV lifecycle
+That existing lane also owns Hermes interface export evidence for #11433. It onboards with public
+dashboard port 19000 through both port aliases, internal port 19120, browser TUI enabled and API
+port 8643. Both CLI names must export the same validated interface values. Existing host dashboard
+and API probes verify the public endpoints; the export fixture separately checks the deployed
+dashboard process's internal port and TUI flag, then probes that internal listener. Process evidence
+contains only the numeric port and TUI boolean. The fixture retains identity-drift rejection,
+registry restoration and export-file cleanup. The `security-posture-hermes` lane retains canonical
+disabled/default interface coverage. This extends one existing behavior dimension and adds no target.
 
-The `openclaw-plugin-runtime-exdev` job keeps one current-version lifecycle:
+## Native plugin and package lifecycle
 
-1. Onboard the custom weather plugin as v1.
-2. Restart the gateway and verify v1.
-3. Recreate the sandbox with the plugin changed to v2.
-4. Run the cross-device runtime-dependency replacement probe.
+Issue #11766 retired the dedicated `openclaw-plugin-runtime-exdev` workflow job
+and its custom-image prebuild/recreation fixtures. That removes one default E2E
+job and the image-ownership contract it existed to verify.
 
-The recreation remains the replacement boundary. It verifies the v2 plugin
-with runtime inspection, `tools.catalog`, and `tools.invoke`, and it preserves
-the workspace marker. The job also keeps the test-only tmpfs mount, unchanged
-stock policy-source bytes, and the distinct-device and source-side `EXDEV`
-checks. The duplicate v3 rebuild is removed from this job. The
-`rebuild-openclaw` job remains the canonical live rebuild coverage.
+The standard `full-e2e` target now owns native OpenClaw installation,
+invocation, update command access, local-source replacement, self-update dry
+run, restart survival, credential non-exposure, and removal in one sandbox.
+`rebuild-openclaw` proves a user-installed native plugin survives rebuild with
+no NemoClaw ownership metadata. `rebuild-hermes` proves native user-plugin and
+lazy-package state survive rebuild. Managed-image activation exercises native
+OpenClaw and Hermes discovery before and after gateway restart. Deterministic
+state-restore tests prove complete native directories are archived without
+image-plugin exclusions.
 
-The current-checkout fixture locally prebuilds its repository-controlled v1
-and v2 Dockerfiles with BuildKit, then hands only those local image references
-to OpenShell. User-supplied `--from` Dockerfiles retain the gateway-builder
-trust boundary and are never host-prebuilt by this fixture.
+## Device-auth health classification
 
-The runtime target for `openclaw-plugin-runtime-exdev` is 16–17 minutes.
-Push-run timing for the reduced lifecycle has not yet been measured.
+Issue #11946 retired the standalone `device-auth-health` target. The target
+repeated these retained contracts:
+
+| Removed assertion | Retained owner |
+|---|---|
+| Install, onboard, list, status, and sandbox inference succeed. | `full-e2e` |
+| An authenticated compatible endpoint receives the sandbox request. | `openclaw-inference-switch` |
+| Gateway, dashboard, and inference HTTP 401 responses remain reachable. | `src/lib/verify-deployment.test.ts` and `src/lib/verify-deployment-agent.test.ts` |
+| Status keeps a reachable authenticated route online. | `test/cli/sandbox-status-json.test.ts` |
+| A real dashboard remains exposed through its supported host forward. | `dashboard-remote-bind` |
+
+The deleted helper tests covered only the retired target's command environment,
+retry loop, and cleanup calls. They did not own a product behavior.
+
+## Cloud inference consolidation
+
+Issue #11946 also retired the standalone `cloud-inference` target. The target's
+supported outcomes now have these owners:
+
+| Removed assertion | Retained owner |
+|---|---|
+| Install, PATH setup, list, status, hosted inference, and sandbox inference succeed. | `full-e2e` |
+| Sandbox state contains no `auth-profiles.json` or secret-shaped credential values. | `full-e2e` and `test/e2e/support/sandbox-credential-boundary.test.ts` |
+| Repository skills contain valid frontmatter and content. | `test/repository/repo-skills-validation.test.ts` |
+| `/sandbox/.openclaw` and `openclaw.json` have the required image layout. | `test/e2e-runtime/managed-image-openclaw-security.test.ts` |
+
+The optional `/sandbox/.openclaw/skills` directory had no pass or fail state.
+The deleted provider retry classifier and sandbox-layout wrapper served only the
+retired target.
+
+## OpenShell development artifact retention
+
+The `openshell-dev-artifact` job resolves the public OpenShell `dev` release
+once for each selected `mcp-bridge-dev` run. It records the source commit and
+the GitHub asset ID, source URL, size, and SHA-256 digest for every required
+Linux x64 archive and checksum file. It rejects release drift during download,
+then uploads the verified bytes under a content-addressed name with the shared
+14-day E2E retention policy.
+
+`mcp-bridge-dev` is an explicit-only compatibility lane. Empty-selector full-suite
+dispatches qualify the exact stable OpenShell 0.0.116 product contract and do not
+select the development runtime.
+
+The OpenClaw, Hermes, and LangChain Deep Agents Code shards restore and verify that same artifact with the trusted workflow revision.
+The `actions/setup-node` step selects Node.js 24.18.1 and disables automatic package manager caching before candidate checkout.
+The trusted workflow installs the exact reviewed npm 12 archive before it installs planner dependencies.
+An argument- and asset-allowlisted `gh` shim presents only the retained files to the unchanged trusted `scripts/install-openshell.sh` path.
+A separate `curl` shim blocks network fallback.
+The installer still checks the release checksums and archive structure before installation.
+Each product shard revokes Docker credentials, then installs OpenShell before candidate dependency preparation begins.
+Dependency preparation can read candidate project configuration and is the first candidate-controlled execution boundary.
+The candidate CLI artifact restore runs after dependency preparation.
+This ordering protects the bytes consumed by the trusted installer before candidate-controlled execution starts.
+It does not make the installed OpenShell files immutable after dependency preparation starts on the same runner.
+Subsequent product steps operate in candidate-controlled state.
+A missing, replaced, or corrupt upstream asset fails the resolver as an infrastructure failure.
+The job error reports the failed identifier and source URL, and `resolution.json` records them when the artifact directory remains writable.
+The three product shards do not start in that case, so the run cannot report a product failure before reaching product assertions.
 
 ## Larger-runner routing
 
@@ -316,8 +892,7 @@ to use `ubuntu-latest`. The trusted `generate-matrix` job builds one runner map
 before checking out test code, and it consumes the variable only when the
 workflow repository is `NVIDIA/NemoClaw`, the ref is `refs/heads/main`, and
 no alternate checkout SHA is requested. Manual PR E2E dispatches therefore remain on
-standard runners even though they use the trusted workflow definition from
-`main`.
+standard runners even though they use the trusted workflow definition from `main`.
 
 Manual PR E2E dispatches and direct push or manual `main` runs use a
 bounded swap fallback for eligible hosted Hermes image-building lanes. The
@@ -346,7 +921,7 @@ If visibility remains stale, cleanup treats the file as active.
 Cleanup removes it only after `swapoff` succeeds.
 Successful state is discarded with the ephemeral runner.
 
-The fallback covers agent-turn latency, Hermes inference switch and shields,
+The fallback covers agent-turn latency and Hermes inference switch,
 the Hermes stable MCP shard, the Hermes common-egress and channel
 stop/start shards, the dashboard-bearing `hermes-e2e` lane, `hermes-discord`,
 and Hermes security-posture tests. Rebuild lanes with workflow-managed swap,
@@ -368,10 +943,7 @@ lanes:
 - `common-egress-agent`;
 - `hermes-e2e`, including dashboard coverage, and `hermes-discord`;
 - the Anthropic-compatible `hermes-inference-switch` mode;
-- `hermes-shields-config`;
 - the Hermes shards of `security-posture` and `channels-stop-start`;
-- `rebuild-hermes`;
-- `rebuild-hermes-stale-base`;
 - the `hermes` and `deepagents` shards of `mcp-bridge`.
 
 The OpenClaw shards of the matrix jobs, the `openclaw` MCP shard,
@@ -380,7 +952,7 @@ The OpenClaw shards of the matrix jobs, the `openclaw` MCP shard,
 The credential-generation window runs as an independent fresh-runner job in
 parallel with the stable MCP agent matrix. Empty-selector dispatches and
 explicit `mcp-bridge` selections run both jobs, while the credential-window job
-keeps its own exact-release provenance, secret scan, and artifact.
+keeps its own release provenance, secret scan, and artifact.
 Before setting the variable, an organization owner must:
 
 1. Create a GitHub-hosted Ubuntu x64 larger runner with 8 vCPU, 32 GB RAM, and
@@ -407,6 +979,31 @@ graph as the live targets:
 
 - GitHub Actions run history is the authoritative record for push and
   manual E2E results.
+- `E2E / Main Retry Evidence` publishes an advisory same-commit reliability table for
+  trusted pushes to `main` and explicit manual qualification runs. It keeps
+  first-pass success, pass-after-retry, exhausted retries, and pass/fail flips
+  distinct,
+  and never treats retry records or runner-pressure classifications as proof
+  that a manual run reached a terminal result. Manual identity comes from the
+  run-bound dispatch receipt; its terminal result additionally requires at
+  least one canonical `nemoclaw-e2e-evidence-v1` manifest bound to the same run,
+  attempt, candidate SHA, trusted workflow repository, workflow SHA, and job
+  status. Outcomes from trusted pushes to `main` instead require the canonical
+  retry-controller artifact. Missing or malformed identity/outcome evidence
+  leaves a run unclassified. Retry and runner-pressure files contribute only
+  allowlisted failure classes: their complete, missing, or malformed state is
+  reported separately, so malformed classification data cannot erase an
+  otherwise authenticated outcome. Both evidence-state counts appear in the
+  grouped JSON and Markdown table. The table never changes a required check,
+  release conclusion, or rerun decision.
+- The `report-same-commit-reliability` job appends the Markdown table to its
+  GitHub Actions job summary and uploads the bounded, allowlisted
+  `same-commit-reliability.json` and `same-commit-reliability.md` files as
+  `same-commit-reliability-<source-run-id>-<attempt>` with 14-day retention.
+  Artifact ZIP entries are structurally validated before an allowlisted file is
+  read: ambiguous relative paths, links, encryption, split/ZIP64 archives,
+  duplicate names, unsupported compression, inconsistent headers, excess
+  entries, oversized contents, and CRC mismatches are rejected.
 - Automated issue routing and the workflow's `issues: write` capability are
   retired. Any future issue escalation should use a separately reviewed
   exceptional threshold, such as the same lane failing twice consecutively or
@@ -435,94 +1032,252 @@ graph as the live targets:
   pass/fail/skip counts, failure rate, pass/fail flips, current failure streak,
   and the most common failed phase. The failure-rate denominator and
   pass/fail-flip count exclude skips.
+
 - Selective dispatches remain silent unless they run on `main` with
   `post_to_slack=true`, which uses the preview Slack route. Branch-dispatched
   runs never receive Slack webhook secrets.
 
-A manual run with `jobs=staging-brev-launchable` runs only `Exact staging Brev
-Launchable`. Each push run also selects this job as part of the complete main run.
+### Weekly unit-test gap review
+
+Treat every automatic `main` E2E failure as a test-gap review input. Generate a
+report for the preceding 168 hours with GitHub CLI authentication already
+configured:
+
+```bash
+evidence_dir="$(mktemp -d)"
+chmod 700 "$evidence_dir"
+npm run e2e:unit-gaps -- \
+  --days 7 \
+  --cache-dir "$evidence_dir/cache" \
+  --output "$evidence_dir/unit-test-gaps.md" \
+  --json-output "$evidence_dir/unit-test-gaps.json"
+```
+
+The command reads push runs from `e2e.yaml` and `portable-profile-e2e.yaml` on
+`main`. Online collection requires `--cache-dir`. The command creates the cache
+directory with mode `0700` and writes normalized job-and-signature JSON files
+with mode `0600`. Each cache entry binds sanitized evidence to one GitHub run ID
+and attempt. A later seven-day run with the same cache directory reuses matching
+entries. Each invocation reads logs for at most 50 uncached failed runs. When
+more failed runs remain, the command saves normalized job names and sanitized
+signatures for that batch. The command then exits nonzero. Rerun the command
+with the same cache directory. Repeat until the command completes; each rerun
+reuses prior batches and collects the next one. The command reports cache hits
+and planned failed-log reads.
+
+The command extracts signatures in memory and does not retain raw GitHub logs.
+It applies the shared full secret redactor and removes volatile identifiers,
+paths, URLs, sandbox names, and durations from each selected cause candidate.
+Treat the cache and reports as credential-bearing until a human reviews them;
+redaction reduces exposure but does not prove that a file is credential-free.
+
+The command stops on GitHub authentication, authorization, and rate-limit
+failures. It exits nonzero when a selected run is unfinished or failed-run
+evidence is unavailable. Do not accept a partial report as the weekly ledger.
+Every GitHub read names `NVIDIA/NemoClaw`, so a fork or different checkout remote
+cannot substitute another repository's run data.
+The command also stops when a workflow reaches the 1,000-run collection limit.
+Narrow the selected range and retry so the report cannot omit older runs silently.
+
+Review one row per cause candidate instead of one row per failed job. Confirm
+the selected candidate against the first causal line and identify the owning
+component before changing code. Then apply the row's test action:
+
+- For a deterministic product failure, add a unit or package-contract
+  regression test that fails for the observed behavior before changing the
+  product code.
+- For a harness failure, add an `e2e-support` test for the decision, cleanup
+  path, or diagnostic.
+- For an external failure, test NemoClaw's retry and diagnostic response with
+  fault injection. Do not reproduce the provider, registry, network, or runner
+  outage in a unit test.
+- For a row that needs triage, name the missing contract only after confirming
+  the cause from the linked run.
+
+The Markdown and JSON reports start each row with review status `open` and no
+regression test. During review, record the test file and complete test title in
+the row and change the status only after the test fails without the fix and
+passes with it. A cause candidate is complete when that test evidence and a
+later passing run of the linked E2E target are both recorded. Delete the
+evidence directory after publishing only the reviewed, credential-free
+conclusions in the owning issue or pull request. Remove the named directory and
+confirm its absence:
+
+```bash
+rm -rf -- "$evidence_dir"
+test ! -e "$evidence_dir"
+```
+
+A manual run with `jobs=staging-brev-launchable` runs only `Exact staging Brev Launchable`.
+Push runs do not select this job.
+
+A manual trusted-`main` run with
+`jobs=staging-brev-launchable-identity` and an empty `targets` selector runs
+only `Exact staging Brev Launchable identity`. It builds the candidate
+image, deploys the standing Launchable, waits for workspace and SSH readiness,
+checks the concrete boot image and baked runtime identity, and confirms two
+consecutive absent workspace observations during cleanup. A passing run uploads
+`lane.log`, `launchable-identity.json`, and `cleanup.json`. A failed run uploads
+the bounded evidence produced before failure only when preparation created the
+evidence directory; a preparation failure produces no lane artifact. After
+workspace preparation, `cleanup.json` records the final cleanup result. The
+identity receipt records onboarding, inference, and full E2E as `not-run`.
+
+The identity job runs on `ubuntu-latest`. GitHub assigns a fresh hosted-runner VM
+to the job and decommissions the VM after the job finishes. `BREV_API_KEY` and
+`BREV_ORG_ID` are environment values only in the preparation step. `brev login`
+writes the raw API key and organization identifier to the runner account's
+`$HOME/.brev/credentials.json` inside an owner-only `.brev` directory. Later
+trusted Brev steps read that file through workspace cleanup.
+
+A successful `brev refresh` writes the Brev user SSH private key to
+`$HOME/.brev/brev.pem`, generated host entries to `$HOME/.brev/ssh_config`, and
+an include directive to `$HOME/.ssh/config`. Brev and OpenSSH use this runner
+account home so the SSH readiness check can read the host entry. The workflow
+removes the API credential file and verifies its absence before artifact upload.
+The SSH private key and configuration remain on the hosted-runner VM until
+GitHub decommissions it.
+
+The image dispatch token is available as `GH_TOKEN` only to the identity
+validation step on the GitHub-hosted runner. Ending that step removes its
+process access. Removing the local Brev API credential file and ending the
+token-bearing step do not revoke the issuer-side credentials. They remain valid
+until they expire or an administrator revokes them. The job does not check out
+candidate code on the hosted runner. It does not send `BREV_API_KEY`,
+`BREV_ORG_ID`, `GH_TOKEN`, or the Brev user SSH private key to the Launchable
+workspace, and it does not receive an inference credential.
+After the identity validation step, a reserved cleanup step rechecks only the
+workflow-owned workspace name. The job is absent from push, default, full, and
+release-required selections.
 
 A manual run with `include_staging_brev_launchable=true` and empty `jobs` and
-`targets` selectors runs the default workflow E2E selection plus the Launchable E2E job.
-This is the full run required for pre-tag evidence. Each full dispatch uses
-`github.run_id` in its workflow concurrency identity, so another full dispatch
-cannot supersede it while it waits. The trusted `main` workflow dispatch
-verifies that the dispatching and rerunning actors have repository `maintain` or
-`admin` permission before the Launchable path's source checkout. That automatic
-role check authorizes `staging-brev-launchable`; the job does not use GitHub
-environment approval. The job uses the non-cancelling
-`staging-brev-launchable-cpu` group with `queue: max`, so pending Launchable E2E
-runs remain queued instead of replacing one another.
+`targets` selectors runs the default workflow E2E selection plus `staging
+Brev Launchable`. The workflow names this selection `E2E full main`, with the
+correlation ID when one was supplied, so maintainers can find the newest full
+manual run without scanning every run's jobs.
 
-The Jetson nvmap and DGX Spark llama.cpp jobs remain excluded from ordinary and
-full runs unless their independent opt-in flags are `true`.
+Each full or focused Launchable dispatch uses `github.run_id` in its workflow concurrency identity,
+so another dispatch cannot supersede it while it waits. The trusted `main`
+workflow dispatch verifies that the dispatching and rerunning actors have
+repository `maintain` or `admin` permission before the Launchable path's source
+checkout. That automatic role check authorizes `staging-brev-launchable` and
+`staging-brev-launchable-identity`; neither job uses GitHub environment
+approval.
+
+Both Launchable jobs and `.github/workflows/staging-launchable-full.yaml` share the
+`staging-brev-launchable-cpu` concurrency group with `queue: max` and `cancel-in-progress: false`.
+One job or workflow runs at a time, and up to 100 pending entries wait without replacing each other.
+GitHub cancels new entries when the queue is full. Entries run in the order they enter the group;
+that order can differ from workflow dispatch order.
+
+For a full manual run dispatched against `main`, `Release qualification` waits
+for every E2E job that does not require a separate opt-in, including `Exact staging Brev Launchable`. The strict aggregate reports whether that full run
+passed; it does not authorize or reject a tag. For a release decision, report
+the newest identifiable full run, its timestamps, tested commit SHA, workflow
+result, `Release qualification` result, and every job that did not succeed.
+Compare the tested SHA with the release candidate, but do not require a match or
+apply a staleness threshold. The maintainer can proceed with the reported status,
+rerun focused jobs, or request another full run.
+The release-tag skill records only the general E2E decision and any reason for
+proceeding with exceptional status in the signed release brief.
+
+Separately, every release candidate requires a successful candidate `Exact staging Brev Launchable` job. That evidence can come from a Launchable-only or
+full run and cannot be waived by the maintainer's general E2E decision. The job
+builds the candidate image, deploys the standing Launchable, verifies the
+booted image and baked runtime, runs the preinstalled full E2E suite with
+inference, and confirms workspace absence.
+
+After preparation succeeds, the Launchable upload retains `lane.log` and each
+phase artifact created before exit. A preparation failure can produce no
+artifact. A later early failure can retain only `lane.log`. A successful job
+contains `launchable-e2e.json`, `full-e2e.log`, and `cleanup.json`;
+`cleanup.json` exists only after the job confirms workspace absence.
+The preinstalled suite resolves its gateway name and port from the external
+gateway declaration before registering cleanup. It removes its sandbox but
+does not remove the platform gateway registration or service. Source-install
+runs retain their test-owned gateway cleanup.
+The Launchable controller enables `NEMOCLAW_E2E_COMMAND_EVIDENCE=1` to retain
+completed command records in `full-e2e.log`. Each `NEMOCLAW_E2E_COMMAND` JSON
+line contains redacted argv, UTC start and finish timestamps, duration, exit
+status, signal, and timeout state. Spawn failures also emit a record. Commands
+that explicitly disable artifact persistence emit none. Output bodies remain
+in guest artifacts; this stream does not export them. Oversized command argv
+is omitted with `commandOmitted: "size-limit"`. Abrupt guest or transport loss
+can leave no completion record for an active command. Older baked suites may
+emit no records; the controller reports that absence rather than inferring
+command times from phase reports.
+The preinstalled suite does not run the source-install cold-onboarding budget
+and does not declare that budget as tested coverage.
+When the preinstalled full E2E fails after SSH succeeds, the job attempts to
+append bounded, redacted host state and fixed lifecycle classifications to
+`lane.log` before cleanup. On the host, the SSH command reads the system journal
+and returns only fixed PID 1 lifecycle and OpenShell gateway bind
+classifications. Raw journal messages and credential values do not reach the
+GitHub-hosted runner or `lane.log`. If a probe fails or the shared budget
+expires, `lane.log` records that result and cleanup continues. The diagnostic
+phase is read-only, uses one 30-second budget, and does not retry the failed E2E
+or repair the workspace.
+The listener diagnostic uses the baked suite's gateway resolver, including its
+declaration path, loopback endpoint parsing, port checks, and conflict checks.
+An unavailable resolver or rejected declaration leaves that probe failed;
+it does not substitute port 8080 or prevent workspace cleanup.
+
+Manual ordinary and full runs exclude the Jetson nvmap job unless `allow_jetson_dispatch` is `true`.
 Set `allow_jetson_dispatch=true` to select `jetson-nvmap-gpu` after the
 operator-owned dispatch service is available at the repository variable
 `JETSON_DISPATCH_URL`. Refer to the
 [Jetson dispatch controller](docs/jetson-dispatch.md) for the trusted workflow,
 HTTP contract, and evidence boundary that NemoClaw owns.
-Set `allow_dgx_spark_runner_queue=true` to select both
-`llama-cpp-dgx-spark-plan` and `llama-cpp-dgx-spark-qualification`.
-GitHub can pause the qualification job for the
-`approve-dgx-spark-image-qualification` environment before it reaches the DGX
-Spark runner.
-Pre-tag evidence requires both hardware opt-in flags to remain `false`.
-Results from opt-in hardware runs do not enter the required pre-tag E2E
-denominator.
+Each trusted push to `main` selects `jetson-nvmap-gpu` without changing the
+manual input default.
+Full manual `main` dispatches require `allow_jetson_dispatch=false`.
+Jetson push results and opt-in hardware results do not enter the strict full-run
+qualification set.
 
 ### Hosted-Runner Recovery
 
-Hosted Runner Recovery can request one full rerun for eligible WSL, macOS, and
-platform-watch push runs. It does not handle `E2E main`. The complete non-passing
-job listing must contain only authenticated hosted-runner-loss evidence for the
-workflow's approved runner labels. An ordinary assertion failure, mixed failure
-set, incomplete listing, custom or self-hosted label, changed evidence, or
-ambiguous pagination prevents recovery.
+`Automation / Recover Platform CI Runner` can request one full rerun for an eligible `CI / Platform Compatibility` push.
+It does not handle `E2E main`.
+The complete non-passing job listing must contain only authenticated hosted-runner-loss evidence for the workflow's approved runner labels.
+An ordinary assertion failure, mixed failure set, incomplete listing, custom or self-hosted label, changed evidence, or ambiguous pagination prevents recovery.
 
-For eligible `E2E main` push runs, `E2E / Main Retry` asks GitHub Actions to rerun failed jobs and their dependent jobs.
-A successful CLI artifact producer is not rerun.
-The workflow retains its CLI artifact for 3 days.
-During that period, consumers can reuse the immutable, content-addressed artifact from an earlier producer attempt in the same workflow run.
-If the artifact is unavailable when a consumer downloads it, restoration fails because the failed-job rerun does not rerun the successful producer.
-Restore validation binds the producer provenance to the workflow run, workflow SHA, and candidate checkout.
-It downloads by immutable artifact ID and verifies the manifest and the payload digest.
-It rejects a producer attempt newer than the consumer attempt.
-The controller can request two reruns.
-It does not verify that GitHub schedules a different runner, so do not treat a rerun as evidence of a fresh host.
-It ignores manual runs and source runs superseded by a newer `main` push.
-The controller checks out only trusted default-branch code and receives no repository secrets.
+For eligible `E2E main` push runs, `E2E / Main Retry Evidence` records `passed-first-attempt`, `passed-after-retry`, `failed-no-retry`, or `ignored` without requesting a workflow rerun.
+A failed job can represent a deterministic product assertion, authentication or authorization failure, policy denial, malformed input, ambiguous mutation, cleanup failure, or an external transient.
+GitHub job conclusions do not distinguish those classes, so a broad failed-job rerun is not authorized evidence.
+External operations use an explicit bounded retry policy at the operation level; new shared paths use the bounded operation helper.
+Operation-level retry artifacts retain each attempt.
+Hosted runner loss remains owned by `Automation / Recover Platform CI Runner`.
+The observer ignores manual source runs and source runs superseded by a newer `main` push, checks out only trusted default-branch code, and receives no repository secrets.
 
-The runner-allocation and internal-error failures handled by Hosted Runner
-Recovery originate in GitHub Actions, outside repository-controlled workflow
-code. Hosted Runner Recovery contains these failures without claiming to repair
+The runner-allocation and internal-error failures handled by
+`Automation / Recover Platform CI Runner` originate in GitHub Actions, outside
+repository-controlled workflow code. The workflow contains these failures without claiming to repair
 their source. Remove `.github/workflows/hosted-runner-recovery.yaml` and its
-controller only after the three platform workflows record 30 consecutive days
-with no first-attempt failure accepted by the recovery classifier, or after those
-workflows stop using GitHub-hosted runners. Each accepted Hosted Runner Recovery
+controller only after the platform-evidence workflow records 30 consecutive days
+with no first-attempt failure accepted by the recovery classifier, or after that
+workflow stops using GitHub-hosted runners. Each accepted `Automation / Recover Platform CI Runner`
 request resets that observation window.
 
 ### Runner comparison telemetry
 
 Trusted `main` runs without an alternate checkout SHA record runner-comparison
-telemetry for 12 routed workflow lane identities / 14
+telemetry for 9 routed workflow lane identities / 11
 concrete job executions.
 
 - `agent-turn-latency`, spanning its sequential OpenClaw and Hermes setup
 - `common-egress-agent` with the `openclaw-balanced-weather`,
   `openclaw-open-reference`, and `hermes-open-reference` shards
-- `rebuild-hermes`
-- `rebuild-hermes-stale-base`
 - `mcp-bridge` with the `hermes` shard
 - `mcp-bridge` with the `deepagents` shard
 - `channels-stop-start` with the `hermes` shard
 - `hermes-discord`
 - `hermes-e2e`, including dashboard coverage
 - `hermes-inference-switch` with the `anthropic` mode
-- `hermes-shields-config`
 - `security-posture` with the `hermes` shard
 
-The two extra executions come from `common-egress-agent`, which runs three
-scenario shards.
+The two extra instrumented executions come from the 3 `common-egress-agent`
+scenario shards that enable runner comparison.
+The Personal public-fetch shard runs without runner-comparison telemetry.
 The OpenClaw matrix entries for `mcp-bridge`,
 `channels-stop-start`, and `security-posture` are not instrumented.
 The #7145 standard-versus-larger-runner cohort compares the same lane and
@@ -533,12 +1288,10 @@ larger runner.
 Each execution writes one bounded, ordered v2 time series to the canonical
 `runner-comparison.jsonl` ledger. It contains:
 
-- an `initialize` endpoint after exact-commit artifact restoration; the rebuild
+- an `initialize` endpoint after commit-bound artifact restoration; the rebuild
   jobs initialize after their fixed-capacity swap;
 - a distinct `scenario-start` for every test handled by the execution;
-- a `periodic` sample on an approximately 15-second fixed cadence for
-  `rebuild-hermes` and `rebuild-hermes-stale-base`, and an approximately
-  60-second fixed cadence for every other execution;
+- a `periodic` sample on an approximately 60-second fixed cadence;
 - a `phase` sample before each semantic phase transition and when the final
   phase stops; and
 - a `finalize` endpoint from an `always()` step immediately before artifact
@@ -553,14 +1306,8 @@ catch-up burst. Each successful append also prints one bounded
 The v2 ledger accepts at most 256 samples. Ordinary sampling stops once 255
 records exist to reserve the last slot for `finalize`. A missing, historical-v1,
 already-finalized, full, or invalid ledger permanently disables comparison
-sampling for that test progress instance. The two Hermes rebuild lanes use their
-shorter cadence to improve Docker/BuildKit peak-RSS evidence without changing
-the ledger bound, schema, privacy contract, or reserved final slot. In
-`rebuild-hermes` and `rebuild-hermes-stale-base`, where legacy phase resource
-evidence is configured, the workflow establishes its 32 GiB swap before
-`initialize` so the ledger sees one stable swap capacity. If canonical sampling
-becomes unavailable, the existing five-minute full snapshot becomes the
-best-effort fallback.
+sampling for that test progress instance. If canonical sampling becomes unavailable,
+the existing five-minute full snapshot becomes the best-effort fallback.
 That full profile may run `ps`, `docker stats`, and `docker system df`
 sequentially with a 15-second timeout each, or 45 seconds in the worst case;
 canonical sampling suppresses this heavier collection while it remains active.
@@ -580,7 +1327,7 @@ environment and secret values. Docker memory evidence is reduced to the largest
 retained container value; maximum Docker CPU considers every row in the bounded
 command output. When the globally largest process is in the Docker/BuildKit
 class, the collector also reads that process's `VmRSS`, `RssAnon`, `RssFile`,
-`RssShmem`, and optional `VmSwap` values from procfs. PID and exact process
+`RssShmem`, and optional `VmSwap` values from procfs. PID and process
 identity remain private to the collector, and the breakdown is `null` if the
 process exits, its identity changes, procfs denies access, or the resident
 components are incomplete or inconsistent. The outer `rssKb` is the `ps`
@@ -620,8 +1367,8 @@ to the portable free-memory value and labels that value as `memory free`.
 
 The comparison time series is diagnostic-only and is not an input to terminal
 classification or retry policy. Runner-comparison telemetry does not affect
-`E2E / Main Retry` decisions. Hosted Runner Recovery remains limited to
-authenticated runner-loss evidence for its three platform workflows.
+`E2E / Main Retry Evidence` decisions. `Automation / Recover Platform CI Runner` remains limited to
+authenticated runner-loss evidence for its platform-evidence workflow.
 
 Treat a missing summary as unavailable evidence, not as low utilization. A
 hard runner loss can prevent finalization or artifact upload. When you compare
@@ -731,7 +1478,7 @@ npx tsx tools/e2e/live-vitest-invocation.mts run \
   --test-path test/e2e/live/spark-express-vllm.test.ts
 ```
 
-A passing target establishes that the source-checkout option-2 path selects the fixed vLLM preset and recipe, the managed container carries exact catalog provenance and the exact catalog-derived serve command, `inference.local` completes a chat request, and unrelated sandbox egress receives an HTTP `403` response.
+A passing target establishes that the source-checkout option-2 path selects the fixed vLLM preset and recipe, the managed container carries catalog provenance and the catalog-derived serve command, `inference.local` completes a chat request, and unrelated sandbox egress receives an HTTP `403` response.
 
 The checker preserves coverage for every file under `test/e2e/live/` and adds
 workflow-selected integration files from the authoritative shared-job planner.
@@ -750,101 +1497,227 @@ a custom, copied, or no-op adapter.
 
 E2E does not run automatically for pull requests.
 Pull requests retain deterministic CI, including the `e2e-support` Vitest project.
-Each push to `main` selects the default workflow E2E jobs.
-The central workflow skips the Jetson nvmap and DGX Spark llama.cpp jobs on push.
+Each push to `main` compares `github.event.before` with `github.sha`.
+The planner selects catalogue targets, tagged credential-free tests, registry targets, and retained workflow jobs that own changed files.
+The planner also selects the CPU-only `jetson-nvmap-gpu` proof for every trusted push.
+Changes to the central workflow, planner, or shared execution helpers select the complete default E2E set.
+If no other E2E target owns a changed file, `Relevant E2E` requires only the Jetson proof.
+Otherwise, `Relevant E2E` requires every selected workflow job to pass.
+For trusted manual PR runs, the same check also records selected results and references the existing dispatch receipt.
+The [review queue evidence contract](../../tools/pr-review-advisor/REVIEW-QUEUE.md#results) defines artifact validation and incomplete results.
 The central workflow has no scheduled trigger.
 
-The main-push selection includes:
+The workflow planner connects each trusted input to its execution and evidence boundary:
 
-- the staging Brev Launchable journey;
-- the OpenShell gateway authentication contract;
-- the development MCP bridge;
-- managed-image startup on AMD64 and ARM64;
-- managed-image GPU, Ollama, NVIDIA NIM, and vLLM behavior;
-- Hermes GPU startup.
+```mermaid
+flowchart LR
+  push["main push diff"] --> planner["Workflow planner"]
+  manual["Full manual dispatch<br/>or manual selectors"] --> planner
+  planner --> registry["Typed registry matrix"]
+  planner --> shared["Shared test matrix"]
+  planner --> profiles["Catalogue profile matrices"]
+  planner --> retained["Retained workflow jobs"]
+  profiles --> reusable["Reusable profile workflow"]
+  registry --> dedicated["Dedicated GitHub Actions jobs"]
+  shared --> dedicated
+  retained --> dedicated
+  reusable --> evidence["Diagnostic product evidence"]
+  dedicated --> evidence
+  reusable -->|"push or PR job results"| relevant["Relevant E2E"]
+  dedicated -->|"push or PR job results"| relevant
+  reusable -->|"full manual job results"| release["Release qualification"]
+  dedicated -->|"full manual job results"| release
+  release --> decision["Status for maintainer decision"]
+```
 
-These jobs retain their runner, credential, evidence, and cleanup boundaries.
-A main push can queue repository-owned GPU runners and can create Brev resources.
-The retry workflow reruns failed jobs at most twice.
+Selected jobs retain their runner, credential, evidence, and cleanup boundaries.
+A main push can queue repository-owned GPU runners or create external resources when a selected target requires them.
+The main-run observer records attempt evidence but does not request broad failed-job reruns.
+Each E2E test owns any bounded operation-level retry policy.
 
-Each trusted push to `main` selects `Exact staging Brev Launchable`. The job reads
-these credentials from repository Actions secrets:
+`Exact staging Brev Launchable` runs only for a trusted manual dispatch against `main`.
+The job reads these credentials from repository Actions secrets:
 
-- `BREV_API_KEY` authenticates the Brev CLI for workspace operations in the
-  organization identified by `BREV_ORG_ID`.
+- `BREV_API_KEY` authenticates the trusted host-side Brev CLI for workspace
+  operations in the organization identified by `BREV_ORG_ID`. Candidate code
+  does not receive this API key.
 - `NEMOCLAW_IMAGE_DISPATCH_TOKEN` is exposed as `GH_TOKEN` only to the trusted
-  host script. It grants Actions read/write access to `brevdev/nemoclaw-image`,
-  which the script uses to dispatch the image workflow, inspect its run, and
-  download its handoff artifact.
-- `NVIDIA_INFERENCE_API_KEY` is exported into the Brev guest for the full E2E
-  process. Code in the baked candidate checkout can read and use it.
+  host controller. The controller uses it to list successful producer runs in
+  `brevdev/nemoclaw-image` and download the selected staging handoff artifact.
+- `NVIDIA_API_KEY` supplies the public NVIDIA endpoint credential. The workflow
+  exports it as `NVIDIA_INFERENCE_API_KEY` into the Brev guest for full E2E.
+  The preinstalled suite selects `build` for `brev-quickstart` and probes the
+  public endpoint. Code in the baked candidate checkout can read and use the key.
 
-These credentials remain valid until they expire or an administrator revokes
-them in their issuing services. If cleanup fails, remove the recorded Brev
-workspace. Rotate or revoke each credential to remove later access.
+Follow the [Staging Brev Launchable Boundary](../../.agents/skills/nemoclaw-maintainer-e2e/SKILL.md#staging-brev-launchable-boundary)
+for credential access, lifetime, and cleanup.
+For a same-repository PR revision, the job builds and runs the candidate commit with this same credential boundary.
+The PR branch must be in `NVIDIA/NemoClaw` because the image producer does not accept a sibling-repository candidate.
 
-When an eligible `E2E main` push workflow concludes with `failure`, `E2E / Main Retry` asks GitHub Actions to rerun failed jobs and their dependent jobs.
-The controller permits two reruns but does not verify that GitHub schedules a different runner.
-After evaluation succeeds, it uploads an artifact named for the current attempt.
+The `NEMOCLAW_STAGING_LAUNCHABLE_ID` repository Actions variable selects the
+standing Launchable. Keep its value equal to the Launchable ID in the default
+URL owned by
+[`nemoclaw-maintainer-validate-launchable`](../../.agents/skills/nemoclaw-maintainer-validate-launchable/SKILL.md).
+
+When an eligible `E2E main` push workflow completes, `E2E / Main Retry Evidence` records its conclusion and the available source-attempt evidence.
+It does not request a broad failed-job or workflow rerun.
+An owning E2E test can retry an external operation only through its checked-in bounded policy.
+After evaluation succeeds, the observer uploads an artifact named for the current attempt.
 The artifact contains one `attempts` summary for each source attempt through the current attempt.
 The `totalRunnerMinutes` field contains the cumulative runner time for those summaries.
 A later successful attempt sets `action` to `passed-after-retry` and `flaky` to `true`.
-The controller does not retry manual PR runs or a run superseded by a newer `main` push.
+The observer ignores manual PR runs and a run superseded by a newer `main` push.
 
-For a PR revision run, a repository maintainer or administrator leaves `jobs` and `targets` empty. The run selects:
+GitHub's workflow-dispatch permission is the actor authorization for a PR revision run.
+The workflow does not add a second `maintain` or `admin` role gate.
+Before checkout, it verifies the open PR, target repository and `main` branch, current source repository and commit, base commit, and trusted workflow commit from the GitHub PR API.
+
+The API must report `NVIDIA/NemoClaw` as the PR source repository. Empty `jobs` and `targets` select:
 
 - every default-selected free-standing workflow E2E except `Exact staging Brev Launchable`;
+- every catalogue target across all credential profiles;
 - every shared credential-free test; and
-- these controller-selected registry targets: `ubuntu-policy-custom-missing-presets-negative`, `ubuntu-repo-cloud-langchain-deepagents-code`, `ubuntu-repo-cloud-openclaw`, and `ubuntu-repo-docker-post-reboot-recovery`.
+- every default registry target.
 
+A same-repository PR may also select any supported E2E job or target.
+Main and manual PR runs use the same typed planner from the trusted workflow revision.
+PRs from forks, including other NVIDIA repositories, are rejected before candidate execution.
 The run skips `jetson-nvmap-gpu` unless `allow_jetson_dispatch` is `true`.
-It skips `llama-cpp-dgx-spark-plan` and `llama-cpp-dgx-spark-qualification`
-unless their runner-queue flag is `true`.
-The trusted workflow definition remains on `main` and binds the candidate head to the current PR base SHA.
+Jetson and Launchable retain their operator and image-producer requirements.
+The trusted workflow definition remains on `main` and binds the latest PR commit to the current PR base SHA.
 It does not run GitHub's synthetic merge commit.
+Before candidate execution, the workflow uploads a `nemoclaw-e2e-dispatch-v2` receipt for the trusted manual run.
+The full-main `Release qualification` aggregate does not use this receipt.
+
+The `base-image-publication` job first resolves any authenticated PR managed-image catalog.
+When a PR catalog is selected, explicit targets with no `jobs` selector and no `managed-image-` target use it without waiting for main's base images.
+Other selections with a PR catalog retain the Deep Agents Code base prerequisite, including full runs and protected managed-image build targets.
+Runs without a PR catalog require a trusted main base and managed-image publication; PR runs select the nearest fully successful publication on the PR base first-parent history.
+For that publication, the job binds the run ID, attempt, revision, cohort artifact ID, and artifact digest before it emits `managed_image_revision`.
+It validates the complete three-agent, two-architecture cohort artifact and the immutable Deep Agents Code base artifact from that workflow attempt.
+`generate-matrix` and every stock-onboarding job depend on this publication job, so incomplete publication creates no onboarding fanout.
+Direct `main` runs use the same publication workflow and artifact contract.
+
+The Deep Agents Code managed-image target uses the shared receipt check to verify its image digest, source revision, and cohort.
+Onboarding and fresh re-onboarding do not supply a base-image override.
+The retained `dcode-base-image.json` artifact records publication evidence; it does not select the managed workload's image.
 
 PR Review Advisor maps changes to either of these shared journaled-recreation handlers to recommended E2E coverage:
 
 - `src/lib/onboard/machine/handlers/sandbox-resume.ts`.
 - `src/lib/onboard/machine/handlers/sandbox.ts`.
 
-The risk plan selects the `openshell-gateway-upgrade` job and the
-`ubuntu-repo-cloud-langchain-deepagents-code` typed target. The job covers the
-installer-driven OpenShell gateway upgrade handoff. The target covers the
-LangChain Deep Agents Code sandbox recreation path.
+The risk plan selects the `openshell-gateway-upgrade` catalogue target and the
+`ubuntu-repo-cloud-langchain-deepagents-code` typed target.
+The catalogue target covers the installer-driven OpenShell gateway upgrade handoff.
+The typed target covers the LangChain Deep Agents Code sandbox recreation path.
 
-An empty-selector manual run exposes these values to candidate-controlled job processes:
+A same-repository PR run with empty selectors exposes these values to candidate-controlled job processes:
 
 - Long-lived API keys from repository secrets: `NVIDIA_INFERENCE_API_KEY`, `NVIDIA_API_KEY`, and `BRAVE_API_KEY`.
+- Docker Hub credentials from `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, available to candidate processes through the job's temporary Docker configuration until cleanup.
 - Long-lived messaging credentials from repository secrets: `TELEGRAM_BOT_TOKEN_REAL`, `DISCORD_BOT_TOKEN_REAL`, `SLACK_BOT_TOKEN_REAL`, and `SLACK_APP_TOKEN_REAL`.
-- The job-scoped `GITHUB_TOKEN` in the `token-rotation` and `openshell-gateway-upgrade` jobs. It has `checks: read`, `contents: read`, and `pull-requests: read` access. Candidate code can use it while either job runs. GitHub Actions invalidates it after the job.
+- The job-scoped `GITHUB_TOKEN`, exposed only to the target step in the `token-rotation` and `openshell-gateway-upgrade` catalogue executions.
+  It has `contents: read` access.
+  Candidate code can use it while either target runs.
+  GitHub Actions invalidates it after the reusable workflow job.
 - Messaging account and channel identifiers from repository secrets: `TELEGRAM_ALLOWED_IDS`, `TELEGRAM_AUTHORIZED_CHAT_IDS`, `TELEGRAM_CHAT_ID`, `TELEGRAM_CHAT_ID_E2E`, `DISCORD_CHANNEL_ID_E2E`, and `SLACK_CHANNEL_ID_E2E`.
 
-The workflow does not rotate or revoke these API keys or messaging credentials. To remove later access, rotate or revoke every listed credential in the external service that issued it. The workflow cannot erase identifiers copied by candidate code. Review the complete candidate diff before dispatch.
+The workflow does not rotate or revoke these API keys, Docker Hub credentials, or messaging credentials. To remove later access, rotate or revoke every listed credential in the external service that issued it. The workflow cannot erase identifiers copied by candidate code. Review the complete candidate diff before dispatch.
 Live targets can create external resources.
 After a failure, inspect the workflow artifacts and remove resources that target cleanup did not remove.
 
-For `managed-image-protected-runtime`, the workflow supplies the long-lived `NVIDIA_API_KEY` repository secret only to the trusted qualification step. Trusted host code uses it for NGC login and passes it as `NGC_API_KEY` and `NIM_NGC_API_KEY` to the temporary NIM container. Candidate managed sandboxes receive generated local route tokens instead of this key. The live fixture attempts to stop and remove `nemoclaw-managed-image-nim-e2e`, but Docker stop or removal errors do not fail the test. A surviving container can retain the API key until runner teardown. The final workflow step removes the job's isolated Docker credential directory and fails if that removal does not complete. The workflow does not revoke the NVIDIA API key. Rotate or revoke it in the issuing NVIDIA service to remove later access.
+For `managed-image-protected-runtime`, the workflow supplies the long-lived `NVIDIA_API_KEY` repository secret only to the trusted qualification step. Trusted host code uses it for NGC login and passes it as `NGC_API_KEY` and `NIM_NGC_API_KEY` to the temporary, cohort-owned NIM container. Managed candidate sandboxes receive generated local route tokens instead of this key. Before starting NIM or vLLM, the live fixture rejects a pre-existing cohort container name. It records the full container ID, requested image, immutable image ID, cohort owner, and provider label, then removes only the container with that exact full container ID after revalidating every field. Missing, ambiguous, name-reused, drifted, or indeterminate cleanup evidence fails the test, as does any retained ID or name. A fail-closed refusal can leave the secret-bearing NIM container alive until runner teardown; inspect the redacted artifacts and remove only the verified container. The final workflow step removes the job's isolated Docker credential directory and fails if that removal does not complete. The workflow does not revoke the NVIDIA API key. Revoke it, or rotate it and disable the old value, in the issuing NVIDIA service. Verify that the exposed key is no longer valid.
 
-For a manual PR run, provide the current PR number, lowercase 40-character head SHA, head repository, lowercase 40-character base SHA, trusted `main` workflow SHA, and a review reason containing 10 to 500 printable characters.
-Leave `jobs` and `targets` empty and keep `include_staging_brev_launchable=false` to use this PR revision selection.
-Keep `allow_jetson_dispatch=false` and `allow_dgx_spark_runner_queue=false` for the default PR revision selection.
-If `allow_dgx_spark_runner_queue=true`, GitHub can pause the qualification job for the `approve-dgx-spark-image-qualification` environment.
-An authorized environment reviewer must approve it before qualification starts.
+Before you dispatch `native-runtime-qualification-producer`, review the `NVIDIA_API_KEY` boundary below.
+The host-side preparation step receives the long-lived repository secret and uses it to create runner-local registry authentication and pull pinned GPU images.
+The step deletes the registry authentication file and unsets the variable before candidate execution.
+The workflow does not revoke the API key.
+The key remains valid in the issuing NVIDIA service until it expires or that service revokes it.
+If exposure occurs or cleanup cannot be confirmed, revoke the key in the issuing NVIDIA service.
+Alternatively, rotate the key and invalidate the old value.
+Verify that the old value is invalid.
+
+After you accept this credential boundary, dispatch `native-runtime-qualification-producer` from trusted `main` for a same-repository open PR.
+Use the first workflow attempt.
+The executing workflow commit and `workflow_sha` input must equal the PR-recorded base commit.
+The dispatcher must have GitHub permission to run the workflow; the E2E workflow adds no second actor-role check.
+
+The trusted workflow binds the candidate commit, base commit, workflow commit, repository, PR, run, attempt, and 24-case plan.
+The unprivileged installer and live-test processes run with `env -i` under a temporary account.
+They receive no GitHub, inference provider, API, or messaging credential.
+Docker is unavailable to these processes.
+Before any self-hosted qualification job runs, set the GitHub Actions repository variable `NATIVE_RUNTIME_EPHEMERAL_RUNNER_POOL` to `enabled`.
+Set the repository variable `NATIVE_RUNTIME_ARM64_GPU_RUNNER_LABEL` to the reviewed ARM64 GPU runner label.
+The workflow provides no ARM64 GPU fallback runner.
+The candidate must contain `test/e2e/live/native-runtime-qualification-case.test.ts`.
+Each successful case uploads the validated installer, runtime, operation, and optional NVIDIA CDI receipts.
+The workflow does not upload the candidate `execution.json` or `case-evidence.json` staging files.
+A failed case uploads no case-evidence artifact.
+The aggregate job runs only after all 24 cases succeed.
+It rejects an incomplete or mixed cohort before it emits the 24-case evidence artifact.
+If the executor or required runner capacity is absent, the producer fails closed instead of claiming qualification.
+This qualification does not register or select Podman in production and does not establish public Podman support.
+
+Before candidate execution, the producer stops Docker, masks its service and socket, removes Docker sockets, and rejects a usable `docker` command.
+Cleanup terminates processes owned by the candidate account and removes that account.
+If cleanup fails or the runner becomes unavailable, inspect the host and remove the ephemeral runner from service.
+Recover or replace the runner before dispatching a new run.
+Do not rerun the same workflow attempt; the producer rejects attempts after the first.
+Dispatch a new run after recovery.
+If a case fails, use the GitHub Actions job log.
+Inspect a case artifact only when its upload step completed.
+
+For the initial manual PR run, provide these inputs:
+
+- The current PR number.
+- The lowercase 40-character SHA of the latest PR commit.
+- The PR source repository.
+- The lowercase 40-character PR base SHA.
+- The SHA of the trusted workflow commit on `main`.
+
+If the head run fails, use the read-only CI failure classifier when it is available. Stop without a
+base replay when it identifies known infrastructure failure. Only an unresolved candidate failure
+may be replayed with the same selectors against the exact PR base: set `checkout_sha` to the
+recorded base SHA and `checkout_repository` to `NVIDIA/NemoClaw`, while leaving `base_sha` and
+`workflow_sha` unchanged. The workflow run is the evidence; do not publish a separate commit status
+or automatically replay the base.
+
+For the default same-repository PR revision selection, leave `jobs` and `targets` empty and keep `include_staging_brev_launchable=false`.
+Keep `allow_jetson_dispatch=false` for the default PR revision selection.
 To select the protected managed-image runtime qualification, set `jobs=managed-image-protected-runtime`.
 Leave `targets` empty.
 Keep `include_staging_brev_launchable=false`.
-The exact candidate must contain `ci/protected-managed-image-multiarch-activation-v1.json` and `ci/protected-managed-image-runtime-activation-v1.json`.
-The trusted pre-checkout step requires current `maintain` or `admin` permission and validates the exact open PR and selected mode before candidate code runs.
-A second validation after checkout rejects a changed head, base, or repository before preparation.
+The candidate must contain `ci/protected-managed-image-multiarch-activation-v1.json` and `ci/protected-managed-image-runtime-activation-v1.json`.
+To select native runtime qualification evidence production, set `jobs=native-runtime-qualification-producer`.
+Leave `targets` empty and keep `include_staging_brev_launchable=false`.
+For this producer run, the executing workflow SHA, `workflow_sha` input, and PR base SHA must match.
+Confirm that the PR comes from `NVIDIA/NemoClaw`, the required ephemeral runner variables are configured, and the workflow has not been rerun.
+A trusted `main` workflow step validates the open PR before candidate checkout.
+It requires `NVIDIA/NemoClaw` as the source repository before authorizing the full ordinary plan and credential profiles.
+A second validation after checkout rejects a changed selected commit, base commit, repository, or
+NVIDIA ownership before preparation.
+Candidate runs cannot publish release qualification.
 
 The Actions run is advisory for the pull request and is not a required merge context.
-Treat it as passing evidence only when the `E2E` workflow concludes with `success` for the recorded PR number, head repository, head SHA, base SHA, and trusted workflow SHA.
-A changed head repository, head SHA, or base SHA invalidates the evidence and requires a new manual run.
+Treat a head or base run as passing evidence only when the `E2E` workflow concludes with `success`
+for the recorded PR number, selected repository, selected commit SHA, base commit SHA, and executing
+workflow SHA. A changed PR source repository, head commit SHA, or base commit SHA invalidates a
+head-to-base comparison.
 
-The macOS and WSL workflows also run on configured pushes to `main`.
-The portable-profile workflow runs on `main` when one of its configured paths changes.
-Their manual dispatch paths remain available for branch diagnosis.
+The platform-evidence workflow runs only on configured pushes to `main`.
+It serializes runs for the same ref, retains the pending queue, and does not cancel an older commit when a newer `main` push arrives.
+The experimental portable-profile workflow can run for pull requests, matching `main` pushes, and manual dispatch.
+Its `portable-launch` job runs only when `github.ref` is `refs/heads/main`.
+The `portable-launch` job's exercise step exposes the long-lived repository `NVIDIA_INFERENCE_API_KEY` to the checked-out source through its environment.
+The hosted-inference fixture copies that key into `/run/nemoclaw/portable-inference.json`, a mode-`0600` file beneath the current-user-owned mode-`0700` `/run/nemoclaw` directory.
+Code running as the current user can read that descriptor until the production loader consumes it or cleanup removes it.
+The descriptor has a one-hour admission window; that window does not expire or revoke the API key.
+The production loader consumes and unlinks the descriptor before provider selection.
+The always-run workflow cleanup removes `/run/nemoclaw/portable-inference.json` and `/run/nemoclaw/.portable-inference.json.tmp` and fails if it cannot remove either path.
+Runner teardown is the fallback that discards the ephemeral runner filesystem; only issuer rotation or revocation removes later API-key access.
+The Podman CPU proof runs only for matching pull request changes.
+The sandbox-image workflow accepts manual and reusable workflow calls for image build and test evidence.
 
 ## Onboard performance budget
 
@@ -869,20 +1742,21 @@ configuration, or the unified E2E workflow. Compatibility schema fields may
 classify that guidance as required, but rendered advisor guidance remains
 non-authoritative. Model advice is additive and cannot downgrade the
 deterministic floor. PR Review Advisor recommendations remain advisory.
-A maintainer decides whether to dispatch this trusted selection for the current PR
-revision. The manual PR controller accepts the credential-free
-`inference-routing` job; secret-backed jobs such as `network-policy` remain
-available only through manual dispatch from reviewed code on `main` and are
-labeled that way in the Advisor comment.
+A repository-authorized user decides whether to dispatch this trusted selection for the current PR revision.
+For API-confirmed same-repository sources, the selection may include secret-backed targets such as `network-policy`.
+Fork contributions require maintainer review and adoption onto a repository branch before manual E2E.
+The Advisor comment labels the requested coverage, but does not restrict a same-repository PR to that recommendation.
 No PR E2E controller dispatches the risk plan.
 
 The `full-e2e` target enforces a separate hard acceptance contract for the
 first fresh onboarding path in that job. It measures from the onboard root span
 (a conservative anchor before wizard step `[1/8]`) through the first non-empty
-agent response, requires the local BuildKit prebuild for the NemoClaw-generated
-context without a gateway-builder fallback, enforces the calibrated root and
-phase limits in the budget file, and limits the longest onboard output gap to
-60 seconds. A violation fails
+agent response and reads the registered workload receipt. The receipt must be
+`managed-image`, use an exact digest that matches the registered sandbox image
+tag, identify the selected publication cohort and exact source revision, and
+forbid a local BuildKit prebuild. The path enforces the calibrated root and phase
+limits in the budget file and limits
+the longest onboard output gap to 60 seconds. A violation fails
 `full-e2e`, and the target writes its evidence to `onboard-progress-budget.json`.
 The artifact records the first-turn command wall clock and OpenClaw's internal
 agent duration separately. Older or malformed OpenClaw output records an
@@ -892,8 +1766,25 @@ When every deterministic cold-onboard budget passes and the real first turn exit
 successfully with the expected sentinel, a sole root-end-to-first-turn overage
 is recorded as a structured, non-blocking hosted-latency anomaly rather than a
 PR regression.
-The same overage remains blocking when accompanied by a root-start or
-phase-budget failure.
+The same overage remains blocking when accompanied by a root-start or phase-budget failure.
+
+The checked-in `nemoclaw.onboard.phase.sandbox` budget remains 208,000 ms.
+A sandbox-phase overage qualifies for anomaly classification only when it is the sole performance overage and the run uses a managed image.
+For a qualifying overage of at most 5,000 ms, `full-e2e` records a `sandbox-phase-tail` anomaly instead of a blocking performance violation.
+An overage greater than 5,000 ms remains blocking.
+A local BuildKit prebuild fails the workload-evidence contract and cannot qualify for anomaly classification.
+Every other performance contract remains blocking, as do the existing first-turn command exit, BuildKit, gateway-builder no-fallback, output-silence, sentinel, E2E job outcome, and cleanup contracts.
+
+For `sandbox-phase-tail`, the trusted push scorecard uses the latest five eligible samples from the same agent, setup mode, platform, base-build mode, and workload kind.
+A current anomaly passes only when four valid prior same-cohort samples exist and none contains a sandbox-phase anomaly.
+A current anomaly remains blocking in these cases:
+
+- One or more queried prior push summaries are unavailable.
+- Fewer than four valid prior same-cohort samples are available.
+- One prior sample in the five-sample window contains a sandbox-phase anomaly.
+
+The second anomaly in the five-sample window therefore blocks immediately.
+These sandbox-phase recurrence rules do not change the hosted first-turn policy described below.
 
 The trusted push scorecard stores the current eligible sample in the
 `e2e-runtime-summary` artifact.
@@ -908,12 +1799,8 @@ Missing, malformed, or functionally unsuccessful samples do not enter the window
 The scorecard waits for 12 eligible samples when retained history is incomplete.
 The canonical E2E uploader retains each push summary for 14 days.
 
-When changed base-image inputs require the authoritative local OpenClaw base
-build, the target applies the separately calibrated 90-second allowance only to
-the root-start and sandbox-phase limits. The installer must emit the exact local
-base-build reason before the allowance applies. Published-image runs retain the
-normal limits, and output silence, first-turn, and all other phase requirements
-remain unchanged.
+The sandbox-phase recurrence rule does not recalibrate the checked-in budget.
+Recalibration remains deferred until five successful samples from the same commit are available.
 
 The two Hermes rebuild jobs and both reusable-workflow Hermes image exporters
 add a bounded 32 GiB swap file on their ephemeral hosted runners before the
@@ -924,6 +1811,10 @@ image layers and can otherwise exhaust the runner's default memory and swap
 during Docker layer export. Apart from those rebuild and export paths, E2E jobs
 add swap only through the trusted Hermes main-workflow fallback described in
 [Larger-runner routing](#larger-runner-routing).
+
+The exporters leave swap active through their final image operation. Their
+GitHub-hosted runners own terminal disposal of the swap and its backing file;
+the workflows do not add a failure-prone teardown step for that ephemeral state.
 
 These assertions run inside the existing `full-e2e` lifecycle instead of a
 second standalone onboarding run. This keeps the measurement on the job's first

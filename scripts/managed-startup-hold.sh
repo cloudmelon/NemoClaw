@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Trusted image-owned hold for managed startup. The image OCI user remains root
-# for the OpenShell supervisor, which deliberately drops the sandbox startup
-# command to sandbox:sandbox before entering this hold. The host separately
+# Trusted image-owned hold for managed startup. OpenShell 0.0.116 requires the
+# image OCI user and this canonical startup command to use sandbox:sandbox.
+# The host separately
 # applies one bounded profile as root to the exact final container. No agent
 # process starts until the root-owned marker authenticates the exact
 # runtime-environment handoff.
@@ -37,7 +37,7 @@ _nemoclaw_bootstrap_identity="$6"
 shift 7
 
 case "$_nemoclaw_agent" in
-  openclaw | hermes | langchain-deepagents-code) ;;
+  openclaw | hermes | langchain-deepagents-code | pi) ;;
   *) fail "agent is unsupported" ;;
 esac
 case "$_nemoclaw_fingerprint" in

@@ -6,6 +6,14 @@ import { checkGatewayRouteCompatibility } from "../inference/gateway-route-compa
 import type { SandboxEntry } from "../state/registry";
 import { createSetupInference, type SetupInferenceDeps } from "./setup-inference";
 
+const revalidateSandboxIdentity = () => undefined;
+
+const releaseAbandonedRouteReservation = vi.hoisted(() => vi.fn(() => false));
+vi.mock("./sandbox-lifecycle", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./sandbox-lifecycle")>()),
+  releaseAbandonedRouteReservation,
+}));
+
 describe("onboard shared gateway route containment", () => {
   afterEach(() => vi.unstubAllEnvs());
 
@@ -55,9 +63,21 @@ describe("onboard shared gateway route containment", () => {
         await operation(),
       step: vi.fn(),
       getGatewayName: () => "nemoclaw",
-      runOpenshell: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
+      runOpenshell: vi.fn((args: string[]) => ({
+        status: 0,
+        stdout: args.includes("export")
+          ? JSON.stringify({
+              id: "openai",
+              credentials: [],
+              endpoints: [],
+              binaries: [],
+              inference_capable: true,
+            })
+          : "",
+        stderr: "",
+      })),
       updateSandbox: vi.fn(() => true),
-      upsertProvider: vi.fn(() => ({ ok: true })),
+      upsertProvider: vi.fn(async () => ({ ok: true })),
       verifyInferenceRoute: vi.fn(),
       verifyOnboardInferenceSmoke,
       resolveEndpointHost,
@@ -100,6 +120,9 @@ describe("onboard shared gateway route containment", () => {
       "compatible-endpoint",
       scenario.endpointUrl,
       "COMPATIBLE_API_KEY",
+      null,
+      [],
+      { revalidateSandboxIdentity },
     ).then(
       () => null,
       (error: Error) => error.message,
@@ -123,8 +146,11 @@ describe("onboard shared gateway route containment", () => {
       events.push("openshell");
       return { status: 0 };
     });
-    const updateSandbox = vi.fn(() => true);
-    const upsertProvider = vi.fn(() => ({ ok: true }));
+    const updateSandbox = vi.fn(() => {
+      events.push("registry-published");
+      return true;
+    });
+    const upsertProvider = vi.fn(async () => ({ ok: true }));
     const verifyInferenceRoute = vi.fn();
     const verifyOnboardInferenceSmoke = vi.fn();
     const getGatewayName = vi.fn(() => "nemoclaw-9090");
@@ -161,6 +187,14 @@ describe("onboard shared gateway route containment", () => {
         events.push("lock");
         return await operation();
       },
+      withModelRouterPortLifecycleLock: async <T>(
+        port: number,
+        operation: () => Promise<T> | T,
+      ) => {
+        events.push(`router-port-lock:${String(port)}`);
+        return await operation();
+      },
+      getModelRouterPort: () => 4100,
       step: () => events.push("step"),
       getGatewayName,
       runOpenshell,
@@ -188,11 +222,21 @@ describe("onboard shared gateway route containment", () => {
     } as unknown as SetupInferenceDeps);
 
     await expect(
-      setupInference("new-sandbox", "model-b", "router-b", "http://router-b.test/v1", "ROUTER_KEY"),
+      setupInference(
+        "new-sandbox",
+        "model-b",
+        "router-b",
+        "http://router-b.test/v1",
+        "ROUTER_KEY",
+        null,
+        [],
+        { revalidateSandboxIdentity },
+      ),
     ).resolves.toEqual({ ok: true });
 
-    expect(events.slice(0, 4)).toEqual([
+    expect(events.slice(0, 5)).toEqual([
       "lock",
+      "router-port-lock:4100",
       "guard",
       expect.stringContaining("error:  Warning: Onboarding 'new-sandbox' will re-point"),
       "step",
@@ -208,6 +252,9 @@ describe("onboard shared gateway route containment", () => {
     expect(verifyInferenceRoute).toHaveBeenCalledWith("nemoclaw-9090", "router-b", "model-b");
     expect(verifyOnboardInferenceSmoke).toHaveBeenCalledOnce();
     expect(updateSandbox).toHaveBeenCalledOnce();
+    expect(events.indexOf("router-port-lock:4100")).toBeLessThan(
+      events.indexOf("registry-published"),
+    );
     expect(error).toHaveBeenCalledWith(expect.stringContaining("stopped-sandbox"));
     expect(exitProcess).not.toHaveBeenCalled();
   });
@@ -215,7 +262,7 @@ describe("onboard shared gateway route containment", () => {
   it("fails before provider mutation when endpoint or credential identity differs (#6315)", async () => {
     const runOpenshell = vi.fn(() => ({ status: 0 }));
     const updateSandbox = vi.fn(() => true);
-    const upsertProvider = vi.fn(() => ({ ok: true }));
+    const upsertProvider = vi.fn(async () => ({ ok: true }));
     const error = vi.fn();
     const exitProcess = vi.fn((code: number): never => {
       throw new Error(`exit ${code}`);
@@ -254,7 +301,7 @@ describe("onboard shared gateway route containment", () => {
         "KEY_B",
         null,
         [],
-        { preferredInferenceApi: "openai-completions" },
+        { preferredInferenceApi: "openai-completions", revalidateSandboxIdentity },
       ),
     ).rejects.toThrow("exit 1");
 
@@ -301,6 +348,7 @@ describe("onboard shared gateway route containment", () => {
         [],
         {
           reservationSessionId: "session-current",
+          revalidateSandboxIdentity,
           isRecordedProviderRecoveryAuthorized: () => {
             events.push("recovery-authority");
             return false;
@@ -363,11 +411,14 @@ describe("onboard shared gateway route containment", () => {
       withSandboxMutationLock: async <T>(_sandboxName: string, operation: () => Promise<T> | T) =>
         await operation(),
       withGatewayRouteMutationLock,
+      withModelRouterPortLifecycleLock: async <T>(_port: number, operation: () => Promise<T> | T) =>
+        await operation(),
+      getModelRouterPort: () => 4000,
       step: vi.fn(),
       getGatewayName: () => "nemoclaw",
       runOpenshell,
       updateSandbox,
-      upsertProvider: vi.fn(() => ({ ok: true })),
+      upsertProvider: vi.fn(async () => ({ ok: true })),
       verifyInferenceRoute: vi.fn(),
       verifyOnboardInferenceSmoke,
       isNonInteractive: () => true,
@@ -403,7 +454,7 @@ describe("onboard shared gateway route containment", () => {
       "ROUTER_KEY",
       null,
       [],
-      { endpointSource: "inference-set" },
+      { endpointSource: "inference-set", revalidateSandboxIdentity },
     );
     await vi.waitFor(() => expect(verifyOnboardInferenceSmoke).toHaveBeenCalledOnce());
     expect(reservations).toEqual([
@@ -422,6 +473,9 @@ describe("onboard shared gateway route containment", () => {
       "router-b",
       "http://router-b.test/v1",
       "ROUTER_KEY",
+      null,
+      [],
+      { revalidateSandboxIdentity },
     );
     const resultsPending = Promise.allSettled([firstSetup, secondSetup]);
     expect(runOpenshell).toHaveBeenCalledTimes(1);
@@ -442,6 +496,7 @@ describe("onboard shared gateway route containment", () => {
       preferredInferenceApi: null,
       gatewayName: "nemoclaw",
       reservationSessionId: undefined,
+      hostLocalInferenceReceipt: null,
     });
     expect(reservations).toHaveLength(2);
     expect(updateSandbox).toHaveBeenCalledTimes(2);
@@ -468,11 +523,14 @@ describe("onboard shared gateway route containment", () => {
         await operation(),
       withGatewayRouteMutationLock: async <T>(_name: string, operation: () => Promise<T> | T) =>
         await operation(),
+      withModelRouterPortLifecycleLock: async <T>(_port: number, operation: () => Promise<T> | T) =>
+        await operation(),
+      getModelRouterPort: () => 4000,
       step: vi.fn(),
       getGatewayName: () => "nemoclaw",
       runOpenshell: vi.fn(() => ({ status: 0 })),
       updateSandbox,
-      upsertProvider: vi.fn(() => ({ ok: true })),
+      upsertProvider: vi.fn(async () => ({ ok: true })),
       verifyInferenceRoute: vi.fn(),
       verifyOnboardInferenceSmoke: vi.fn(),
       isNonInteractive: () => true,
@@ -505,12 +563,89 @@ describe("onboard shared gateway route containment", () => {
         "ROUTER_KEY",
         null,
         [],
-        { skipHostInferenceSmoke: true, reservationSessionId: "session-gamma" },
+        {
+          skipHostInferenceSmoke: true,
+          reservationSessionId: "session-gamma",
+          revalidateSandboxIdentity,
+        },
       ),
     ).resolves.toEqual({ ok: true });
 
     expect(reservations).toEqual([
       expect.objectContaining({ name: "gamma", reservationSessionId: "session-gamma" }),
     ]);
+  });
+
+  it("releases an abandoned route reservation before the first reservation write (#11051)", async () => {
+    releaseAbandonedRouteReservation.mockReset().mockReturnValue(true);
+    const events: string[] = [];
+    releaseAbandonedRouteReservation.mockImplementation(() => {
+      events.push("release");
+      return true;
+    });
+    const updateSandbox = vi.fn(() => {
+      events.push("reserve");
+      return true;
+    });
+    const log = vi.fn();
+    const setupInference = createSetupInference({
+      checkGatewayRouteCompatibility: vi.fn(() => ({ ok: true as const })),
+      withSandboxMutationLock: async <T>(_name: string, operation: () => Promise<T> | T) =>
+        await operation(),
+      withGatewayRouteMutationLock: async <T>(_name: string, operation: () => Promise<T> | T) =>
+        await operation(),
+      withModelRouterPortLifecycleLock: async <T>(_port: number, operation: () => Promise<T> | T) =>
+        await operation(),
+      getModelRouterPort: () => 4000,
+      step: vi.fn(),
+      getGatewayName: () => "nemoclaw",
+      runOpenshell: vi.fn(() => ({ status: 0 })),
+      updateSandbox,
+      upsertProvider: vi.fn(() => ({ ok: true })),
+      verifyInferenceRoute: vi.fn(),
+      verifyOnboardInferenceSmoke: vi.fn(),
+      isNonInteractive: () => true,
+      hermesProviderAuth: { HERMES_PROVIDER_NAME: "hermes-provider" },
+      isRoutedInferenceProvider: () => true,
+      reconcileModelRouter: vi.fn(async () => undefined),
+      routedInference: {
+        upsertRoutedProvider: vi.fn(() => ({
+          ok: true,
+          endpointUrl: "http://router.test/v1",
+          result: { ok: true },
+        })),
+      },
+      hydrateCredentialEnv: vi.fn(() => "secret"),
+      redact: (value: string) => value,
+      compactText: (value: string) => value,
+      log,
+      error: vi.fn(),
+      exitProcess: vi.fn((code: number): never => {
+        throw new Error(`exit ${code}`);
+      }),
+    } as unknown as SetupInferenceDeps);
+
+    await expect(
+      setupInference(
+        "delta",
+        "model-d",
+        "router-d",
+        "http://router-d.test/v1",
+        "ROUTER_KEY",
+        null,
+        [],
+        {
+          skipHostInferenceSmoke: true,
+          reservationSessionId: "session-delta",
+          revalidateSandboxIdentity,
+        },
+      ),
+    ).resolves.toEqual({ ok: true });
+
+    expect(releaseAbandonedRouteReservation).toHaveBeenCalledWith("delta");
+    expect(events).toEqual(["release", "reserve"]);
+    expect(log).toHaveBeenCalledWith(
+      "  Released an abandoned inference route reservation for sandbox 'delta'.",
+    );
   });
 });

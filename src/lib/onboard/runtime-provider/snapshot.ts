@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { captureOpenshell } from "../../adapters/openshell/runtime";
+import type { SandboxRuntimeSnapshot } from "../../state/registry/runtime-snapshot";
 import type { SandboxEntry } from "../../state/registry/types";
 import { resolveSandboxGatewayName } from "../gateway-binding";
 import {
@@ -36,9 +37,15 @@ const SANDBOX_ID_PATTERN = /^[A-Za-z0-9._-]{1,512}$/u;
 const DOCKER_CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/u;
 const MANAGED_STARTUP_RUNTIME_EXECUTABLE =
   "/usr/local/lib/nemoclaw/managed-startup-image-runtime.cjs";
+// Dockerfile copies and validates this exact final-image path; the managed
+// startup hold and bootstrap trampoline invoke the same 0444 runtime through it.
+const MANAGED_STARTUP_NODE_EXECUTABLE = "/usr/local/bin/node";
 const LIFECYCLE_GENERATION_PATTERN = /^[A-Za-z0-9._:/=-]{1,512}$/u;
 const ANSI_PATTERN = /\u001b\[[0-9;]*m/gu;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
+const CONTROL_CHARACTERS_GLOBAL = /[\u0000-\u001f\u007f-\u009f]/gu;
+const TERMINAL_CONTROL_SEQUENCE =
+  /(?:\u001b\[[0-?]*[ -/]*[@-~]|\u009b[0-?]*[ -/]*[@-~]|(?:\u001b\]|\u009d)(?:[^\u0007\u001b\u009c]|\u001b(?!\\))*(?:\u0007|\u001b\\|\u009c)|\u001b[ -/]*[@-~])/gu;
 
 export interface RuntimeProviderSnapshotObservation {
   readonly lifecycleState: RuntimeProviderSnapshotLifecycleState;
@@ -54,11 +61,16 @@ export type RuntimeProviderSnapshotObserver = (
 export type RuntimeProviderManagedProfileRestorer = (
   sandbox: SandboxEntry,
   authority: RuntimeProviderManagedProfileRestoreAuthority,
+  runtime: RuntimeProviderRuntimeReceipt,
 ) => string;
 
 export interface RuntimeProviderSnapshotDriver {
   readonly observe: RuntimeProviderSnapshotObserver;
   readonly restoreManagedProfile: RuntimeProviderManagedProfileRestorer;
+  readonly canRepresentAcceleration?: (
+    source: RuntimeProviderRuntimeReceipt["acceleration"],
+    target: RuntimeProviderRuntimeReceipt["acceleration"],
+  ) => boolean;
 }
 
 export interface OpenShellRuntimeSnapshotDependencies {
@@ -79,7 +91,6 @@ export interface DockerRuntimeSnapshotDependencies {
     args: string[],
     timeout?: number,
   ) => RuntimeProviderCommandCapture;
-  readonly captureOpenShell: typeof captureOpenshell;
   readonly queryRuntimeSnapshot: (
     sandboxName: string,
   ) => OpenShellDockerSandboxRuntimeSnapshotQuery;
@@ -99,30 +110,30 @@ function gatewayScopedSandboxGetArgs(sandbox: SandboxEntry): string[] {
     : ["sandbox", "get", sandbox.name];
 }
 
-function gatewayScopedManagedProfileVerifyArgs(
-  sandbox: SandboxEntry,
-  authority: RuntimeProviderManagedProfileRestoreAuthority,
-): string[] {
-  const args = ["sandbox", "exec", "--name", sandbox.name];
-  const gatewayName = resolveSandboxGatewayName(sandbox);
-  if (gatewayName) args.push("-g", gatewayName);
-  args.push(
-    "--no-tty",
-    "--timeout",
-    "10",
-    "--",
-    MANAGED_STARTUP_RUNTIME_EXECUTABLE,
-    "--verify-completion",
-    "--agent",
-    authority.agent,
-    "--profile-fingerprint",
-    authority.profileFingerprint,
-  );
-  return args;
-}
-
 function cleanOutput(value: string): string {
   return value.replace(ANSI_PATTERN, "");
+}
+
+function cleanDiagnostic(value: string): string {
+  return value.replace(TERMINAL_CONTROL_SEQUENCE, "").replace(CONTROL_CHARACTERS_GLOBAL, "");
+}
+
+function managedProfileVerificationFailureDetail(result: RuntimeProviderCommandCapture): string {
+  // This command accepts only a validated agent and secret-free profile hash;
+  // bound its fixed-runtime diagnostic so restore failures remain actionable.
+  const output = cleanDiagnostic([result.stderr, result.stdout].filter(Boolean).join("\n"))
+    .replace(/\s+/gu, " ")
+    .trim();
+  const error = cleanDiagnostic(result.error?.message ?? "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return [
+    `status=${result.status}`,
+    ...(error ? [`error=${error}`] : []),
+    ...(output ? [`output=${output}`] : []),
+  ]
+    .join("; ")
+    .slice(0, 1024);
 }
 
 function parseSandboxId(output: string): string | null {
@@ -215,19 +226,134 @@ export function observeOpenShellRuntimeSnapshot(
   };
 }
 
-function dockerRequestUsesGpu(
+function dockerNvidiaGpuRequestSelectors(
   request: NonNullable<
     Extract<OpenShellDockerSandboxRuntimeSnapshotQuery, { ok: true }>["deviceRequests"]
   >[number],
-): boolean {
-  return (
-    request.Driver.trim().toLowerCase() === "nvidia" ||
-    request.DeviceIDs?.some((device) => /^nvidia[.]com\/gpu(?:=|$)/iu.test(device.trim())) ===
-      true ||
+): readonly string[] | null {
+  const driver = request.Driver.trim().toLowerCase();
+  const deviceIds = request.DeviceIDs ?? [];
+  const hasGpuCapability =
     request.Capabilities?.some((group) =>
       group.some((capability) => capability.trim().toLowerCase() === "gpu"),
-    ) === true
+    ) === true;
+  const hasNvidiaCdiSelector = deviceIds.some((device) =>
+    /^nvidia[.]com\/gpu=/iu.test(device.trim()),
   );
+  if (driver !== "nvidia" && !hasNvidiaCdiSelector && !hasGpuCapability) return null;
+
+  if (deviceIds.length > 0) {
+    if (driver === "nvidia" || (driver === "" && hasGpuCapability)) return deviceIds;
+    if (
+      ["", "cdi"].includes(driver) &&
+      deviceIds.every((device) => /^nvidia[.]com\/gpu=/iu.test(device.trim()))
+    ) {
+      return deviceIds;
+    }
+    throw new RuntimeProviderSnapshotError(
+      "Docker GPU attachment does not prove NVIDIA acceleration authority",
+    );
+  }
+  if (request.Count === -1 && ["", "nvidia"].includes(driver)) return ["all"];
+  throw new RuntimeProviderSnapshotError(
+    driver && !["nvidia", "cdi"].includes(driver)
+      ? "Docker GPU attachment does not prove NVIDIA acceleration authority"
+      : "Docker GPU attachment does not expose exact live device selectors",
+  );
+}
+
+function canonicalNvidiaGpuSelector(device: string): string {
+  const identifier = device.trim().replace(/^nvidia[.]com\/gpu=/iu, "");
+  if (!identifier || identifier.includes("=") || CONTROL_CHARACTERS.test(identifier)) {
+    throw new RuntimeProviderSnapshotError(
+      "Docker GPU attachment does not expose exact live device selectors",
+    );
+  }
+  return identifier.toLowerCase() === "all" ? "nvidia.com/gpu=all" : `nvidia.com/gpu=${identifier}`;
+}
+
+function canonicalDockerGpuSelection(devices: readonly string[]): readonly string[] {
+  const selectors = [...new Set(devices.map(canonicalNvidiaGpuSelector))].sort();
+  if (selectors.includes("nvidia.com/gpu=all") && selectors.length !== 1) {
+    throw new RuntimeProviderSnapshotError(
+      "Docker GPU attachment exposes conflicting live device selectors",
+    );
+  }
+  return selectors;
+}
+
+function canonicalDockerAcceleration(
+  acceleration: RuntimeProviderRuntimeReceipt["acceleration"],
+): RuntimeProviderRuntimeReceipt["acceleration"] | null {
+  if (acceleration.kind === "none") return acceleration;
+  if (acceleration.vendor.toLowerCase() !== "nvidia") return null;
+  const gpuSelectors: string[] = [];
+  const pathSelectors: string[] = [];
+  for (const selector of acceleration.devices) {
+    if (selector.startsWith("docker-device-path:")) {
+      pathSelectors.push(selector);
+      continue;
+    }
+    if (
+      selector === "docker-nvidia-visible-devices:all" ||
+      selector === "docker-device-request:nvidia:count=-1"
+    ) {
+      gpuSelectors.push("all");
+      continue;
+    }
+    const legacyDevice = selector.match(
+      /^docker-(?:device-id:(nvidia[.]com\/gpu=.+)|nvidia-visible-device:(.+))$/u,
+    );
+    if (legacyDevice) {
+      gpuSelectors.push(legacyDevice[1] ?? legacyDevice[2]);
+      continue;
+    }
+    if (/^nvidia[.]com\/gpu=/iu.test(selector)) {
+      gpuSelectors.push(selector);
+      continue;
+    }
+    return null;
+  }
+  try {
+    const devices = [
+      ...canonicalDockerGpuSelection(gpuSelectors),
+      ...new Set(pathSelectors),
+    ].sort();
+    return gpuSelectors.length > 0 ? { kind: "gpu", vendor: "nvidia", devices } : null;
+  } catch {
+    return null;
+  }
+}
+
+function dockerCanRepresentAcceleration(
+  source: RuntimeProviderRuntimeReceipt["acceleration"],
+  target: RuntimeProviderRuntimeReceipt["acceleration"],
+): boolean {
+  const canonicalSource = canonicalDockerAcceleration(source);
+  const canonicalTarget = canonicalDockerAcceleration(target);
+  return Boolean(
+    canonicalSource && canonicalTarget && isDeepStrictEqual(canonicalSource, canonicalTarget),
+  );
+}
+
+/**
+ * Resolve the exact Docker-owned GPU selector that can replay a captured
+ * runtime snapshot during an authoritative rebuild. Device-path evidence is
+ * retained by restore validation, but it is not a sandbox-create selector.
+ */
+export function resolveDockerSnapshotRecreateGpuDevice(
+  snapshot: SandboxRuntimeSnapshot,
+): string | null {
+  if (snapshot.providerId !== "docker" || snapshot.runtime.providerId !== "docker") return null;
+  const acceleration = canonicalDockerAcceleration(snapshot.runtime.acceleration);
+  if (!acceleration || acceleration.kind === "none") return null;
+  const selectors = acceleration.devices.filter((device) => /^nvidia[.]com\/gpu=/iu.test(device));
+  if (selectors.length !== 1) {
+    throw new RuntimeProviderSnapshotError(
+      "Docker snapshot acceleration cannot be replayed by one sandbox GPU selector",
+    );
+  }
+  return selectors[0] ?? null;
 }
 
 function dockerGpuSelectors(
@@ -238,35 +364,29 @@ function dockerGpuSelectors(
     throw new RuntimeProviderSnapshotError("Docker returned ambiguous live acceleration evidence");
   }
 
-  const selectors: string[] = [];
+  const selections: string[][] = [];
   if (snapshot.runtime.trim().toLowerCase() === "nvidia") {
     const visibleDevices = snapshot.nvidiaVisibleDevices;
     if (visibleDevices === "all") {
-      selectors.push("docker-nvidia-visible-devices:all");
+      selections.push(["all"]);
     } else if (visibleDevices && !["none", "void"].includes(visibleDevices)) {
-      for (const device of visibleDevices.split(",")) {
-        selectors.push(`docker-nvidia-visible-device:${device}`);
-      }
+      selections.push(visibleDevices.split(","));
     }
   }
+  const requestedDevices: string[] = [];
   for (const request of snapshot.deviceRequests ?? []) {
-    if (!dockerRequestUsesGpu(request)) continue;
-    if (request.DeviceIDs && request.DeviceIDs.length > 0) {
-      for (const device of request.DeviceIDs) {
-        selectors.push(`docker-device-id:${device}`);
-      }
-      continue;
-    }
-    if (request.Count === -1) {
-      // Count=-1 is Docker's explicit live all-device selector. Never infer
-      // this value from a durable "GPU enabled" flag.
-      selectors.push(`docker-device-request:${request.Driver || "default"}:count=-1`);
-      continue;
-    }
+    const selectors = dockerNvidiaGpuRequestSelectors(request);
+    if (selectors) requestedDevices.push(...selectors);
+  }
+  if (requestedDevices.length > 0) selections.push(requestedDevices);
+  const canonicalSelections = selections.map(canonicalDockerGpuSelection);
+  const selectedDevices = canonicalSelections[0] ?? [];
+  if (canonicalSelections.some((selection) => !isDeepStrictEqual(selection, selectedDevices))) {
     throw new RuntimeProviderSnapshotError(
-      "Docker GPU attachment does not expose exact live device selectors",
+      "Docker GPU attachment exposes conflicting live device selectors",
     );
   }
+  const selectors = [...selectedDevices];
   for (const mapping of snapshot.devices ?? []) {
     const rendered =
       `docker-device-path:${mapping.PathOnHost}=>${mapping.PathInContainer}` +
@@ -280,7 +400,7 @@ function dockerGpuSelectors(
   }
   const devices = [...new Set(selectors)].sort();
   if (
-    devices.length === 0 ||
+    selectedDevices.length === 0 ||
     devices.some(
       (device) =>
         device.trim() === "" ||
@@ -396,26 +516,56 @@ export function observeDockerRuntimeSnapshot(
   };
 }
 
-export function verifyOpenShellManagedProfileRestore(
+export function verifyDockerManagedProfileRestore(
   sandbox: SandboxEntry,
   authorityValue: RuntimeProviderManagedProfileRestoreAuthority,
-  dependencies: Pick<DockerRuntimeSnapshotDependencies, "captureOpenShell">,
+  runtimeValue: RuntimeProviderRuntimeReceipt,
+  dependencies: Pick<DockerRuntimeSnapshotDependencies, "captureHostCommand">,
 ): string {
   const authority = normalizeRuntimeProviderManagedProfileRestoreAuthority(authorityValue);
   if (!authority) {
     throw new RuntimeProviderSnapshotError("managed profile restore authority is invalid");
   }
-  const result = dependencies.captureOpenShell(
-    gatewayScopedManagedProfileVerifyArgs(sandbox, authority),
-    {
-      ignoreError: true,
-      includeStderr: true,
-      timeout: 15_000,
-    },
-  );
-  if (result.status !== 0 || result.error || result.signal) {
+  const runtime = normalizeRuntimeProviderRuntimeReceipt(runtimeValue);
+  if (
+    !runtime ||
+    runtime.runtime.kind !== "docker-container" ||
+    !DOCKER_CONTAINER_ID_PATTERN.test(runtime.runtime.handle)
+  ) {
     throw new RuntimeProviderSnapshotError(
-      `sandbox '${sandbox.name}' managed profile restoration could not be proven`,
+      `sandbox '${sandbox.name}' exact Docker runtime identity could not be inspected`,
+    );
+  }
+  // The completion handoff is deliberately root-owned under /run/nemoclaw and
+  // therefore outside an ordinary Landlock-confined sandbox exec. The Docker
+  // provider pins this fixed verifier to the exact live container ID, runs no
+  // user-supplied command, and clears the inherited host environment.
+  const result = dependencies.captureHostCommand(
+    "docker",
+    [
+      "exec",
+      "--user",
+      "root",
+      runtime.runtime.handle,
+      "/usr/bin/env",
+      "-i",
+      "HOME=/root",
+      "LANG=C.UTF-8",
+      "LC_ALL=C.UTF-8",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      MANAGED_STARTUP_NODE_EXECUTABLE,
+      MANAGED_STARTUP_RUNTIME_EXECUTABLE,
+      "--verify-completion",
+      "--agent",
+      authority.agent,
+      "--profile-fingerprint",
+      authority.profileFingerprint,
+    ],
+    15_000,
+  );
+  if (result.status !== 0 || result.error) {
+    throw new RuntimeProviderSnapshotError(
+      `sandbox '${sandbox.name}' managed profile restoration could not be proven (${managedProfileVerificationFailureDetail(result)})`,
     );
   }
   return createHash("sha256")
@@ -425,7 +575,7 @@ export function verifyOpenShellManagedProfileRestore(
     .update("\0", "utf8")
     .update(authority.profileFingerprint, "utf8")
     .update("\0", "utf8")
-    .update(cleanOutput(result.output || ""), "utf8")
+    .update(cleanOutput(result.stdout), "utf8")
     .digest("hex");
 }
 
@@ -541,6 +691,7 @@ function validateRestoreRequest(
   readonly expected: RuntimeProviderSnapshotPreflightReceipt;
   readonly source: RuntimeProviderSnapshotRestoreSource;
   readonly managedProfile: RuntimeProviderManagedProfileRestoreAuthority;
+  readonly observed: RuntimeProviderSnapshotObservation;
 } {
   const expected = requireStablePreflight(preflightValue, providerId, "restore", sandbox);
   const source = normalizeRuntimeProviderSnapshotRestoreSource(sourceValue);
@@ -574,12 +725,13 @@ function validateRestoreRequest(
   }
   const observed = observeAndNormalize(driver.observe, sandbox, providerId);
   assertUnchanged(providerId, expected, observed);
-  if (!isDeepStrictEqual(source.runtime.acceleration, observed.runtime.acceleration)) {
+  const canRepresentAcceleration = driver.canRepresentAcceleration ?? isDeepStrictEqual;
+  if (!canRepresentAcceleration(source.runtime.acceleration, observed.runtime.acceleration)) {
     throw new RuntimeProviderSnapshotError(
       `sandbox '${sandbox.name}' cannot represent the snapshot acceleration state`,
     );
   }
-  return { expected, source, managedProfile };
+  return { expected, source, managedProfile, observed };
 }
 
 export function createRuntimeProviderSnapshotSurface(
@@ -614,11 +766,12 @@ export function createRuntimeProviderSnapshotSurface(
       assertUnchanged(providerId, expected, observed);
       return observed.runtime;
     },
+    canRepresentAcceleration: driver.canRepresentAcceleration,
     validateRestore(sandbox, preflight, source, managedProfile) {
       validateRestoreRequest(providerId, driver, sandbox, preflight, source, managedProfile);
     },
     restore(sandbox, preflight, sourceValue, managedProfileValue) {
-      const { expected, source, managedProfile } = validateRestoreRequest(
+      const { expected, source, managedProfile, observed } = validateRestoreRequest(
         providerId,
         driver,
         sandbox,
@@ -626,7 +779,7 @@ export function createRuntimeProviderSnapshotSurface(
         sourceValue,
         managedProfileValue,
       );
-      const providerProof = driver.restoreManagedProfile(sandbox, managedProfile);
+      const providerProof = driver.restoreManagedProfile(sandbox, managedProfile, observed.runtime);
       if (
         typeof providerProof !== "string" ||
         providerProof.trim() === "" ||
@@ -667,13 +820,13 @@ export function createDockerRuntimeProviderSnapshotSurface(
 ): RuntimeProviderSnapshotSurface {
   const resolved = {
     captureHostCommand: dependencies.captureHostCommand,
-    captureOpenShell: dependencies.captureOpenShell ?? captureOpenshell,
     queryRuntimeSnapshot:
       dependencies.queryRuntimeSnapshot ?? queryOpenShellDockerSandboxRuntimeSnapshot,
   };
   return createRuntimeProviderSnapshotSurface(providerId, {
     observe: (sandbox, id) => observeDockerRuntimeSnapshot(sandbox, id, resolved),
-    restoreManagedProfile: (sandbox, authority) =>
-      verifyOpenShellManagedProfileRestore(sandbox, authority, resolved),
+    canRepresentAcceleration: dockerCanRepresentAcceleration,
+    restoreManagedProfile: (sandbox, authority, runtime) =>
+      verifyDockerManagedProfileRestore(sandbox, authority, runtime, resolved),
   });
 }

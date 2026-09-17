@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { decisionSelected, decisionUnset } from "../../../state/onboard-checkpoint-decision";
 import { deriveCheckpointFromSession } from "../../../state/onboard-checkpoint-migrate";
 import type { CheckpointSandboxIdentity } from "../../../state/onboard-checkpoint-types";
-import { createSession, type SessionUpdates } from "../../../state/onboard-session";
+import { createSession } from "../../../state/onboard-session";
 import {
   handleProviderInferenceState,
   type ProviderInferenceStateOptions,
@@ -49,13 +49,14 @@ describe("handleProviderInferenceState", () => {
     expect(calls.startStep).toHaveBeenNthCalledWith(1, "provider_selection");
     expect(calls.setupNim).toHaveBeenCalledWith(
       { type: "nvidia" },
-      null,
+      "my-assistant",
       null,
       true,
       "nemoclaw",
       expect.any(Function),
       expect.any(Function),
       session.sessionId,
+      expect.any(Function),
     );
     const selectionUpdates = (
       calls.complete.mock.calls as unknown as Array<[string, Record<string, unknown>]>
@@ -275,6 +276,7 @@ describe("handleProviderInferenceState", () => {
       expect.any(Function),
       expect.any(Function),
       session.sessionId,
+      expect.any(Function),
     );
     expect(calls.setupInference).toHaveBeenCalled();
   });
@@ -635,36 +637,39 @@ describe("handleProviderInferenceState", () => {
   it.each([
     ["is unset", decisionUnset<CheckpointSandboxIdentity>()],
     ["names another sandbox", decisionSelected({ name: "other-sandbox", agent: "openclaw" })],
-  ])("prompts before route reservation when the checkpoint identity %s", async (_label, identity) => {
-    const session = createSession({
-      sandboxName: "stale-sandbox",
-      provider: "nvidia-prod",
-      model: "nvidia/nemotron-test",
-      endpointUrl: "https://integrate.api.nvidia.com/v1",
-      credentialEnv: "NVIDIA_INFERENCE_API_KEY",
-      preferredInferenceApi: "openai-responses",
-    });
-    session.steps.provider_selection.status = "complete";
-    session.checkpoint = {
-      ...deriveCheckpointFromSession(session),
-      sandboxIdentity: identity,
-    };
-    const { deps, calls } = createDeps({ isInferenceRouteReady: vi.fn(() => true) });
-    calls.promptName.mockResolvedValueOnce("prompted-sandbox");
+  ])(
+    "prompts before route reservation when the checkpoint identity %s",
+    async (_label, identity) => {
+      const session = createSession({
+        sandboxName: "stale-sandbox",
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-test",
+        endpointUrl: "https://integrate.api.nvidia.com/v1",
+        credentialEnv: "NVIDIA_INFERENCE_API_KEY",
+        preferredInferenceApi: "openai-responses",
+      });
+      session.steps.provider_selection.status = "complete";
+      session.checkpoint = {
+        ...deriveCheckpointFromSession(session),
+        sandboxIdentity: identity,
+      };
+      const { deps, calls } = createDeps({ isInferenceRouteReady: vi.fn(() => true) });
+      calls.promptName.mockResolvedValueOnce("prompted-sandbox");
 
-    const result = await handleProviderInferenceState({
-      ...baseOptions(deps, session),
-      resume: true,
-      sandboxName: "stale-sandbox",
-    });
+      const result = await handleProviderInferenceState({
+        ...baseOptions(deps, session),
+        resume: true,
+        sandboxName: "stale-sandbox",
+      });
 
-    expect(calls.promptName).toHaveBeenCalledWith(null);
-    expect(calls.reserveRoute).toHaveBeenCalledWith(
-      "prompted-sandbox",
-      expect.objectContaining({ reservationSessionId: session.sessionId }),
-    );
-    expect(result.sandboxName).toBe("prompted-sandbox");
-  });
+      expect(calls.promptName).toHaveBeenCalledWith(null);
+      expect(calls.reserveRoute).toHaveBeenCalledWith(
+        "prompted-sandbox",
+        expect.objectContaining({ reservationSessionId: session.sessionId }),
+      );
+      expect(result.sandboxName).toBe("prompted-sandbox");
+    },
+  );
 
   it("does not reserve a route when resume skips inference after sandbox completion (#6562)", async () => {
     const session = createSession({
@@ -697,7 +702,7 @@ describe("handleProviderInferenceState", () => {
     const completedSelection = createSession({ sessionId: "resume-selection-session" });
     const { deps, calls } = createDeps({ isInferenceRouteReady: vi.fn(() => true) });
     calls.complete.mockResolvedValueOnce(completedSelection);
-    calls.promptName.mockResolvedValueOnce("tm");
+    calls.promptName.mockResolvedValue("tm");
 
     const result = await handleProviderInferenceState({
       ...baseOptions(deps, session),
@@ -1071,6 +1076,7 @@ describe("handleProviderInferenceState", () => {
       expect.any(Function),
       expect.any(Function),
       session.sessionId,
+      expect.any(Function),
     );
     expect(setupInference).toHaveBeenCalledWith(
       "my-assistant",
@@ -1381,13 +1387,14 @@ describe("handleProviderInferenceState", () => {
     expect(setupNim).toHaveBeenNthCalledWith(
       1,
       { type: "nvidia" },
-      null,
+      "my-assistant",
       null,
       true,
       "nemoclaw",
       expect.any(Function),
       expect.any(Function),
       expect.any(String),
+      expect.any(Function),
     );
     expect(setupNim).toHaveBeenNthCalledWith(
       2,
@@ -1399,6 +1406,7 @@ describe("handleProviderInferenceState", () => {
       expect.any(Function),
       expect.any(Function),
       expect.any(String),
+      expect.any(Function),
     );
     expect(setupInference).toHaveBeenCalledTimes(2);
     expect(result.model).toBe("good");

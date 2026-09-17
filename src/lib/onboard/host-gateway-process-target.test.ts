@@ -5,13 +5,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  buildDockerDriverGatewayConfigToml,
+  ensureDockerDriverGatewayJwtBundle,
   gatewayIdForStateDir,
   NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
 } from "./docker-driver-gateway-config";
 import { writeDockerDriverGatewayRuntimeMarkerForStateDir } from "./docker-driver-gateway-runtime-marker";
+import { prepareNativePodmanGatewayHostRuntime } from "./runtime-provider/podman-runtime-surfaces";
 import {
   HOST_GATEWAY_PGREP_PATTERN,
   type HostGatewayProcessDeps,
@@ -20,6 +23,18 @@ import {
 } from "./host-gateway-process";
 
 const PGREP_KEY = `pgrep -f ${HOST_GATEWAY_PGREP_PATTERN}`;
+const tempRoots = new Set<string>();
+
+afterEach(() => {
+  for (const root of tempRoots) fs.rmSync(root, { recursive: true, force: true });
+  tempRoots.clear();
+});
+
+function makeTempRoot(prefix: string): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempRoots.add(root);
+  return root;
+}
 
 type RunResponse = (args: string[]) => RunResult;
 
@@ -50,6 +65,7 @@ function psResponses(
     cmdline: string | (() => string);
     exited: Set<number>;
     processStatus?: RunResult;
+    provider?: "docker" | "podman";
   },
 ): [string, RunResponse][] {
   return [
@@ -76,22 +92,48 @@ function stopScopedTarget(
     pidFilePid?: number;
     port?: number;
     processStatus?: RunResult;
+    provider?: "docker" | "podman";
     signalDenied?: boolean;
   } = {},
 ) {
   const selectedPid = 9_999_601;
   const pid = overrides.pidFilePid ?? selectedPid;
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-scoped-target-"));
+  const stateDir = makeTempRoot("nemoclaw-scoped-target-");
+  const provider = overrides.provider ?? "docker";
   const pidFile = path.join(stateDir, "openshell-gateway.pid");
   fs.writeFileSync(pidFile, `${String(pid)}\n`);
+  const jwtBundle = ensureDockerDriverGatewayJwtBundle(stateDir);
   fs.writeFileSync(
     path.join(stateDir, "openshell-gateway.toml"),
-    `[openshell.drivers.docker]\nsandbox_namespace = "${gatewayIdForStateDir(stateDir)}"\n`,
+    buildDockerDriverGatewayConfigToml(
+      {
+        OPENSHELL_GRPC_ENDPOINT:
+          provider === "podman" ? "https://169.254.2.2:18080" : "https://127.0.0.1:18080",
+        OPENSHELL_LOCAL_TLS_DIR: path.join(stateDir, "tls"),
+        OPENSHELL_DOCKER_NETWORK_NAME: "openshell-docker",
+        OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "supervisor:test",
+        ...(provider === "podman"
+          ? { OPENSHELL_PODMAN_SOCKET: path.join(stateDir, "podman.sock") }
+          : {}),
+      },
+      "/usr/bin/openshell-sandbox",
+      jwtBundle,
+      gatewayIdForStateDir(stateDir),
+      provider === "podman"
+        ? prepareNativePodmanGatewayHostRuntime({
+            environment: {},
+            platform: "linux",
+            socketPath: path.join(stateDir, "podman.sock"),
+          })
+        : undefined,
+    ),
+    { mode: 0o600 },
   );
   writeDockerDriverGatewayRuntimeMarkerForStateDir(stateDir, {
-    desiredEnv: {},
+    desiredEnv: { NEMOCLAW_RUNTIME_PROVIDER_ID: provider },
     endpoint: `https://127.0.0.1:${String(overrides.markerPort ?? 18080)}`,
     pid: selectedPid,
+    platform: provider === "podman" ? "linux" : process.platform,
   });
   const exited = new Set<number>();
   const markExited = (pid: number): true => {
@@ -149,7 +191,7 @@ function stopScopedTarget(
 }
 
 function stopTargetedPid(pid: number, cmdline: string, targeted = true) {
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-host-gateway-target-"));
+  const stateDir = makeTempRoot("nemoclaw-host-gateway-target-");
   const pidFile = path.join(stateDir, "openshell-gateway.pid");
   fs.writeFileSync(pidFile, `${pid}\n`);
   const exited = new Set<number>();
@@ -192,6 +234,21 @@ describe("stopHostGatewayProcesses target filtering", () => {
     expect(kill).toHaveBeenCalledWith(9_999_601, "SIGTERM");
     expect(run.mock.calls.some(([command]) => command === "pgrep")).toBe(false);
     expect(fs.existsSync(pidFile)).toBe(false);
+  });
+
+  it("uses the native provider runtime marker when its gateway schema omits namespaces", () => {
+    const platform = vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+    try {
+      const { kill, pidFile, result, run } = stopScopedTarget({ provider: "podman" });
+
+      expect(result.stopped).toEqual([9_999_601]);
+      expect(result.ownershipFailures).toEqual([]);
+      expect(kill).toHaveBeenCalledWith(9_999_601, "SIGTERM");
+      expect(run.mock.calls.some(([command]) => command === "pgrep")).toBe(false);
+      expect(fs.existsSync(pidFile)).toBe(false);
+    } finally {
+      platform.mockRestore();
+    }
   });
 
   it.each([

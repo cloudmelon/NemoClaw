@@ -34,6 +34,7 @@ describe("NVIDIA featured model catalog", () => {
         JSON.stringify({
           "featured-models": [
             { model: "z-ai/glm-5.1", "model-name": "GLM 5.1" },
+            { model: "z-ai/glm-5.2", "model-name": "GLM 5.2" },
             { model: "moonshotai/kimi-k2.6", "model-name": "Kimi K2.6" },
             {
               model: "nvidia/nemotron-3-super-120b-a12b",
@@ -313,6 +314,33 @@ describe("NVIDIA featured model catalog", () => {
     expect(options.cloudModelOptions.map((option) => option.id)).not.toContain(
       "moonshotai/kimi-k2.6",
     );
+  });
+
+  it("filters retired featured-feed entries the live NVIDIA catalog no longer serves (#9611, #10222)", () => {
+    const options = getNvidiaFeaturedModelPromptOptions(null, {
+      runCurlProbeImpl: () => ({
+        ok: true,
+        httpStatus: 200,
+        curlStatus: 0,
+        body: JSON.stringify({
+          "featured-models": [
+            { model: "nvidia/nemotron-3-ultra-550b-a55b", "model-name": "Nemotron 3 Ultra 550B" },
+            { model: "nemotron-3-super-120b-a12b", "model-name": "Nemotron 3 Super 120B" },
+            { model: "z-ai/glm-5.2", "model-name": "GLM 5.2" },
+            { model: "minimaxai/minimax-m3", "model-name": "Minimax M3" },
+            { model: "deepseek-ai/deepseek-v4-pro", "model-name": "DeepSeek V4 Pro" },
+          ],
+        }),
+        stderr: "",
+        message: "",
+      }),
+    });
+
+    expect(options.cloudModelOptions.map((option) => option.id)).toEqual([
+      "nvidia/nemotron-3-ultra-550b-a55b",
+      "nvidia/nemotron-3-super-120b-a12b",
+      "minimaxai/minimax-m3",
+    ]);
   });
 
   it("reuses one featured catalog lookup but recomputes defaults across onboarding retries", () => {

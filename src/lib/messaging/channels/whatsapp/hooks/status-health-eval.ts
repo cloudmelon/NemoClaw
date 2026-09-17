@@ -15,11 +15,7 @@
  * paired-but-idle channel cannot be mistaken for working.
  */
 
-import type {
-  ChannelHealthReport,
-  DiagnosticSeverity,
-  DiagnosticSignal,
-} from "../../channel-health";
+import type { ChannelHealthReport, DiagnosticSignal } from "../../channel-health";
 
 export type { DiagnosticSeverity, DiagnosticSignal } from "../../channel-health";
 
@@ -79,7 +75,7 @@ export type WhatsappProbeInput = {
   // depending on the system clock.
   probedAt: string;
   // Whether the whatsapp preset is recorded in the sandbox registry.
-  presetInRegistry: boolean;
+  presetApplied: boolean;
   // Whether the whatsapp preset's network policy is loaded on the gateway,
   // or null when the gateway could not be reached.
   presetOnGateway: boolean | null;
@@ -93,6 +89,8 @@ export type WhatsappProbeInput = {
 export type WhatsappSessionLocations = {
   gatewaySessionCreds: boolean | null;
   dashboardSessionCreds: boolean | null;
+  gatewaySessionPathSource?: "default" | "config" | "unsupported";
+  gatewaySessionDir?: string;
 };
 
 /**
@@ -186,7 +184,8 @@ function hermesDashboardOnlySession(input: WhatsappProbeInput): boolean {
   return (
     input.agent === "hermes" &&
     input.sessionLocations?.gatewaySessionCreds === false &&
-    input.sessionLocations.dashboardSessionCreds === true
+    input.sessionLocations.dashboardSessionCreds === true &&
+    input.sessionLocations.gatewaySessionPathSource !== "config"
   );
 }
 
@@ -195,6 +194,23 @@ function sessionLocationSignal(input: WhatsappProbeInput): DiagnosticSignal | nu
   if (!locations) return null;
   const gateway = locations.gatewaySessionCreds;
   const dashboard = locations.dashboardSessionCreds;
+  if (locations.gatewaySessionPathSource === "config" && gateway !== null) {
+    const configuredPath = locations.gatewaySessionDir
+      ? ` at \`${locations.gatewaySessionDir}\``
+      : "";
+    return gateway
+      ? {
+          label: "Session location",
+          severity: "ok",
+          detail: `the configured Hermes WhatsApp session path${configuredPath} contains credentials`,
+        }
+      : {
+          label: "Session location",
+          severity: "warn",
+          detail: `the configured Hermes WhatsApp session path${configuredPath} has no WhatsApp credentials`,
+          hint: "pair WhatsApp again, or set `platforms.whatsapp.extra.session_path` to the session path that holds the credentials",
+        };
+  }
   if (gateway === false && dashboard === true) {
     return {
       label: "Session location",
@@ -231,6 +247,29 @@ function sessionLocationSignal(input: WhatsappProbeInput): DiagnosticSignal | nu
     severity: "info",
     detail: "Hermes session paths could not be inspected",
   };
+}
+
+function sessionPathOverrideSignal(input: WhatsappProbeInput): DiagnosticSignal | null {
+  const source = input.sessionLocations?.gatewaySessionPathSource;
+  if (source === "config") {
+    return {
+      label: "Session path override",
+      severity: "info",
+      detail:
+        "the gateway session check used the path set in `platforms.whatsapp.extra.session_path`",
+      hint: "remove the override after Hermes uses one WhatsApp session path for dashboard pairing and gateway startup",
+    };
+  }
+  if (source === "unsupported") {
+    return {
+      label: "Session path override",
+      severity: "warn",
+      detail:
+        "`platforms.whatsapp.extra.session_path` is not a supported session path, so the gateway session check used the default path",
+      hint: "set `platforms.whatsapp.extra.session_path` to an absolute path under `/sandbox/.hermes` that has no `.` or `..` segment",
+    };
+  }
+  return null;
 }
 
 function websocketSignal(input: WhatsappProbeInput): DiagnosticSignal {
@@ -339,7 +378,7 @@ function inboundSignal(input: WhatsappProbeInput): DiagnosticSignal {
 }
 
 function policyCoverageSignal(input: WhatsappProbeInput): DiagnosticSignal {
-  if (input.presetOnGateway === false && input.presetInRegistry) {
+  if (input.presetOnGateway === false && input.presetApplied) {
     return {
       label: "Policy coverage",
       severity: "fail",
@@ -347,7 +386,7 @@ function policyCoverageSignal(input: WhatsappProbeInput): DiagnosticSignal {
       hint: "rebuild the sandbox so the preset is reapplied to the OpenShell gateway",
     };
   }
-  if (!input.presetInRegistry) {
+  if (!input.presetApplied) {
     // A missing local preset is a deterministic gap regardless of gateway
     // reachability — the next rebuild will not reapply WhatsApp egress and
     // the channel will eventually fail closed. Treat it as a fail so the
@@ -513,10 +552,12 @@ function buildHints(verdict: WhatsappVerdict, input: WhatsappProbeInput): string
 
 export function evaluateWhatsappDiagnostics(input: WhatsappProbeInput): WhatsappDiagnosticReport {
   const sessionSignal = sessionLocationSignal(input);
+  const overrideSignal = sessionPathOverrideSignal(input);
   const signals: DiagnosticSignal[] = [
     configCoverageSignal(input),
     pairingSignal(input),
     ...(sessionSignal ? [sessionSignal] : []),
+    ...(overrideSignal ? [overrideSignal] : []),
     bridgeProcessSignal(input),
     websocketSignal(input),
     inboundSignal(input),

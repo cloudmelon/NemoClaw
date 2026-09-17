@@ -1,40 +1,141 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync } from "node:child_process";
-
-import { resolveOpenshell } from "../../adapters/openshell/resolve";
-import { captureOpenshell, isCommandTimeout, runOpenshell } from "../../adapters/openshell/runtime";
+import type {
+  OpenShellForwardAdapter,
+  OpenShellForwardIdentity,
+  OpenShellForwardObservation,
+} from "../../adapters/openshell/forward";
 import {
-  OPENSHELL_OPERATION_TIMEOUT_MS,
+  createOpenShellForwardAdapterForAuthority,
+  openShellForwardIdentity,
+  type OpenShellForwardRuntimeAuthority,
+} from "../../adapters/openshell/forward-runtime";
+import type { OpenShellRuntimeSelection } from "../../adapters/openshell/runtime-selection";
+import {
+  OPENSHELL_HEAVY_TIMEOUT_MS,
   OPENSHELL_PROBE_TIMEOUT_MS,
-} from "../../adapters/openshell/timeouts";
+} from "../../adapters/openshell/command-execution";
 import * as agentRuntime from "../../agent/runtime";
-import { DASHBOARD_PORT } from "../../core/ports";
-import { waitUntil } from "../../core/wait";
+import { DASHBOARD_PORT, HERMES_OPENAI_API_PORT } from "../../core/ports";
 import { getActiveMessagingHostForward } from "../../messaging/host-forward";
 import { hydrateDerivedSandboxMessagingPlanFields } from "../../messaging/hydration";
 import type { SandboxMessagingHostForwardPlan } from "../../messaging/manifest";
 import { parseSandboxMessagingPlan } from "../../messaging/plan-validation";
 import { isRemoteDashboardBindRequested } from "../../onboard/dockerfile-remote-dashboard-bind-contract";
-import { resolveSandboxGatewayName } from "../../onboard/gateway-binding";
-import { isWsl } from "../../platform";
-import { ROOT } from "../../state/paths";
-import * as registry from "../../state/registry";
-import { parseForwardList } from "../../state/sandbox-session";
-import { buildSubprocessEnv } from "../../subprocess-env";
 import {
-  classifyForwardHealthWithReachability,
-  isLocalForwardReachable,
-  type SandboxForwardHealth,
-  type SandboxForwardListEntry,
-} from "./forward-health";
+  resolveGatewayPortFromName,
+  resolveSandboxGatewayName,
+} from "../../onboard/gateway-binding";
+import { resolveGatewayForwardAuthority } from "../../onboard/gateway-teardown-authority";
+import { resolveGatewayForwardRuntimeAuthority } from "../../onboard/gateway-host-runtime";
+import { sameGatewayOwner, type GatewayOwner } from "../../onboard/gateway-ownership";
+import {
+  resolveSandboxHermesApiPort,
+  retargetHermesApiPortInUrl,
+} from "../../onboard/hermes-api-port";
+import { resolveDashboardForwardBind } from "../../onboard/dashboard-runtime";
+import { isWsl } from "../../platform";
+import * as registry from "../../state/registry";
+export type SandboxForwardHealth = boolean;
 import {
   ensureHermesDashboardPortForwardIfEnabled as ensureHermesDashboardPortForward,
   getHermesDashboardRecoveryConfig,
 } from "./hermes-dashboard-recovery";
+import {
+  HermesPortableForwardRecoveryError,
+  type HermesPortableForwardRecoveryInput,
+  type HermesPortableForwardRecoveryTimingEvidence,
+} from "./probe/hermes-portable-forward-adapter-recovery";
+export {
+  HermesPortableForwardRecoveryError,
+  prepareHermesPortableLaunchForwards,
+  recoverHermesPortableLaunchForwards,
+  verifyHermesPortableLaunchForwards,
+} from "./probe/hermes-portable-forward-adapter-recovery";
+export type {
+  HermesPortableForwardRecoveryContext,
+  HermesPortableForwardRecoveryFailure,
+  HermesPortableForwardRecoveryInput,
+  HermesPortableForwardRecoveryResult,
+  HermesPortableForwardRecoveryTiming,
+  HermesPortableForwardRecoveryTimingEvidence,
+  HermesPortableForwardVerificationResult,
+  PreparedHermesPortableForwardRecovery,
+} from "./probe/hermes-portable-forward-adapter-recovery";
 
-type SandboxPortAgent = { forwardPort?: unknown; runtime?: { kind?: unknown } } | null;
+export interface HermesPortableForwardCommandAuthority {
+  readonly env: NodeJS.ProcessEnv;
+  readonly executablePath: string;
+}
+
+/** Compose exact Hermes command authority with the direct ForwardTcp owner. */
+export function createHermesPortableForwardRecoveryInput(input: {
+  readonly assertCurrent: () => void;
+  readonly assertRollbackCurrent: () => void;
+  readonly commandAuthority: HermesPortableForwardCommandAuthority;
+  readonly gatewayName: string;
+  readonly intent: "connect-probe-only";
+  readonly onTiming: (evidence: HermesPortableForwardRecoveryTimingEvidence) => void;
+  readonly ports: readonly number[];
+  readonly sandboxName: string;
+}): HermesPortableForwardRecoveryInput {
+  let gatewayAuthority: ReturnType<typeof resolveForwardGatewayAuthority>;
+  try {
+    input.assertCurrent();
+    gatewayAuthority = resolveForwardGatewayAuthority(input.gatewayName);
+    input.assertCurrent();
+  } catch {
+    throw new HermesPortableForwardRecoveryError("authority-drift");
+  }
+  const assertGatewayAuthorityCurrent = (): void => {
+    const current = resolveForwardGatewayAuthority(input.gatewayName);
+    if (!sameForwardGatewayAuthority(current, gatewayAuthority)) {
+      throw new Error("OpenShell forward service gateway authority changed");
+    }
+  };
+  const assertCurrent = (): void => {
+    input.assertCurrent();
+    assertGatewayAuthorityCurrent();
+  };
+  const assertRollbackCurrent = (): void => {
+    input.assertRollbackCurrent();
+    assertGatewayAuthorityCurrent();
+  };
+  const runtime: OpenShellForwardRuntimeAuthority = {
+    gatewayEndpoint: gatewayAuthority.endpoint,
+    gatewayName: input.gatewayName,
+    workspace: "default",
+    ...(gatewayAuthority.localTlsDir ? { localTlsDir: gatewayAuthority.localTlsDir } : {}),
+  };
+  return {
+    intent: input.intent,
+    sandboxName: input.sandboxName,
+    gatewayName: input.gatewayName,
+    // Initial inspection, sequential starts, and joint verification share one deadline.
+    operationTimeoutMs: OPENSHELL_HEAVY_TIMEOUT_MS,
+    ports: input.ports,
+    probeTimeoutMs: OPENSHELL_PROBE_TIMEOUT_MS,
+    forwards: input.ports.map((port) =>
+      openShellForwardIdentity(runtime, input.sandboxName, "127.0.0.1", port),
+    ),
+    timing: { onComplete: input.onTiming },
+    deps: {
+      adapter: createOpenShellForwardAdapterForAuthority(runtime, {
+        environment: input.commandAuthority.env,
+        executable: input.commandAuthority.executablePath,
+      }),
+      assertCurrent,
+      assertRollbackCurrent,
+    },
+  };
+}
+
+type SandboxPortAgent = {
+  forwardPort?: unknown;
+  forward_ports?: unknown;
+  runtime?: { kind?: unknown };
+} | null;
 
 type SandboxPortDeps = {
   getSandbox?: typeof registry.getSandbox;
@@ -45,52 +146,114 @@ type SandboxForwardRecoveryOptions = {
   afterSuccess?: () => boolean;
   beforeStart?: () => boolean;
   isWsl?: boolean;
+  runtimeSelection?: OpenShellRuntimeSelection;
 };
 
-type DashboardForwardStopRunner = (
-  args: string[],
-  options: { ignoreError: true; stdio: "ignore"; timeout: number },
-) => { status?: number | null };
-
-const FORWARD_RELEASE_TIMEOUT_MS = 5_000;
-const FORWARD_RELEASE_POLL_MS = 250;
-
-function isValidPort(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+function selectedForwardRuntime(
+  gatewayName: string,
+  runtimeSelection?: OpenShellRuntimeSelection,
+  authorityLocalTlsDir?: string,
+): OpenShellRuntimeSelection {
+  if (
+    runtimeSelection?.localTlsDir &&
+    authorityLocalTlsDir &&
+    runtimeSelection.localTlsDir !== authorityLocalTlsDir
+  ) {
+    throw new Error("OpenShell forward service TLS selection disagrees with gateway authority");
+  }
+  const localTlsDir = authorityLocalTlsDir ?? runtimeSelection?.localTlsDir;
+  return {
+    gatewayName,
+    workspace: runtimeSelection?.workspace ?? "default",
+    ...(localTlsDir ? { localTlsDir } : {}),
+  };
 }
 
-function runDashboardForwardStopBestEffort(
-  args: string[],
-  options: { timeout: number },
-): { status?: number | null } {
-  try {
-    const openshellBinary = resolveOpenshell();
-    if (!openshellBinary) return { status: 1 };
-    return spawnSync(openshellBinary, args, {
-      cwd: ROOT,
-      env: buildSubprocessEnv(),
-      stdio: "ignore",
-      timeout: options.timeout,
-    });
-  } catch {
-    // The container lifecycle action has already completed; cleanup must not
-    // replace that result when OpenShell cannot be launched.
-    return { status: 1 };
+type ForwardGatewayAuthority = {
+  readonly endpoint: string;
+  readonly localTlsDir?: string;
+  readonly owner: GatewayOwner;
+};
+
+function resolveForwardGatewayAuthority(gatewayName: string): ForwardGatewayAuthority {
+  const gatewayPort = resolveGatewayPortFromName(gatewayName);
+  if (gatewayPort === null) {
+    throw new Error(`Invalid OpenShell forward gateway '${gatewayName}'`);
+  }
+  const owner = resolveGatewayForwardAuthority({ gatewayName, gatewayPort });
+  const runtimeAuthority = resolveGatewayForwardRuntimeAuthority(owner);
+  return {
+    endpoint: runtimeAuthority.gatewayEndpoint,
+    ...(runtimeAuthority.localTlsDir ? { localTlsDir: runtimeAuthority.localTlsDir } : {}),
+    owner,
+  };
+}
+
+function sameForwardGatewayAuthority(
+  first: ForwardGatewayAuthority,
+  second: ForwardGatewayAuthority,
+): boolean {
+  return (
+    first.endpoint === second.endpoint &&
+    first.localTlsDir === second.localTlsDir &&
+    sameGatewayOwner(first.owner, second.owner)
+  );
+}
+
+function assertForwardGatewayAuthorityCurrent(
+  gatewayName: string,
+  expected: ForwardGatewayAuthority,
+): void {
+  if (!sameForwardGatewayAuthority(resolveForwardGatewayAuthority(gatewayName), expected)) {
+    throw new Error("OpenShell forward service gateway authority changed during launch");
   }
 }
 
-function confirmDashboardForwardReleased(
+function assertSandboxForwardAuthorityCurrent(
+  sandboxName: string,
+  gatewayName: string,
+  expected: ForwardGatewayAuthority,
+): void {
+  const sandbox = registry.getSandbox(sandboxName);
+  if (!sandbox || resolveSandboxGatewayName(sandbox) !== gatewayName) {
+    throw new Error("Sandbox gateway changed during forward observation");
+  }
+  assertForwardGatewayAuthorityCurrent(gatewayName, expected);
+}
+
+function forwardRuntimeAuthority(
+  gatewayName: string,
+  runtimeSelection?: OpenShellRuntimeSelection,
+): { authority: ForwardGatewayAuthority; runtime: OpenShellForwardRuntimeAuthority } {
+  const authority = resolveForwardGatewayAuthority(gatewayName);
+  const selection = selectedForwardRuntime(gatewayName, runtimeSelection, authority.localTlsDir);
+  return {
+    authority,
+    runtime: {
+      gatewayEndpoint: authority.endpoint,
+      gatewayName,
+      workspace: selection.workspace,
+      ...(selection.localTlsDir ? { localTlsDir: selection.localTlsDir } : {}),
+    },
+  };
+}
+
+function sandboxForwardIdentity(
+  authority: OpenShellForwardRuntimeAuthority,
+  sandboxName: string,
   port: number,
-  isForwardReachable: (port: number) => boolean,
-): boolean {
-  const now = Date.now;
-  return waitUntil(() => !isForwardReachable(port), {
-    deadlineMs: now() + FORWARD_RELEASE_TIMEOUT_MS,
-    initialIntervalMs: FORWARD_RELEASE_POLL_MS,
-    maxIntervalMs: FORWARD_RELEASE_POLL_MS,
-    backoffFactor: 1,
-    now,
-  });
+  expectedBind = "127.0.0.1",
+): OpenShellForwardIdentity {
+  return openShellForwardIdentity(
+    authority,
+    sandboxName,
+    expectedBind === "0.0.0.0" ? "0.0.0.0" : "127.0.0.1",
+    port,
+  );
+}
+
+function isValidPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
 export function resolveSandboxDashboardPort(
@@ -113,44 +276,103 @@ export function resolveSandboxDashboardPort(
 }
 
 /**
- * Tear down the host-side dashboard port-forward this sandbox created.
+ * Resolve the health endpoint to probe inside the sandbox.
  *
- * `stop` stops the container but must also release the forward it spawned;
- * leaving it alive orphans an `ssh -L` listener on the dashboard port, which
- * `status` then misreports as a foreign `sandbox_dashboard_port_conflict` and
- * which `start`/`recover` contend with (#7227). Best-effort: a stop must still
- * free container resources when openshell is unreachable, so errors are ignored
- * — mirroring the sandbox- and gateway-scoped forward cleanup used elsewhere.
- * OpenShell may return before its SSH listener exits, so successful commands
- * also receive a bounded host-port release wait.
+ * Manifest probe URLs name the agent's default API port. Retarget them at this
+ * sandbox's own port so the probe reaches its relay rather than reporting the
+ * default port as unreachable.
  */
-export function teardownSandboxDashboardForward(
+export function resolveSandboxHealthProbeUrl(sandboxName: string): string {
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  if (agent && agentRuntime.hasGatewayRuntime(agent)) {
+    return retargetHermesApiPortInUrl(
+      agentRuntime.getHealthProbeUrl(agent),
+      resolveSandboxHermesApiPort(registry.getSandbox(sandboxName) ?? {}),
+    );
+  }
+  return `http://127.0.0.1:${resolveSandboxDashboardPort(sandboxName)}/health`;
+}
+
+/**
+ * Wait for OpenShell's direct forwards to exit after the sandbox becomes unavailable.
+ */
+export async function teardownSandboxDashboardForward(
   sandboxName: string,
   deps: {
     getSandbox?: typeof registry.getSandbox;
-    isLocalForwardReachable?: typeof isLocalForwardReachable;
+    forwardAdapterForAuthority?: (
+      authority: OpenShellForwardRuntimeAuthority,
+    ) => Pick<OpenShellForwardAdapter, "verifyForwardRelease">;
+    resolveForwardRuntimeAuthority?: typeof forwardRuntimeAuthority;
     resolveSandboxDashboardPort?: typeof resolveSandboxDashboardPort;
-    resolveSandboxGatewayName?: typeof resolveSandboxGatewayName;
-    runOpenshell?: DashboardForwardStopRunner;
   } = {},
-): void {
+): Promise<boolean> {
   try {
     const getSandbox = deps.getSandbox ?? registry.getSandbox;
     const sandbox = getSandbox(sandboxName);
-    if (!sandbox) return;
-    const gatewayName = (deps.resolveSandboxGatewayName ?? resolveSandboxGatewayName)(sandbox);
+    if (!sandbox) return true;
+    const registeredAgent = sandbox.agent ? agentRuntime.getRegisteredAgent(sandbox) : null;
+    if (registeredAgent && !agentRuntime.hasGatewayRuntime(registeredAgent)) return true;
     const resolvePort = deps.resolveSandboxDashboardPort ?? resolveSandboxDashboardPort;
-    const port = resolvePort(sandboxName, { getSandbox: () => sandbox });
-    const run = deps.runOpenshell ?? runDashboardForwardStopBestEffort;
-    const result = run(["forward", "stop", String(port), sandboxName, "--gateway", gatewayName], {
-      ignoreError: true,
-      stdio: "ignore",
-      timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
+    const primaryPort = resolvePort(sandboxName, { getSandbox: () => sandbox });
+    const hermesDashboardPort =
+      sandbox.hermesDashboardEnabled === true && isValidPort(sandbox.hermesDashboardPort)
+        ? sandbox.hermesDashboardPort
+        : null;
+    const ports = new Set<number>([primaryPort]);
+    if (hermesDashboardPort !== null) ports.add(hermesDashboardPort);
+    const parsedMessaging = parseSandboxMessagingPlan(sandbox.messaging?.plan, { sandboxName });
+    const messagingForward = getActiveMessagingHostForward(
+      parsedMessaging ? hydrateDerivedSandboxMessagingPlanFields(parsedMessaging) : null,
+    );
+    if (messagingForward) ports.add(messagingForward.port);
+    for (const port of resolveDeclaredAgentForwardPorts(
+      sandbox,
+      primaryPort,
+      registeredAgent,
+      hermesDashboardPort,
+    )) {
+      ports.add(port);
+    }
+    const gatewayName = resolveSandboxGatewayName(sandbox);
+    const { authority, runtime } = (deps.resolveForwardRuntimeAuthority ?? forwardRuntimeAuthority)(
+      gatewayName,
+    );
+    const primaryBind = resolveDashboardForwardBind(sandbox, {
+      requestedBind: process.env.NEMOCLAW_DASHBOARD_BIND,
+      wsl: isWsl(),
     });
-    if (result.status !== 0) return;
-    confirmDashboardForwardReleased(port, deps.isLocalForwardReachable ?? isLocalForwardReachable);
-  } catch {
-    // Defense in depth for injected or future runners: teardown is best-effort.
+    const forwards = [...ports].map((port) =>
+      sandboxForwardIdentity(
+        runtime,
+        sandboxName,
+        port,
+        port === primaryPort ? primaryBind : "127.0.0.1",
+      ),
+    );
+    const release = await (
+      deps.forwardAdapterForAuthority ?? createOpenShellForwardAdapterForAuthority
+    )(runtime).verifyForwardRelease({
+      forwards,
+      timeoutMs: 5_000,
+      assertCurrent: async () => assertForwardGatewayAuthorityCurrent(gatewayName, authority),
+    });
+    if (release.state !== "released") {
+      const unreleasedPorts =
+        "forwards" in release ? release.forwards.map((forward) => forward.port) : [...ports];
+      console.error(
+        `  ForwardTcp cleanup did not release registered host port(s): ${unreleasedPorts.join(", ")}.`,
+      );
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error(
+      `  ForwardTcp port-release verification did not complete: ${
+        error instanceof Error ? error.message : "unknown verification failure"
+      }`,
+    );
+    return false;
   }
 }
 
@@ -158,102 +380,172 @@ export function teardownSandboxDashboardForward(
  * Re-establish the dashboard port forward to the sandbox.
  * Uses the recorded dashboard port when available, including custom ports for
  * non-OpenClaw agents, then falls back to the active agent's declared port.
- * Returns true when `forward start` succeeded and a follow-up probe
- * confirms the new entry is running, false otherwise.
+ * Returns true when the detached OpenShell service makes the port reachable.
  */
-export function ensureSandboxPortForward(
+export async function ensureSandboxPortForward(
   sandboxName: string,
   options: SandboxForwardRecoveryOptions = {},
-): boolean {
+): Promise<boolean> {
   const port = resolveSandboxDashboardPort(sandboxName);
+  const sandbox = registry.getSandbox(sandboxName);
   const remoteBindRequested = isRemoteDashboardBindRequested(process.env.NEMOCLAW_DASHBOARD_BIND);
-  const allInterfaceBindRequired = remoteBindRequested || isWsl({ isWsl: options.isWsl });
-  if (
-    remoteBindRequested &&
-    registry.getSandbox(sandboxName)?.dashboardRemoteBindPrepared !== true
-  ) {
+  const bind = resolveDashboardForwardBind(sandbox, {
+    requestedBind: process.env.NEMOCLAW_DASHBOARD_BIND,
+    wsl: isWsl({ isWsl: options.isWsl }),
+  });
+  if (remoteBindRequested && sandbox?.dashboardRemoteBindPrepared !== true) {
     console.error(
       `  Refusing remote dashboard bind for '${sandboxName}': its generated configuration was not prepared for remote exposure. Re-run onboarding with NEMOCLAW_DASHBOARD_BIND=0.0.0.0 and --recreate-sandbox before reconnecting.`,
     );
     return false;
   }
   return ensureSandboxPortForwardForPort(sandboxName, port, {
-    forwardTarget: allInterfaceBindRequired ? `0.0.0.0:${port}` : String(port),
-    forceRestart: remoteBindRequested,
-    expectedBind: allInterfaceBindRequired ? "0.0.0.0" : "127.0.0.1",
+    forwardTarget: bind === "0.0.0.0" ? `0.0.0.0:${port}` : String(port),
+    expectedBind: bind,
     afterSuccess: options.afterSuccess,
     beforeStart: () =>
       (!remoteBindRequested ||
         registry.getSandbox(sandboxName)?.dashboardRemoteBindPrepared === true) &&
       (options.beforeStart?.() ?? true),
+    runtimeSelection: options.runtimeSelection,
   });
 }
 
 /**
- * Probe `openshell forward list` for the sandbox's dashboard forward.
- * Returns true when an entry exists for the expected sandbox+port pair
- * with STATUS=running, false when the entry is missing or non-running,
- * "occupied" when another sandbox already owns the expected port, and
- * null when openshell is unreachable.
+ * What answers on a sandbox's host forward port.
  *
- * The in-sandbox gateway and the host-side forward are independent
- * dimensions: the forward can die (host SSH session dropped, list shows
- * STATUS=dead) while the gateway keeps listening on 127.0.0.1:<port>.
- *
- * Local reachability is intentionally not sufficient: an unrelated listener
- * cannot prove that OpenShell assigned this sandbox the requested host port.
+ * - `owned`: this sandbox's exact OpenShell ForwardTcp service, proved from
+ *   the listener PID, its executable and its full argv.
+ * - `absent`: nothing listens.
+ * - `stale`: an exact legacy forward may be retired only through adapter
+ *   authority and is then re-observed before replacement.
+ * - `foreign`: another listener owns the port, so recovery does not mutate it.
+ * - `indeterminate`: observation could not prove a safe state, so recovery
+ *   fails closed without mutation.
  */
-export function isSandboxForwardHealthy(
+export type SandboxForwardListener = OpenShellForwardObservation["state"];
+
+export type OpenShellForwardObservationAdapterFactory = (
+  authority: OpenShellForwardRuntimeAuthority,
+) => Pick<OpenShellForwardAdapter, "observeForwards">;
+
+export async function describeSandboxForwardListener(
   sandboxName: string,
-  options: { isWsl?: boolean } = {},
-): SandboxForwardHealth {
-  const allInterfaceBindRequired =
-    isRemoteDashboardBindRequested(process.env.NEMOCLAW_DASHBOARD_BIND) ||
-    isWsl({ isWsl: options.isWsl });
-  return isSandboxPortForwardHealthy(
+  options: {
+    forwardAdapterForAuthority?: OpenShellForwardObservationAdapterFactory;
+    isWsl?: boolean;
+    runtimeSelection?: OpenShellRuntimeSelection;
+  } = {},
+): Promise<SandboxForwardListener> {
+  const bind = resolveDashboardForwardBind(registry.getSandbox(sandboxName), {
+    requestedBind: process.env.NEMOCLAW_DASHBOARD_BIND,
+    wsl: isWsl({ isWsl: options.isWsl }),
+  });
+  return await describeSandboxPortForwardListener(
     sandboxName,
     resolveSandboxDashboardPort(sandboxName),
-    allInterfaceBindRequired ? "0.0.0.0" : "127.0.0.1",
+    bind,
+    options.runtimeSelection,
+    options.forwardAdapterForAuthority,
   );
 }
 
-export function isSandboxPortForwardHealthy(
+export async function isSandboxForwardHealthy(
+  sandboxName: string,
+  options: { isWsl?: boolean; runtimeSelection?: OpenShellRuntimeSelection } = {},
+): Promise<SandboxForwardHealth> {
+  return (await describeSandboxForwardListener(sandboxName, options)) === "owned";
+}
+
+export async function isSandboxPortForwardHealthy(
   sandboxName: string,
   port: number,
   expectedBind?: string,
-): SandboxForwardHealth {
-  const result = captureOpenshell(["forward", "list"], {
-    ignoreError: true,
-    timeout: OPENSHELL_PROBE_TIMEOUT_MS,
-  });
-  if (!result || isCommandTimeout(result) || result.status !== 0) return null;
-  const entries = parseForwardList(result.output) as SandboxForwardListEntry[];
-  return classifyForwardHealthWithReachability(
-    entries,
-    sandboxName,
-    String(port),
-    () => isLocalForwardReachable(port),
-    expectedBind,
+  runtimeSelection?: OpenShellRuntimeSelection,
+): Promise<SandboxForwardHealth> {
+  return (
+    (await describeSandboxPortForwardListener(
+      sandboxName,
+      port,
+      expectedBind,
+      runtimeSelection,
+    )) === "owned"
   );
 }
 
-export function ensureSandboxPortForwardForPort(
+/** Why recovery leaves a listener it cannot attribute to the sandbox alone. */
+export function nonOwnedForwardListenerRefusal(sandboxName: string, port: number): string {
+  return `  Host port ${String(port)} for '${sandboxName}' is held by a listener that NemoClaw cannot attribute to this sandbox's OpenShell forward. NemoClaw cannot prove it started the listener, so it leaves the listener running and does not restore a forward onto it. Find the owner with \`ss -ltnp 'sport = :${String(port)}'\` or \`lsof -nP -iTCP:${String(port)} -sTCP:LISTEN\`, free the port, then run \`nemoclaw ${sandboxName} recover\` again.`;
+}
+
+function forwardOperationFailureMessage(
+  result:
+    | Awaited<ReturnType<OpenShellForwardAdapter["startForward"]>>
+    | Awaited<ReturnType<OpenShellForwardAdapter["retireLegacyForward"]>>,
+): string {
+  if ("error" in result) return result.error.message;
+  if ("observation" in result && result.observation.state === "foreign") {
+    return "The host port is owned by a foreign listener.";
+  }
+  return "NemoClaw could not prove the OpenShell forward state.";
+}
+
+export async function describeSandboxPortForwardListener(
+  sandboxName: string,
+  port: number,
+  expectedBind?: string,
+  runtimeSelection?: OpenShellRuntimeSelection,
+  forwardAdapterForAuthority?: OpenShellForwardObservationAdapterFactory,
+): Promise<SandboxForwardListener> {
+  return await inspectSandboxPortForwardListener(
+    sandboxName,
+    port,
+    expectedBind,
+    runtimeSelection,
+    forwardAdapterForAuthority,
+  );
+}
+
+async function inspectSandboxPortForwardListener(
+  sandboxName: string,
+  port: number,
+  expectedBind?: string,
+  runtimeSelection?: OpenShellRuntimeSelection,
+  forwardAdapterForAuthority: OpenShellForwardObservationAdapterFactory = createOpenShellForwardAdapterForAuthority,
+): Promise<SandboxForwardListener> {
+  const sandbox = registry.getSandbox(sandboxName);
+  if (!sandbox) return "absent";
+  try {
+    const gatewayName = runtimeSelection?.gatewayName ?? resolveSandboxGatewayName(sandbox);
+    const { authority, runtime } = forwardRuntimeAuthority(gatewayName, runtimeSelection);
+    const [observation] = await forwardAdapterForAuthority(runtime).observeForwards({
+      forwards: [sandboxForwardIdentity(runtime, sandboxName, port, expectedBind)],
+      assertCurrent: async () =>
+        assertSandboxForwardAuthorityCurrent(sandboxName, gatewayName, authority),
+    });
+    return observation?.state ?? "indeterminate";
+  } catch {
+    return "indeterminate";
+  }
+}
+
+export async function ensureSandboxPortForwardForPort(
   sandboxName: string,
   port: number,
   options: {
     afterSuccess?: () => boolean;
     forwardTarget?: string;
-    forceRestart?: boolean;
     expectedBind?: string;
     beforeStart?: () => boolean;
+    runtimeSelection?: OpenShellRuntimeSelection;
   } = {},
-): boolean {
+): Promise<boolean> {
   const {
     afterSuccess = () => true,
     forwardTarget = String(port),
-    forceRestart = false,
     expectedBind,
     beforeStart = () => true,
+    runtimeSelection,
   } = options;
   const acceptSuccessfulForward = () => {
     let accepted = false;
@@ -262,157 +554,144 @@ export function ensureSandboxPortForwardForPort(
     } catch {
       accepted = false;
     }
-    if (accepted) return true;
-    runOpenshell(["forward", "stop", String(port), sandboxName], {
-      ignoreError: true,
-      stdio: "ignore",
-    });
-    return false;
+    return accepted;
   };
-  let forwardHealth = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
-  if (forwardHealth === true && !forceRestart) return acceptSuccessfulForward();
-  if (forwardHealth === "occupied") return false;
-  const configuredWaitMs = Number(process.env.NEMOCLAW_FORWARD_RECOVERY_WAIT_MS ?? "3000");
-  const waitMs = Number.isFinite(configuredWaitMs) ? Math.max(0, configuredWaitMs) : 3000;
-
-  const stopResult = runOpenshell(["forward", "stop", String(port), sandboxName], {
-    ignoreError: true,
-    stdio: "ignore",
-  });
-  if (stopResult.status !== 0) {
+  let listener: SandboxForwardListener;
+  try {
+    listener = await inspectSandboxPortForwardListener(
+      sandboxName,
+      port,
+      expectedBind,
+      runtimeSelection,
+    );
+  } catch (error) {
     console.error(
-      `  Warning: openshell forward stop ${port} ${sandboxName} exited ${stopResult.status}; attempting restart anyway.`,
+      `  Warning: OpenShell ForwardTcp ${String(port)} for ${sandboxName} could not be inspected: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
     );
+    return false;
   }
-
-  // OpenShell v0.0.85 removes the forward PID file shortly after SIGTERM,
-  // before the old SSH listener is guaranteed to release its host port. A
-  // blind stop -> start can therefore collide with the just-stopped process.
-  // Preserve authoritative owner metadata while waiting: accept a target-
-  // owned forward that recovered on its own, reject another sandbox, and
-  // prefer starting only after an otherwise-unowned local listener has
-  // quiesced. If an authoritative list remains ownerless while the listener
-  // stays reachable, `forward start` is still the reconciliation operation:
-  // its result is accepted below only after the list reports the exact target
-  // owner. An unavailable list and forced bind replacement remain fail-closed.
-  // NemoClaw must compensate while the supported OpenShell 0.0.85
-  // contract remains supported; test/process-recovery.test.ts locks both the
-  // delayed-release and fail-closed cases. Remove this wait only after every
-  // supported OpenShell release either waits for host-listener release before
-  // `forward stop` returns or exposes an authoritative listener-released state
-  // that this path consumes instead.
-  if (waitMs > 0 && isLocalForwardReachable(port)) {
-    const stopState: { health: SandboxForwardHealth; portReleased: boolean } = {
-      health: forwardHealth,
-      portReleased: false,
-    };
-    waitUntil(
-      () => {
-        stopState.health = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
-        stopState.portReleased = !isLocalForwardReachable(port);
-        return (
-          (!forceRestart && stopState.health === true) ||
-          stopState.health === "occupied" ||
-          stopState.portReleased
-        );
-      },
-      {
-        deadlineMs: Date.now() + waitMs,
-        initialIntervalMs: 100,
-        maxIntervalMs: 500,
-        backoffFactor: 1.5,
-      },
-    );
-    if (stopState.health === true && !forceRestart) return acceptSuccessfulForward();
-    if (stopState.health === "occupied") return false;
-    if (!stopState.portReleased && (forceRestart || stopState.health === null)) {
-      return false;
-    }
+  if (listener === "owned") return acceptSuccessfulForward();
+  // A listener this sandbox does not own is reported, never replaced. A
+  // launch onto it would only fail as "occupied", and reporting the forward
+  // as restored would send the dashboard token to that process (#11149).
+  if (listener === "foreign" || listener === "indeterminate") {
+    console.error(nonOwnedForwardListenerRefusal(sandboxName, port));
+    return false;
   }
-
   if (!beforeStart()) return false;
-  const startResult = runOpenshell(
-    ["forward", "start", "--background", forwardTarget, sandboxName],
-    {
-      ignoreError: true,
-      // OpenShell 0.0.85 leaves the background SSH forward attached to the
-      // caller's inherited descriptors. Detach them so a scripted `recover`
-      // can finish after the foreground OpenShell command exits. Keep this
-      // until every supported OpenShell release redirects those descriptors.
-      stdio: "ignore",
-    },
-  );
-  // OpenShell 0.0.85 returns an error when start preflight finds a validated
-  // live forward for the requested port. Recovery cannot change that upstream
-  // CLI contract, so a reachable listener settles against the authoritative
-  // forward list below; an absent listener still fails fast. Remove this
-  // tolerance once every supported OpenShell release makes `forward start`
-  // idempotent for an already-tracked live forward.
-  if (startResult.status !== 0 && !isLocalForwardReachable(port)) return false;
-
-  // `forward start --background` can return before its authoritative list
-  // entry becomes visible. Poll for the exact live sandbox+port owner instead
-  // of accepting an arbitrary reachable listener or failing on the first
-  // metadata refresh.
-  let health = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
-  if (health === true) return acceptSuccessfulForward();
-  if (health === "occupied") return false;
-  if (waitMs === 0) return false;
-
-  let occupied = false;
-  const settled = waitUntil(
-    () => {
-      health = isSandboxPortForwardHealthy(sandboxName, port, expectedBind);
-      if (health === "occupied") {
-        occupied = true;
-        return true;
+  try {
+    const sandbox = registry.getSandbox(sandboxName);
+    if (!sandbox) throw new Error(`Sandbox '${sandboxName}' is not registered`);
+    const gatewayName = runtimeSelection?.gatewayName ?? resolveSandboxGatewayName(sandbox);
+    const { authority, runtime } = forwardRuntimeAuthority(gatewayName, runtimeSelection);
+    const forward = sandboxForwardIdentity(
+      runtime,
+      sandboxName,
+      port,
+      expectedBind ?? (forwardTarget.startsWith("0.0.0.0:") ? "0.0.0.0" : "127.0.0.1"),
+    );
+    const adapter = createOpenShellForwardAdapterForAuthority(runtime);
+    const assertCurrent = async () =>
+      assertSandboxForwardAuthorityCurrent(sandboxName, gatewayName, authority);
+    if (listener === "stale") {
+      const retirement = await adapter.retireLegacyForward({
+        forward,
+        assertCurrent,
+        authorize: async () =>
+          assertSandboxForwardAuthorityCurrent(sandboxName, gatewayName, authority),
+      });
+      if (retirement.state !== "retired" && retirement.state !== "not_needed") {
+        throw new Error(forwardOperationFailureMessage(retirement));
       }
-      return health === true;
-    },
-    {
-      deadlineMs: Date.now() + waitMs,
-      initialIntervalMs: 100,
-      maxIntervalMs: 500,
-      backoffFactor: 1.5,
-    },
-  );
-  return settled && !occupied && acceptSuccessfulForward();
+    }
+    const started = await adapter.startForward({ forward, assertCurrent });
+    if (started.state !== "started" && started.state !== "reused") {
+      throw new Error(forwardOperationFailureMessage(started));
+    }
+    return acceptSuccessfulForward();
+  } catch (error) {
+    console.error(
+      `  Warning: OpenShell ForwardTcp ${String(port)} for ${sandboxName} did not start: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return false;
+  }
 }
 
-export function ensureHermesDashboardPortForwardIfEnabled(sandboxName: string): boolean | null {
+export async function ensureHermesDashboardPortForwardIfEnabled(
+  sandboxName: string,
+  runtimeSelection?: OpenShellRuntimeSelection,
+): Promise<boolean | null> {
   return ensureHermesDashboardPortForward(sandboxName, {
-    isPortForwardHealthy: isSandboxPortForwardHealthy,
-    ensurePortForward: ensureSandboxPortForwardForPort,
+    isPortForwardHealthy: (name, port) =>
+      isSandboxPortForwardHealthy(name, port, undefined, runtimeSelection),
+    ensurePortForward: (name, port) =>
+      ensureSandboxPortForwardForPort(name, port, { runtimeSelection }),
   });
 }
 
 function getSandboxMessagingHostForward(
   sandboxName: string,
+  entry: ReturnType<typeof registry.getSandbox> = registry.getSandbox(sandboxName),
 ): SandboxMessagingHostForwardPlan | null {
-  const entry = registry.getSandbox(sandboxName);
   const parsed = parseSandboxMessagingPlan(entry?.messaging?.plan, { sandboxName });
   const plan = parsed ? hydrateDerivedSandboxMessagingPlanFields(parsed) : null;
   return getActiveMessagingHostForward(plan);
 }
 
-export function ensureMessagingHostForwardHealthy(sandboxName: string): boolean | null {
+export async function ensureMessagingHostForwardHealthy(
+  sandboxName: string,
+  runtimeSelection?: OpenShellRuntimeSelection,
+): Promise<boolean | null> {
   const forward = getSandboxMessagingHostForward(sandboxName);
   if (!forward) return null;
-  const health = isSandboxPortForwardHealthy(sandboxName, forward.port);
+  const health = await isSandboxPortForwardHealthy(
+    sandboxName,
+    forward.port,
+    undefined,
+    runtimeSelection,
+  );
   if (health === true) return true;
-  if (health === "occupied") return false;
-  return ensureSandboxPortForwardForPort(sandboxName, forward.port);
+  return ensureSandboxPortForwardForPort(sandboxName, forward.port, { runtimeSelection });
 }
 
-export function recoverMessagingHostForward(
+export async function recoverMessagingHostForward(
   sandboxName: string,
-  { quiet }: { quiet: boolean },
-): boolean | null {
-  const recovered = ensureMessagingHostForwardHealthy(sandboxName);
+  { quiet, runtimeSelection }: { quiet: boolean; runtimeSelection?: OpenShellRuntimeSelection },
+): Promise<boolean | null> {
+  const recovered = await ensureMessagingHostForwardHealthy(sandboxName, runtimeSelection);
   if (!quiet && recovered === false) {
     console.error("  Messaging webhook port forward could not be re-established.");
   }
   return recovered;
+}
+
+function resolveDeclaredAgentForwardPorts(
+  sandbox: ReturnType<typeof registry.getSandbox>,
+  primaryPort: number,
+  agent: SandboxPortAgent,
+  hermesDashboardPort: number | null,
+): number[] {
+  const declared = agent?.forward_ports;
+  if (!Array.isArray(declared)) return [];
+  const covered = new Set<number>([primaryPort]);
+  if (isValidPort(agent?.forwardPort)) covered.add(agent.forwardPort);
+  if (isValidPort(hermesDashboardPort)) covered.add(hermesDashboardPort);
+  const ports: number[] = [];
+  for (const candidate of declared) {
+    if (typeof candidate !== "number") continue;
+    if (!Number.isInteger(candidate) || candidate < 1024 || candidate > 65535) continue;
+    if (covered.has(candidate)) continue;
+    const port =
+      candidate === HERMES_OPENAI_API_PORT ? resolveSandboxHermesApiPort(sandbox ?? {}) : candidate;
+    if (covered.has(port)) continue;
+    covered.add(port);
+    ports.push(port);
+  }
+  return ports;
 }
 
 /**
@@ -421,47 +700,202 @@ export function recoverMessagingHostForward(
  * primary dashboard port is owned by `ensureSandboxPortForward`; the
  * optional Hermes web dashboard port is owned by
  * `ensureHermesDashboardPortForwardIfEnabled`.
+ *
+ * Manifest entries name the agent's default ports, not this sandbox's. Both
+ * the dashboard port and the Hermes API port are per-sandbox host resources, so
+ * a second sandbox owns neither manifest default. Skip the manifest dashboard
+ * entry, which `ensureSandboxPortForward` already recovers at this sandbox's
+ * dashboard port, and resolve the manifest API entry against the sandbox's
+ * recorded API port, or recovery demands a port that belongs to a sibling
+ * sandbox and reports a failure the sandbox cannot repair.
  */
-export function ensureDeclaredAgentForwardPortsHealthy(
+export async function ensureDeclaredAgentForwardPortsHealthy(
   sandboxName: string,
   primaryPort: number,
-): boolean | null {
+  runtimeSelection?: OpenShellRuntimeSelection,
+): Promise<boolean | null> {
   const agent = agentRuntime.getSessionAgent(sandboxName);
   if (!agent) return null;
-  const declared = (agent as { forward_ports?: unknown }).forward_ports;
-  if (!Array.isArray(declared) || declared.length === 0) return null;
   const hermesDashboard = getHermesDashboardRecoveryConfig(sandboxName);
-  const skipSet = new Set<number>([primaryPort]);
-  if (hermesDashboard && Number.isInteger(hermesDashboard.publicPort)) {
-    skipSet.add(hermesDashboard.publicPort);
-  }
-  let sawCovered = false;
+  const sandbox = registry.getSandbox(sandboxName);
+  const ports = resolveDeclaredAgentForwardPorts(
+    sandbox,
+    primaryPort,
+    agent,
+    hermesDashboard?.publicPort ?? null,
+  );
+  if (ports.length === 0) return null;
   let allHealthy = true;
-  for (const candidate of declared) {
-    if (typeof candidate !== "number") continue;
-    if (!Number.isInteger(candidate) || candidate < 1024 || candidate > 65535) continue;
-    if (skipSet.has(candidate)) continue;
-    sawCovered = true;
-    const health = isSandboxPortForwardHealthy(sandboxName, candidate);
+  for (const port of ports) {
+    const health = await isSandboxPortForwardHealthy(
+      sandboxName,
+      port,
+      undefined,
+      runtimeSelection,
+    );
     if (health === true) continue;
-    if (health === "occupied") {
-      allHealthy = false;
-      continue;
-    }
-    if (!ensureSandboxPortForwardForPort(sandboxName, candidate)) {
+    if (!(await ensureSandboxPortForwardForPort(sandboxName, port, { runtimeSelection }))) {
       allHealthy = false;
     }
   }
-  if (!sawCovered) return null;
   return allHealthy;
 }
 
-export function recoverDeclaredAgentForwardPorts(
+function normalizeForwardPorts(ports: readonly number[]): number[] {
+  return [...new Set(ports)].sort((first, second) => first - second);
+}
+
+function sameForwardPortSet(first: readonly number[], second: readonly number[]): boolean {
+  const normalizedFirst = normalizeForwardPorts(first);
+  const normalizedSecond = normalizeForwardPorts(second);
+  return (
+    normalizedFirst.length === normalizedSecond.length &&
+    normalizedFirst.every((port, index) => port === normalizedSecond[index])
+  );
+}
+
+/**
+ * Observe every host forward that the interactive preflight would recover,
+ * without starting, stopping, or rebinding one.
+ */
+export async function areSandboxLaunchForwardsHealthy(
+  sandboxName: string,
+  gatewayName?: string,
+  deps: {
+    forwardAdapterForAuthority?: (
+      authority: OpenShellForwardRuntimeAuthority,
+    ) => Pick<OpenShellForwardAdapter, "observeForwards">;
+  } = {},
+): Promise<boolean | null> {
+  const sandbox = registry.getSandbox(sandboxName);
+  if (!sandbox) return false;
+  try {
+    const owningGatewayName = resolveSandboxGatewayName(sandbox);
+    if (gatewayName && gatewayName !== owningGatewayName) return false;
+    const agent = agentRuntime.getSessionAgent(sandboxName);
+    const primaryPort = resolveSandboxDashboardPort(sandboxName, {
+      getSandbox: () => sandbox,
+      getSessionAgent: () => agent,
+    });
+    const requiredPorts = resolveSandboxLaunchForwardPortsFromAuthority(
+      sandboxName,
+      sandbox,
+      agent,
+      primaryPort,
+    );
+    const assertForwardPlanCurrent = (): void => {
+      const currentSandbox = registry.getSandbox(sandboxName);
+      if (!currentSandbox || resolveSandboxGatewayName(currentSandbox) !== owningGatewayName) {
+        throw new Error("Sandbox gateway changed during forward observation");
+      }
+      const currentAgent = agentRuntime.getSessionAgent(sandboxName);
+      const currentPrimaryPort = resolveSandboxDashboardPort(sandboxName, {
+        getSandbox: () => currentSandbox,
+        getSessionAgent: () => currentAgent,
+      });
+      const currentRequiredPorts = resolveSandboxLaunchForwardPortsFromAuthority(
+        sandboxName,
+        currentSandbox,
+        currentAgent,
+        currentPrimaryPort,
+      );
+      if (
+        currentPrimaryPort !== primaryPort ||
+        !sameForwardPortSet(currentRequiredPorts, requiredPorts)
+      ) {
+        throw new Error("Sandbox forward plan changed during observation");
+      }
+    };
+    if (requiredPorts.length === 0) {
+      assertForwardPlanCurrent();
+      return true;
+    }
+
+    const { authority, runtime } = forwardRuntimeAuthority(owningGatewayName);
+    const primaryBind = resolveDashboardForwardBind(sandbox, {
+      requestedBind: process.env.NEMOCLAW_DASHBOARD_BIND,
+      wsl: isWsl(),
+    });
+    const observations = await (
+      deps.forwardAdapterForAuthority ?? createOpenShellForwardAdapterForAuthority
+    )(runtime).observeForwards({
+      forwards: requiredPorts.map((port) =>
+        sandboxForwardIdentity(
+          runtime,
+          sandboxName,
+          port,
+          port === primaryPort ? primaryBind : "127.0.0.1",
+        ),
+      ),
+      assertCurrent: async () => {
+        assertSandboxForwardAuthorityCurrent(sandboxName, owningGatewayName, authority);
+        assertForwardPlanCurrent();
+      },
+    });
+    if (observations.some((observation) => observation.state === "indeterminate")) return null;
+    if (observations.some((observation) => observation.state !== "owned")) return false;
+
+    assertForwardPlanCurrent();
+    const currentPrimaryBind = resolveDashboardForwardBind(registry.getSandbox(sandboxName), {
+      requestedBind: process.env.NEMOCLAW_DASHBOARD_BIND,
+      wsl: isWsl(),
+    });
+    if (currentPrimaryBind !== primaryBind) {
+      throw new Error("Sandbox forward bind changed during observation");
+    }
+    assertForwardGatewayAuthorityCurrent(owningGatewayName, authority);
+    return true;
+  } catch {
+    return null;
+  }
+}
+
+function resolveSandboxLaunchForwardPortsFromAuthority(
+  sandboxName: string,
+  sandbox: NonNullable<ReturnType<typeof registry.getSandbox>>,
+  agent: SandboxPortAgent,
+  primaryPort: number,
+): number[] {
+  if (agent && !agentRuntime.hasGatewayRuntime(agent)) return [];
+
+  const requiredPorts = new Set<number>([primaryPort]);
+  const hermesDashboard = getHermesDashboardRecoveryConfig(sandboxName, () => sandbox);
+  if (hermesDashboard) requiredPorts.add(hermesDashboard.publicPort);
+  const messagingForward = getSandboxMessagingHostForward(sandboxName, sandbox);
+  if (messagingForward) requiredPorts.add(messagingForward.port);
+  for (const port of resolveDeclaredAgentForwardPorts(
+    sandbox,
+    primaryPort,
+    agent,
+    hermesDashboard?.publicPort ?? null,
+  )) {
+    requiredPorts.add(port);
+  }
+  return [...requiredPorts];
+}
+
+/** Resolve the complete forward set used by launch-readiness health. */
+export function resolveSandboxLaunchForwardPorts(sandboxName: string): number[] | null {
+  const sandbox = registry.getSandbox(sandboxName);
+  if (!sandbox) return null;
+  const agent = agentRuntime.getSessionAgent(sandboxName);
+  const primaryPort = resolveSandboxDashboardPort(sandboxName, {
+    getSandbox: () => sandbox,
+    getSessionAgent: () => agent,
+  });
+  return resolveSandboxLaunchForwardPortsFromAuthority(sandboxName, sandbox, agent, primaryPort);
+}
+
+export async function recoverDeclaredAgentForwardPorts(
   sandboxName: string,
   recoveryPort: number,
-  { quiet }: { quiet: boolean },
-): boolean | null {
-  const recovered = ensureDeclaredAgentForwardPortsHealthy(sandboxName, recoveryPort);
+  { quiet, runtimeSelection }: { quiet: boolean; runtimeSelection?: OpenShellRuntimeSelection },
+): Promise<boolean | null> {
+  const recovered = await ensureDeclaredAgentForwardPortsHealthy(
+    sandboxName,
+    recoveryPort,
+    runtimeSelection,
+  );
   if (!quiet && recovered === false) {
     console.error("  One or more agent-declared port forwards could not be re-established.");
   }

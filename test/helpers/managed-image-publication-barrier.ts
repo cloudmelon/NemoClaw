@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +25,10 @@ type Candidate = {
 
 export type CandidateMutation = (candidates: Candidate[]) => Candidate[];
 
+type BarrierOptions = {
+  publicationCohort?: string;
+};
+
 type PromotionResult = {
   calls: string[];
   cohortContract: Record<string, unknown> | null;
@@ -32,8 +37,19 @@ type PromotionResult = {
   stderr: string;
 };
 
+type PromotionOptions = {
+  mutate?: CandidateMutation;
+  publicationCohort?: string;
+  retainStalePointerAliases?: boolean;
+};
+
 function imageFor(agent: (typeof publicationAgents)[number]): string {
   return `ghcr.io/nvidia/nemoclaw/${agent}-sandbox`;
+}
+
+function referenceStatePath(root: string, reference: string): string {
+  const digest = createHash("sha256").update(reference).digest("hex");
+  return path.join(root, "references", `${digest}.raw`);
 }
 
 function digestFor(agentIndex: number, platformIndex: number, offset: number): string {
@@ -54,7 +70,7 @@ function candidates(): Candidate[] {
       return {
         agent,
         platform,
-        artifact: `managed-image-candidate-${runId}-${runAttempt}-${agent}-${platform.replaceAll("/", "-")}`,
+        artifact: `managed-image-candidate-${runId}-${agent}-${platform.replaceAll("/", "-")}`,
         contract: {
           contractVersion: 2,
           phase: "candidate",
@@ -153,10 +169,59 @@ function candidates(): Candidate[] {
   );
 }
 
+export const reuseOpenclawAmd64FromAttemptOne: CandidateMutation = (candidateSet) =>
+  candidateSet.map((candidate) => {
+    const contract = structuredClone(candidate.contract);
+    const producerAttempt =
+      `${candidate.agent}|${candidate.platform}` === "openclaw|linux/amd64" ? 1 : 2;
+    (contract.source as Record<string, unknown>).cohort = "ghrun-7744-1";
+    (contract.run as Record<string, unknown>).attempt = producerAttempt;
+    const evidence = contract.publicationEvidence as Record<string, unknown>;
+    const attestations = evidence.attestations as Record<string, unknown>;
+    const statement = (attestations.slsa as Record<string, unknown>).statement as Record<
+      string,
+      unknown
+    >;
+    statement.builderId = `https://github.com/NVIDIA/NemoClaw/actions/runs/7744/attempts/${producerAttempt}`;
+    (statement.bindings as Record<string, unknown>).cohort = "ghrun-7744-1";
+    return {
+      ...candidate,
+      contract,
+    };
+  });
+
+export function runManagedImageBaseRestore(
+  script: string,
+  contract: string,
+): { restored: boolean; status: number | null; stderr: string } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-managed-base-restore-"));
+  try {
+    const result = spawnSync("bash", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        AGENT: "openclaw",
+        DCODE_CONTRACT_BASE64: contract,
+        HERMES_CONTRACT_BASE64: contract,
+        OPENCLAW_CONTRACT_BASE64: contract,
+        RUNNER_TEMP: root,
+      },
+    });
+    return {
+      restored: fs.existsSync(path.join(root, "managed-base-contract", "contract.json")),
+      status: result.status,
+      stderr: result.stderr,
+    };
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 export function runPublicationBarrier(
   script: string,
   mutate: CandidateMutation = (value) => value,
   afterBarrier = "",
+  options: BarrierOptions = {},
 ): {
   dockerCalls: string[];
   status: number | null;
@@ -199,6 +264,7 @@ export function runPublicationBarrier(
         GITHUB_RUN_ID: runId,
         GITHUB_SHA: revision,
         PATH: `${bin}:${process.env.PATH ?? ""}`,
+        PUBLICATION_COHORT: options.publicationCohort ?? cohort,
         RUNNER_TEMP: root,
       },
     });
@@ -219,6 +285,7 @@ export function runManagedImagePromotion(
   script: string,
   failCohortAgent = "",
   pointerScript = "",
+  options: PromotionOptions = {},
 ): PromotionResult {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-managed-promotion-"));
   const bin = path.join(root, "bin");
@@ -241,19 +308,29 @@ agent_for_reference() {
     *) return 1 ;;
   esac
 }
+reference_path() {
+  reference_digest="$(printf '%s' "$1" | sha256sum | awk '{print $1}')"
+  printf '%s/references/%s.raw\n' "$STATE_ROOT" "$reference_digest"
+}
+store_reference() {
+  install -d -m 0700 "$STATE_ROOT/references"
+  cp "$2" "$(reference_path "$1")"
+}
 if [ "\${1:-} \${2:-} \${3:-}" = "buildx imagetools create" ]; then
   shift 3
-  tag=""
+  tags=()
   metadata=""
   files=()
+  source_reference=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --tag) tag="$2"; shift 2 ;;
+      --tag) tags+=("$2"); shift 2 ;;
       --metadata-file) metadata="$2"; shift 2 ;;
       --file) files+=("$2"); shift 2 ;;
-      *) shift ;;
+      *) source_reference="$1"; shift ;;
     esac
   done
+  tag="\${tags[0]:-}"
   if [[ "$tag" == *':cohort-'* ]]; then
     agent="$(agent_for_reference "$tag")"
     if [ -n "\${FAIL_COHORT_AGENT:-}" ] && [ "$agent" = "$FAIL_COHORT_AGENT" ]; then
@@ -274,19 +351,38 @@ if [ "\${1:-} \${2:-} \${3:-}" = "buildx imagetools create" ]; then
         size: $size
       }
     }' > "$metadata"
+    for alias in "\${tags[@]}"; do
+      store_reference "$alias" "$raw"
+    done
+    store_reference "\${tag%:*}@$digest" "$raw"
+  elif [ -n "$source_reference" ]; then
+    source_path="$(reference_path "$source_reference")"
+    if [ ! -f "$source_path" ]; then
+      exit 92
+    fi
+    if [ "\${RETAIN_STALE_POINTER_ALIASES:-}" != "1" ]; then
+      for alias in "\${tags[@]}"; do
+        store_reference "$alias" "$source_path"
+      done
+    fi
   fi
 elif [ "\${1:-} \${2:-} \${3:-}" = "buildx imagetools inspect" ] &&
      [ "\${5:-}" = "--raw" ]; then
-  agent="$(agent_for_reference "$4")"
-  cat "$STATE_ROOT/$agent.raw"
+  cat "$(reference_path "$4")"
 fi
 `,
   );
   fs.chmodSync(path.join(bin, "docker"), 0o755);
+  const candidateValues = options.mutate ? options.mutate(candidates()) : candidates();
   fs.writeFileSync(
     candidateSet,
-    `${JSON.stringify(candidates().map(({ contract }) => contract))}\n`,
+    `${JSON.stringify(candidateValues.map(({ contract }) => contract))}\n`,
   );
+  if (options.retainStalePointerAliases) {
+    const stalePointer = referenceStatePath(root, `${imageFor("openclaw")}:${revision}`);
+    fs.mkdirSync(path.dirname(stalePointer));
+    fs.writeFileSync(stalePointer, '{"stale":true}\n');
+  }
 
   try {
     const result = spawnSync("bash", ["-c", `${script}\n${pointerScript}`], {
@@ -302,6 +398,8 @@ fi
         GITHUB_RUN_ID: runId,
         GITHUB_SHA: revision,
         PATH: `${bin}:${process.env.PATH ?? ""}`,
+        PUBLICATION_COHORT: options.publicationCohort ?? cohort,
+        RETAIN_STALE_POINTER_ALIASES: options.retainStalePointerAliases ? "1" : "",
         RUNNER_TEMP: root,
         STATE_ROOT: root,
       },

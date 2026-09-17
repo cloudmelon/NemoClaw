@@ -9,11 +9,13 @@ import {
   MANAGED_STARTUP_HOLD_EXECUTABLE,
 } from "../managed-startup/hold";
 import type { ManagedStartupAgent } from "../managed-startup/profile";
+import type { ManagedStartupStateRoot } from "../managed-startup/state-roots";
 import {
   type ManagedStartupRootApplyRequest,
   parseManagedStartupRootApplyRequest,
   serializeManagedStartupRootApplyRequest,
 } from "../managed-startup/root-apply";
+import { redactOnboardErrorText, sanitizeOnboardFailure } from "../diagnostics/redaction";
 
 export const MANAGED_BOOTSTRAP_SCHEMA_VERSION = 1 as const;
 export const MANAGED_BOOTSTRAP_IDENTITY_BYTES = 32;
@@ -65,6 +67,7 @@ export interface ManagedBootstrapExpectedPlan {
     readonly fingerprint: string;
   };
   readonly agentIdentity: ManagedBootstrapAgentIdentity;
+  readonly managedStateRoots: readonly ManagedStartupStateRoot[];
   readonly intendedWorkloadArgv: readonly string[];
   readonly expectedSupervisorArgv: readonly string[];
   readonly metadata: Readonly<Record<string, string>>;
@@ -270,6 +273,8 @@ export interface ManagedBootstrapRecoveryFailure {
   readonly bootstrapIdentity: string;
   /** Provider-owned diagnostic code. Central orchestration must not branch on this value. */
   readonly code: string;
+  /** Provider-wide when recovery may still own shared provider authority. */
+  readonly blockingScope: "provider" | "sandbox";
   readonly retryable: boolean;
   readonly detail: string;
 }
@@ -357,16 +362,52 @@ export class ManagedBootstrapRecoveryBlockedError extends Error {
   }
 }
 
-export function attachManagedBootstrapRollbackError(failure: Error, rollbackError: unknown): void {
-  (
-    failure as Error & {
-      managedBootstrapRollbackError?: unknown;
-    }
-  ).managedBootstrapRollbackError = rollbackError;
-  const detail = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
-  if (!failure.message.includes(detail)) {
-    failure.message = `${failure.message}\nManaged bootstrap rollback requires attention: ${detail}`;
+/** Retain rollback evidence on the original failure, redacting Error and string details before adding recovery guidance. */
+export function attachManagedBootstrapRollbackError(failure: Error, rollbackError: unknown): Error {
+  const redactedRollbackError = sanitizeOnboardFailure(rollbackError);
+  const rollbackDescriptor = Object.getOwnPropertyDescriptor(
+    failure,
+    "managedBootstrapRollbackError",
+  );
+  if (rollbackDescriptor?.configurable || (!rollbackDescriptor && Object.isExtensible(failure))) {
+    Object.defineProperty(failure, "managedBootstrapRollbackError", {
+      configurable: true,
+      enumerable: true,
+      value: redactedRollbackError,
+      writable: true,
+    });
+  } else if (rollbackDescriptor && "value" in rollbackDescriptor && rollbackDescriptor.writable) {
+    Object.defineProperty(failure, "managedBootstrapRollbackError", {
+      value: redactedRollbackError,
+    });
   }
+  const detailDescriptor = Object.getOwnPropertyDescriptor(redactedRollbackError, "message");
+  const detail =
+    detailDescriptor && "value" in detailDescriptor && typeof detailDescriptor.value === "string"
+      ? detailDescriptor.value
+      : "Rollback failure details were redacted.";
+  const messageDescriptor = Object.getOwnPropertyDescriptor(failure, "message");
+  const message =
+    messageDescriptor && "value" in messageDescriptor && typeof messageDescriptor.value === "string"
+      ? redactOnboardErrorText(messageDescriptor.value)
+      : "Managed bootstrap failed.";
+  if (message.includes(detail)) return redactedRollbackError;
+  const nextMessage = `${message}\nManaged bootstrap rollback requires attention: ${detail}`;
+  if (
+    (!messageDescriptor && !Object.isExtensible(failure)) ||
+    (messageDescriptor &&
+      !messageDescriptor.configurable &&
+      (!("value" in messageDescriptor) || !messageDescriptor.writable))
+  ) {
+    return redactedRollbackError;
+  }
+  Object.defineProperty(failure, "message", {
+    configurable: messageDescriptor?.configurable ?? true,
+    enumerable: messageDescriptor?.enumerable ?? false,
+    value: nextMessage,
+    writable: messageDescriptor && "value" in messageDescriptor ? messageDescriptor.writable : true,
+  });
+  return redactedRollbackError;
 }
 
 export interface ManagedBootstrapAdapter {
@@ -511,6 +552,7 @@ function normalizeRecoveryFailure(
     candidate === null ||
     Array.isArray(candidate) ||
     candidate.schemaVersion !== MANAGED_BOOTSTRAP_SCHEMA_VERSION ||
+    (candidate.blockingScope !== "provider" && candidate.blockingScope !== "sandbox") ||
     typeof candidate.retryable !== "boolean"
   ) {
     protocolFail("recovery failure has an invalid schema");
@@ -537,6 +579,7 @@ function normalizeRecoveryFailure(
     sandbox: candidate.sandbox === null ? null : Object.freeze({ ...candidate.sandbox }),
     bootstrapIdentity: candidate.bootstrapIdentity,
     code: candidate.code,
+    blockingScope: candidate.blockingScope,
     retryable: candidate.retryable,
     detail: candidate.detail,
   });
@@ -578,7 +621,7 @@ export async function recoverManagedBootstrapTransactions(
   });
 }
 
-/** Block only failures that can own the requested name; warn for exact unrelated sandboxes. */
+/** Block failures that own the requested name or retain provider-wide shared authority. */
 export function enforceManagedBootstrapRecoveryForSandbox(
   report: ManagedBootstrapRecoveryReport,
   sandboxName: string,
@@ -586,10 +629,18 @@ export function enforceManagedBootstrapRecoveryForSandbox(
 ): ManagedBootstrapRecoveryReport {
   assertOpaqueString(sandboxName, "recovery target sandbox name");
   const blocking = report.failures.filter(
-    (failure) => failure.sandbox === null || failure.sandbox.sandboxName === sandboxName,
+    (failure) =>
+      failure.blockingScope === "provider" ||
+      failure.sandbox === null ||
+      failure.sandbox.sandboxName === sandboxName,
   );
   for (const failure of report.failures) {
-    if (failure.sandbox === null || failure.sandbox.sandboxName === sandboxName) continue;
+    if (
+      failure.blockingScope === "provider" ||
+      failure.sandbox === null ||
+      failure.sandbox.sandboxName === sandboxName
+    )
+      continue;
     warn(
       `Managed bootstrap recovery retained unrelated sandbox '${failure.sandbox.sandboxName}' ` +
         `(${failure.bootstrapIdentity}, ${failure.code}).`,
@@ -768,9 +819,64 @@ function assertExpectedPlan(
     protocolFail("planned profile does not match the root application request");
   }
   assertAgentIdentity(plan.agentIdentity);
+  assertManagedStateRoots(plan.managedStateRoots);
   assertArgv(plan.intendedWorkloadArgv, "intended workload");
   assertArgv(plan.expectedSupervisorArgv, "expected supervisor");
   assertMetadata(plan.metadata);
+}
+
+function assertManagedStateRoots(roots: readonly ManagedStartupStateRoot[]): void {
+  if (!Array.isArray(roots)) protocolFail("managed state roots must be one exact list");
+  const targets = new Set<string>();
+  const resources = new Set<string>();
+  for (const root of roots) {
+    if (
+      typeof root !== "object" ||
+      root === null ||
+      Array.isArray(root) ||
+      typeof root.mountTarget !== "string" ||
+      !root.mountTarget.startsWith("/") ||
+      root.mountTarget === "/" ||
+      root.mountTarget.includes("\0") ||
+      typeof root.resourceIdentity !== "string" ||
+      root.resourceIdentity.length === 0 ||
+      root.resourceIdentity.includes("\0") ||
+      targets.has(root.mountTarget) ||
+      resources.has(root.resourceIdentity) ||
+      typeof root.ownershipLabels !== "object" ||
+      root.ownershipLabels === null ||
+      Array.isArray(root.ownershipLabels) ||
+      Object.entries(root.ownershipLabels).some(
+        ([name, value]) => name.length === 0 || typeof value !== "string",
+      ) ||
+      !Number.isSafeInteger(root.uid) ||
+      root.uid < 0 ||
+      !Number.isSafeInteger(root.gid) ||
+      root.gid < 0 ||
+      !Number.isSafeInteger(root.mode) ||
+      root.mode < 0 ||
+      root.mode > 0o7777 ||
+      typeof root.readWrite !== "boolean"
+    ) {
+      protocolFail("managed state-root declaration is invalid");
+    }
+    targets.add(root.mountTarget);
+    resources.add(root.resourceIdentity);
+  }
+}
+
+function freezeManagedStateRoots(
+  roots: readonly ManagedStartupStateRoot[],
+): readonly ManagedStartupStateRoot[] {
+  assertManagedStateRoots(roots);
+  return Object.freeze(
+    roots.map((root) =>
+      Object.freeze({
+        ...root,
+        ownershipLabels: freezeMetadata(root.ownershipLabels),
+      }),
+    ),
+  );
 }
 
 function freezeArgv(argv: readonly string[], label: string): readonly string[] {
@@ -822,6 +928,7 @@ function normalizeExpectedPlan(
       gid: plan.agentIdentity.gid,
       workdir: plan.agentIdentity.workdir,
     }),
+    managedStateRoots: freezeManagedStateRoots(plan.managedStateRoots),
     intendedWorkloadArgv: freezeArgv(plan.intendedWorkloadArgv, "intended workload"),
     expectedSupervisorArgv: freezeArgv(plan.expectedSupervisorArgv, "expected supervisor"),
     metadata: freezeMetadata(plan.metadata),

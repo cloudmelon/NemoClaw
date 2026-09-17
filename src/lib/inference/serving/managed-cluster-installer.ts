@@ -1,10 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { resolveVllmPort } from "../../core/vllm-port.js";
 import { isAffirmativeAnswer } from "../../onboard/prompt-helpers.js";
 import type { VllmProfile } from "../vllm.js";
 import { ensureManagedVllmApiKey } from "../vllm-api-key.js";
-import { assertGatedModelAccess, VLLM_EXTRA_ARGS_ENV, type VllmModelDef } from "../vllm-models.js";
+import {
+  assertGatedModelAccess,
+  VLLM_EXTRA_ARGS_ENV,
+  type VllmModelDef,
+  vllmModelMatchesAlias,
+} from "../vllm-models.js";
 import { imageStorageRequirementBytes, modelStorageRequirementBytes } from "../vllm-storage.js";
 import {
   claimManagedClusterManagedServingCapability,
@@ -52,6 +58,14 @@ export interface ManagedClusterInstallerOptions {
   readonly platform: VllmProfile["platform"];
   readonly promptFn: (question: string) => Promise<string>;
   readonly beforeInstall?: (modelId: string) => void;
+  readonly checkpointInstallIntent?: (modelId: string) => void;
+  /**
+   * Model recorded by an interrupted managed install, carried separately from
+   * the environment because a serving preset owns model selection here. The
+   * caller keeps it out of `NEMOCLAW_VLLM_MODEL` so NemoClaw's own checkpoint
+   * is not mistaken for an operator override (#11148).
+   */
+  readonly resumedPresetModel?: string;
 }
 
 export interface ManagedClusterInstallerEffects {
@@ -184,8 +198,8 @@ function selectedHostStorageFailure(
 function selectedRecipeAdmissionFailure(
   capability: ManagedClusterDetectedManagedServingCapability,
   recipe: ManagedInferenceServingRecipe,
+  apiPort = recipeApiPort(recipe),
 ): SelectedRecipeAdmissionFailure | null {
-  const apiPort = recipeApiPort(recipe);
   if (apiPort === null) {
     return { code: "runtime-unknown", reason: "The selected recipe serving port is invalid." };
   }
@@ -396,6 +410,7 @@ export async function tryInstallManagedClusterManagedVllm(
 ): Promise<ManagedClusterInstallerResult> {
   if (options.platform !== "spark") return { kind: "not-selected" };
   const env = options.env ?? process.env;
+  const apiPort = resolveVllmPort(env);
   const deferToLegacy = automaticIntentDefersToLegacy(env);
 
   const deps = { ...DEFAULT_DEPS, ...overrides };
@@ -434,20 +449,40 @@ export async function tryInstallManagedClusterManagedVllm(
     if (!("topologyQualification" in previewResolution)) {
       return { kind: "not-selected" };
     }
-    const previewAdmission = selectedRecipeAdmissionFailure(detected, previewResolution.recipe);
+    const previewAdmission = selectedRecipeAdmissionFailure(
+      detected,
+      previewResolution.recipe,
+      apiPort,
+    );
     if (previewAdmission) {
       return admissionFailure(previewAdmission, detected.selectionIntent, true, deps);
     }
 
     let previewPlan: ManagedClusterVllmPlan;
     try {
-      previewPlan = deps.materializePlan(previewResolution);
+      previewPlan = deps.materializePlan(previewResolution, { apiPort });
     } catch (error) {
       deps.error(`  Managed-cluster vLLM setup stopped: ${(error as Error).message}`);
       return { kind: "handled", result: { ok: false } };
     }
+    // Revalidate the interrupted run's checkpoint against the model this
+    // preset resolves to, before the capability claim, the checkpoint write,
+    // the image pull, model staging, or any container creation. The resumed
+    // model is no longer part of the selection intent, so without this the
+    // cluster path would install the preset's model over a mismatched
+    // checkpoint (#11148).
+    const resumedPresetModel = String(options.resumedPresetModel ?? "").trim();
+    const previewModel = managedModel(previewPlan, previewResolution.recipe);
+    if (resumedPresetModel && !vllmModelMatchesAlias(previewModel, resumedPresetModel)) {
+      deps.error(
+        `  Managed-cluster vLLM setup stopped: the resumed model '${resumedPresetModel}' does not match ` +
+          `'${previewModel.envValue}', which ${NEMOCLAW_SERVING_PRESET_ENV} selects. ` +
+          "Re-run onboarding with --fresh to discard the interrupted session.",
+      );
+      return { kind: "handled", result: { ok: false } };
+    }
     try {
-      deps.assertGatedModelAccess(managedModel(previewPlan, previewResolution.recipe), env);
+      deps.assertGatedModelAccess(previewModel, env);
     } catch (error) {
       deps.error(`  Managed-cluster vLLM setup stopped: ${(error as Error).message}`);
       return { kind: "handled", result: { ok: false } };
@@ -488,6 +523,7 @@ export async function tryInstallManagedClusterManagedVllm(
     const revalidatedAdmission = selectedRecipeAdmissionFailure(
       revalidated,
       revalidatedResolution.recipe,
+      apiPort,
     );
     if (revalidatedAdmission) {
       return admissionFailure(revalidatedAdmission, revalidated.selectionIntent, false, deps);
@@ -513,7 +549,7 @@ export async function tryInstallManagedClusterManagedVllm(
 
     let plan: ManagedClusterVllmPlan;
     try {
-      plan = deps.materializePlan(resolution);
+      plan = deps.materializePlan(resolution, { apiPort });
     } catch (error) {
       deps.error(`  Managed-cluster vLLM setup stopped: ${(error as Error).message}`);
       return { kind: "handled", result: { ok: false } };
@@ -533,6 +569,9 @@ export async function tryInstallManagedClusterManagedVllm(
 
     const profile = managedProfile(plan, resolution.recipe);
     const model = managedModel(plan, resolution.recipe);
+    options.checkpointInstallIntent?.(
+      String(options.env?.NEMOCLAW_VLLM_MODEL ?? "").trim() || plan.model.id,
+    );
     options.beforeInstall?.(plan.model.servedName);
 
     const prerequisites = effects.prerequisites();

@@ -20,6 +20,9 @@ const {
   DEFAULT_AGENT_CONFIG,
   resolveAgentConfig: resolveAgentConfigTarget,
 }: typeof import("./agent-config") = require("./agent-config");
+const {
+  stripAnsi,
+}: typeof import("../adapters/openshell/client") = require("../adapters/openshell/client");
 const { createHash } = require("node:crypto");
 const fs = require("fs");
 const os = require("os");
@@ -29,28 +32,25 @@ const { isIP } = require("node:net");
 const { isErrnoException }: typeof import("../core/errno") = require("../core/errno");
 const { validateName } = require("../runner");
 const { shellQuote } = require("../core/shell-quote");
-const { dockerExecFileSync, dockerSpawnSync } = require("../adapters/docker/exec");
 const credentialFilter: typeof import("../security/credential-filter") = require("../security/credential-filter");
 const { stripCredentials, isConfigObject, isConfigValue, isCredentialField } = credentialFilter;
-const { appendAuditEntry } = require("../shields/audit");
-const {
-  withTimerBoundShieldsMutationLock,
-}: typeof import("../shields/timer-bound-lock") = require("../shields/timer-bound-lock");
+const { appendAuditEntry } = require("../state/audit/operational");
 const {
   withSandboxMutationLock,
 }: typeof import("../state/mcp-lifecycle-lock") = require("../state/mcp-lifecycle-lock");
 const {
-  runOpenClawConfigGuard,
   validateOpenClawConfigCandidate,
-}: typeof import("../shields/openclaw-config-lock") = require("../shields/openclaw-config-lock");
+  writeOpenClawConfigCandidate,
+}: typeof import("./openclaw-config-guard") = require("./openclaw-config-guard");
 const {
   isAllowedOpenShellSandboxBridgeUrl,
   isPrivateHostname,
   isPrivateIp,
 }: typeof import("../private-networks") = require("../private-networks");
 const {
-  privilegedSandboxExecArgv,
-  resolveDirectSandboxContainer,
+  capturePrivilegedSandboxCommand,
+  executePrivilegedSandboxCommand,
+  resolvePrivilegedSandboxTarget,
   withPrivilegedSandboxExecutionLease,
 }: typeof import("./privileged-exec") = require("./privileged-exec");
 const {
@@ -64,6 +64,11 @@ const {
   OPENSHELL_OPERATION_TIMEOUT_MS,
 }: typeof import("../adapters/openshell/timeouts") = require("../adapters/openshell/timeouts");
 const { redactFull }: typeof import("../security/redact") = require("../security/redact");
+const {
+  loadRotateTokenSession,
+  readStdin,
+  rotateSandboxToken,
+}: typeof import("./config-rotate-token") = require("./config-rotate-token");
 
 type ConfigObject = import("../security/credential-filter").ConfigObject;
 type ConfigValue = import("../security/credential-filter").ConfigValue;
@@ -102,7 +107,7 @@ interface ConfigUrlValidationOptions {
   allowPrivateUrls?: boolean;
 }
 
-type ManagedGatewayRestart = (sandboxName: string) => { ok: boolean };
+type ManagedGatewayRestart = (sandboxName: string) => Promise<{ ok: boolean }>;
 
 export class SandboxConfigError extends Error {
   readonly lines: readonly string[];
@@ -121,15 +126,15 @@ function configFail(lines: string | readonly string[], exitCode = 1): never {
   throw new SandboxConfigError(lines, exitCode);
 }
 
-function restartSandboxAgentAfterConfigSet(
+async function restartSandboxAgentAfterConfigSet(
   sandboxName: string,
   agentName: string,
   restartImpl?: ManagedGatewayRestart,
-): void {
+): Promise<void> {
   const restart =
     restartImpl ??
     (require("../actions/sandbox/process-recovery").restartSandboxGateway as ManagedGatewayRestart);
-  const result = restart(sandboxName);
+  const result = await restart(sandboxName);
   if (!result.ok) {
     // The config was already written to disk (the CAS write above succeeded),
     // but the running agent was not reloaded. Say so plainly and point at the
@@ -194,11 +199,11 @@ function privilegedSandboxExec(
     sandboxName,
     "sandbox config privileged execution",
     () =>
-      dockerExecFileSync(privilegedSandboxExecArgv(sandboxName, cmd, hasInput, true), {
-        input: opts.input,
-        stdio: hasInput ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+      capturePrivilegedSandboxCommand(sandboxName, cmd, {
+        ...(hasInput ? { input: opts.input } : {}),
+        sanitizeEnvironment: true,
         timeout: opts.timeout ?? 30000,
-      }),
+      }).toString("utf8"),
   );
 }
 
@@ -207,24 +212,20 @@ function openClawConfigGuardExec(sandboxName: string, expectedContainerId?: stri
     run: (cmd: string[], input?: string) => {
       try {
         return withPrivilegedSandboxExecutionLease(sandboxName, "OpenClaw config guard", () => {
-          const argv = privilegedSandboxExecArgv(
-            sandboxName,
-            cmd,
-            input !== undefined,
-            true,
-            expectedContainerId,
-          );
-          const result = dockerSpawnSync(argv, {
-            encoding: "utf-8",
-            input,
+          const result = executePrivilegedSandboxCommand(sandboxName, cmd, {
+            ...(input === undefined ? {} : { input }),
+            sanitizeEnvironment: true,
+            ...(expectedContainerId === undefined
+              ? {}
+              : { expectedResourceHandle: expectedContainerId }),
             timeout: OPENCLAW_CONFIG_GUARD_TIMEOUT_MS,
-            maxBuffer: 2 * 1024 * 1024,
+            maxOutputBytes: 2 * 1024 * 1024,
           });
           return {
             status: result.status,
             signal: result.signal,
-            stdout: String(result.stdout ?? ""),
-            stderr: String(result.stderr ?? ""),
+            stdout: result.stdout.toString("utf8"),
+            stderr: result.stderr.toString("utf8"),
             ...(result.error ? { error: result.error.message } : {}),
           };
         });
@@ -443,6 +444,26 @@ function parseCliConfigValue(rawValue: string): ConfigValue {
 }
 
 /**
+ * True when an OpenShell `sandbox exec` failure detail reports the sandbox
+ * itself is not ready (for example, stopped), rather than an unrelated exec
+ * failure. Normalizes ANSI codes, the CLI's box-drawing error marker, and
+ * line-wrapping whitespace so a wrapped multi-line rendering of the same
+ * message still matches (#10251).
+ */
+function isSandboxNotReadyExecDetail(detail: string): boolean {
+  const normalized = stripAnsi(detail)
+    .replace(/[×│]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return (
+    /sandbox '[^']*' is not ready \(phase: \w+\)/i.test(normalized) ||
+    /^Error: code: 'The system is not in a state required for the operation's execution', message: "sandbox is not ready"$/i.test(
+      normalized,
+    )
+  );
+}
+
+/**
  * Read the agent's config from a running sandbox.
  * Resolves the correct config path based on the agent type.
  */
@@ -462,15 +483,30 @@ function readSandboxConfig(sandboxName: string, target: AgentConfigTarget): Conf
       },
     );
     if (result.error || result.signal || result.status !== 0) {
-      const detail = result.error?.message || result.stderr?.trim() || result.output;
-      configFail(
-        `  Cannot read ${target.agentName} config (${target.configPath})${detail ? `: ${detail}` : "."}`,
-      );
+      // Diagnostic channels only. `result.output` is stdout-first, and stdout
+      // here is the agent config `cat` printed, so echoing it would put config
+      // contents — credentials included — into a CLI error.
+      const detail = result.error?.message || result.stderr?.trim();
+      // Preserve a failed exec's detail. `configFail` throws, so it must not be
+      // caught and replaced with the generic stopped-sandbox message below.
+      // Exception: a "sandbox is not ready" detail IS the stopped-sandbox case
+      // (#10251, a regression of #6997) — fall through to the generic message
+      // below instead, so the actionable "Is the sandbox running?" / "Start
+      // the sandbox and retry." guidance survives instead of a raw OpenShell
+      // error.
+      if (detail && !isSandboxNotReadyExecDetail(detail)) {
+        configFail(`  Cannot read ${target.agentName} config (${target.configPath}): ${detail}`);
+      }
+      raw = "";
+    } else {
+      // `output` is display-normalized with trim(); the transaction digest must
+      // bind the exact bytes returned by `cat`, including its final newline.
+      raw = result.stdout ?? result.output ?? "";
     }
-    // `output` is display-normalized with trim(); the transaction digest must
-    // bind the exact bytes returned by `cat`, including its final newline.
-    raw = result.stdout ?? result.output ?? "";
-  } catch {
+  } catch (error) {
+    // Only unexpected capture failures become empty reads. A diagnostic raised
+    // above already names the reason and must reach the caller (#9104).
+    if (error instanceof SandboxConfigError) throw error;
     raw = "";
   }
 
@@ -498,7 +534,7 @@ function readSandboxConfig(sandboxName: string, target: AgentConfigTarget): Conf
 
 type ValidatedOpenClawCandidate = {
   content: string;
-  privileged: import("../shields/state-dir-lock").PrivilegedExec;
+  privileged: import("./openclaw-config-guard").PrivilegedExec;
 };
 
 function isHermesCompatHashRecoveryError(error: unknown): boolean {
@@ -572,13 +608,10 @@ function writeSandboxConfig(
         "Refusing OpenClaw config write without the digest from the matching sandbox read.",
       );
     }
-    const result = runOpenClawConfigGuard(
+    const result = writeOpenClawConfigCandidate(
       validatedOpenClawCandidate?.privileged ?? openClawConfigGuardExec(sandboxName),
-      "write-config",
-      {
-        expectedConfigSha256,
-        input: content,
-      },
+      content,
+      expectedConfigSha256,
     );
     if (result.issues.length > 0) {
       configFail(result.issues.map((issue) => `  ${issue}`));
@@ -815,7 +848,10 @@ function runHermesDashboardConfigSeed(
 function seedHermesDashboardConfig(
   sandboxName: string,
   target: AgentConfigTarget,
-  deps: HermesDashboardReseedDeps = { getOpenshellBinary, captureOpenshellCommand },
+  deps: HermesDashboardReseedDeps = {
+    getOpenshellBinary,
+    captureOpenshellCommand,
+  },
 ): HermesDashboardReseedResult {
   return runHermesDashboardConfigSeed(sandboxName, target, false, deps);
 }
@@ -823,7 +859,10 @@ function seedHermesDashboardConfig(
 function restoreHermesDashboardConfig(
   sandboxName: string,
   target: AgentConfigTarget,
-  deps: HermesDashboardReseedDeps = { getOpenshellBinary, captureOpenshellCommand },
+  deps: HermesDashboardReseedDeps = {
+    getOpenshellBinary,
+    captureOpenshellCommand,
+  },
 ): HermesDashboardReseedResult {
   return runHermesDashboardConfigSeed(sandboxName, target, true, deps);
 }
@@ -917,7 +956,11 @@ async function validateUrlValueWithDnsResult(
   assertPublicHost(hostname);
   const lookupHostname = hostnameForDnsLookup(hostname);
   if (isIP(lookupHostname)) {
-    return { protocol: parsed.protocol as "http:" | "https:", originalUrl, pinnedUrl: originalUrl };
+    return {
+      protocol: parsed.protocol as "http:" | "https:",
+      originalUrl,
+      pinnedUrl: originalUrl,
+    };
   }
 
   let addresses: Array<{ address: string; family?: number }>;
@@ -1113,7 +1156,10 @@ function parseConfigGetArgs(args: string[], cliName = "nemoclaw"): ConfigGetPars
     const flag = args[i];
     if (flag === "--key") {
       if (i + 1 >= args.length || args[i + 1].startsWith("--")) {
-        return { ok: false, errors: ["  --key requires a value.", configGetUsage(cliName)] };
+        return {
+          ok: false,
+          errors: ["  --key requires a value.", configGetUsage(cliName)],
+        };
       }
       opts.key = args[++i];
     } else if (flag === "--format") {
@@ -1125,11 +1171,17 @@ function parseConfigGetArgs(args: string[], cliName = "nemoclaw"): ConfigGetPars
       }
       const format = args[++i];
       if (format !== "json" && format !== "yaml") {
-        return { ok: false, errors: [`  Unknown format: ${format}. Use json or yaml.`] };
+        return {
+          ok: false,
+          errors: [`  Unknown format: ${format}. Use json or yaml.`],
+        };
       }
       opts.format = format;
     } else {
-      return { ok: false, errors: [`  Unknown flag: ${flag}`, configGetUsage(cliName)] };
+      return {
+        ok: false,
+        errors: [`  Unknown flag: ${flag}`, configGetUsage(cliName)],
+      };
     }
   }
   return { ok: true, opts };
@@ -1215,15 +1267,6 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
       `  config set is not available for '${target.agentName}': its config is baked into the sandbox image at build time. To change it, re-onboard with the new selection (e.g. ${CLI_NAME} onboard --agent dcode --name ${shellQuote(sandboxName)} --fresh).`,
     );
   }
-  if (target.agentName === "openclaw" || target.agentName === "hermes") {
-    const { isShieldsDown }: typeof import("../shields") = require("../shields");
-    if (!isShieldsDown(sandboxName, false)) {
-      configFail(
-        `  ${target.agentName} config changes are unavailable while shields are up for '${sandboxName}'. Run 'nemoclaw ${sandboxName} shields down' first.`,
-      );
-    }
-  }
-
   // Read current config
   console.log(`  Reading ${target.agentName} config...`);
   const config = readSandboxConfig(sandboxName, target);
@@ -1321,7 +1364,7 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
     setDotpath(config, opts.key, safeValue);
     const content = composeSandboxConfigBody(config, target);
     try {
-      const containerId = resolveDirectSandboxContainer(sandboxName, null);
+      const containerId = resolvePrivilegedSandboxTarget(sandboxName).resourceHandle;
       const privileged = openClawConfigGuardExec(sandboxName, containerId);
       const issues = validateOpenClawConfigCandidate(privileged, content);
       if (issues.length > 0) configFail(issues.map((issue) => `  ${issue}`));
@@ -1333,60 +1376,48 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
     }
   }
 
-  // Re-read under both mutation locks and enforce the source digest. For
+  // Re-read under the sandbox mutation lock and enforce the source digest. For
   // OpenClaw, also require the exact serialized bytes validated above.
-  await withSandboxMutationLock(sandboxName, () =>
-    withTimerBoundShieldsMutationLock(sandboxName, "config set write", () => {
-      const { isShieldsDown }: typeof import("../shields") = require("../shields");
+  await withSandboxMutationLock(sandboxName, () => {
+    const currentConfig = readSandboxConfig(sandboxName, target);
+    const currentConfigSha256 = (
+      currentConfig as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string }
+    )[CONFIG_SOURCE_SHA256];
+    if (currentConfigSha256 !== initialConfigSha256) {
+      configFail(
+        `  ${target.agentName} config changed while this update was being validated. Re-run config set against the current value.`,
+      );
+    }
+    setDotpath(currentConfig, opts.key!, safeValue);
+
+    if (target.agentName === "openclaw") {
+      const currentCandidateContent = composeSandboxConfigBody(currentConfig, target);
       if (
-        (target.agentName === "openclaw" || target.agentName === "hermes") &&
-        !isShieldsDown(sandboxName, true)
+        !validatedOpenClawCandidate ||
+        currentCandidateContent !== validatedOpenClawCandidate.content
       ) {
         configFail(
-          `  ${target.agentName} config changes are unavailable while shields are up for '${sandboxName}'. Run 'nemoclaw ${sandboxName} shields down' first.`,
+          "  OpenClaw config candidate changed after schema validation. Re-run config set against the current value.",
         );
       }
-      const currentConfig = readSandboxConfig(sandboxName, target);
-      const currentConfigSha256 = (
-        currentConfig as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string }
-      )[CONFIG_SOURCE_SHA256];
-      if (currentConfigSha256 !== initialConfigSha256) {
-        configFail(
-          `  ${target.agentName} config changed while this update was being validated. Re-run config set against the current value.`,
-        );
-      }
-      setDotpath(currentConfig, opts.key!, safeValue);
+    }
 
-      if (target.agentName === "openclaw") {
-        const currentCandidateContent = composeSandboxConfigBody(currentConfig, target);
-        if (
-          !validatedOpenClawCandidate ||
-          currentCandidateContent !== validatedOpenClawCandidate.content
-        ) {
-          configFail(
-            "  OpenClaw config candidate changed after schema validation. Re-run config set against the current value.",
-          );
-        }
-      }
-
-      console.log(`  Writing config to sandbox (${target.configPath})...`);
-      writeSandboxConfig(sandboxName, target, currentConfig, validatedOpenClawCandidate);
-      recomputeSandboxConfigHash(sandboxName, target);
-
-      appendAuditEntry({
-        action: "config_set",
-        sandbox: sandboxName,
-        timestamp: new Date().toISOString(),
-        reason: `config set ${target.agentName}:${opts.key}`,
-      });
-    }),
-  );
+    console.log(`  Writing config to sandbox (${target.configPath})...`);
+    writeSandboxConfig(sandboxName, target, currentConfig, validatedOpenClawCandidate);
+    recomputeSandboxConfigHash(sandboxName, target);
+    appendAuditEntry({
+      action: "config_set",
+      sandbox: sandboxName,
+      timestamp: new Date().toISOString(),
+      reason: `config set ${target.agentName}:${opts.key}`,
+    });
+  });
 
   console.log(`  ${target.agentName} config updated.`);
 
   // Restart if requested
   if (opts.restart) {
-    restartSandboxAgentAfterConfigSet(sandboxName, target.agentName);
+    await restartSandboxAgentAfterConfigSet(sandboxName, target.agentName);
   } else {
     console.log("");
     for (const line of buildConfigSetRestartGuidance(sandboxName, target.agentName)) {
@@ -1399,137 +1430,21 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
 // config rotate-token
 // ---------------------------------------------------------------------------
 
-interface RotateTokenOpts {
-  fromEnv?: string | null;
-  fromStdin?: boolean;
-}
+type RotateTokenOpts = import("./config-rotate-token").RotateTokenOpts;
 
 async function configRotateToken(sandboxName: string, opts: RotateTokenOpts = {}): Promise<void> {
-  validateName(sandboxName, "sandbox name");
-
-  // 1. Determine which provider and credentialEnv the sandbox uses.
-  //    Load the onboard session and verify it matches this sandbox.
-  const { loadSession } = require("../state/onboard-session");
-  const session = loadSession();
-
-  if (!session || !session.credentialEnv) {
-    configFail([
-      `  Cannot determine credential for sandbox '${sandboxName}'.`,
-      "  No onboard session found with a credentialEnv.",
-      "  Re-run: nemoclaw onboard --recreate-sandbox",
-    ]);
-  }
-
-  if (session.sandboxName && session.sandboxName !== sandboxName) {
-    configFail(`  Onboard session is for sandbox '${session.sandboxName}', not '${sandboxName}'.`);
-  }
-
-  const target = resolveAgentConfig(sandboxName);
-  const credentialEnv: string = session.credentialEnv;
-  const providerName: string = session.provider || "inference";
-
-  console.log(`  Agent:          ${target.agentName}`);
-  console.log(`  Provider:       ${providerName}`);
-  console.log(`  Credential env: ${credentialEnv}`);
-
-  // 2. Read new token
-  let newToken: string | null = null;
-
-  if (opts.fromEnv) {
-    newToken = process.env[opts.fromEnv] || null;
-    if (!newToken) {
-      configFail(`  Environment variable "${opts.fromEnv}" is not set or empty.`);
-    }
-  } else if (opts.fromStdin) {
-    newToken = await readStdin();
-  } else {
-    const { promptSecret } = require("../credentials/store");
-    newToken = await promptSecret(`  New ${credentialEnv} value: `);
-  }
-
-  if (!newToken || !newToken.trim()) {
-    configFail("  Token cannot be empty.");
-  }
-
-  newToken = newToken.trim();
-
-  // 3. Validate — no whitespace in token
-  if (/\s/.test(newToken)) {
-    configFail("  Token contains whitespace. This is likely a paste error.");
-  }
-
-  // 4. Stage the new value in the current process so the openshell update
-  //    that follows can read it via --credential <ENV>. The OpenShell
-  //    gateway becomes the system of record once the update succeeds.
-  const { saveCredential } = require("../credentials/store");
-  saveCredential(credentialEnv, newToken);
-
-  // 5. Update the openshell provider
-  console.log("  Updating openshell provider...");
-  const binary = getOpenshellBinary();
-  const result = runOpenshellCommand(
-    binary,
-    ["provider", "update", providerName, "--credential", credentialEnv],
-    {
-      env: { [credentialEnv]: newToken },
-      ignoreError: true,
-      errorLine: console.error,
-      exit: (code: number) => process.exit(code),
-    },
-  );
-
-  if (result.status !== 0) {
-    const providerType = session.providerType || "generic";
-    const createResult = runOpenshellCommand(
-      binary,
-      [
-        "provider",
-        "create",
-        "--name",
-        providerName,
-        "--type",
-        providerType,
-        "--credential",
-        credentialEnv,
-      ],
-      {
-        env: { [credentialEnv]: newToken },
-        ignoreError: true,
-        errorLine: console.error,
-        exit: (code: number) => process.exit(code),
-      },
-    );
-
-    if (createResult.status !== 0) {
-      configFail("  Failed to update provider. You may need to re-onboard.");
-    }
-  }
-
-  // 6. Audit log
-  appendAuditEntry({
-    action: "rotate_token",
-    sandbox: sandboxName,
-    timestamp: new Date().toISOString(),
-    reason: `rotate-token ${target.agentName}:${credentialEnv}`,
-  });
-
-  // 7. Output (redacted)
-  const lastFour = newToken.length > 4 ? newToken.slice(-4) : "****";
-  console.log(`  Token rotated: ****${lastFour}`);
-  console.log("");
-  console.log("  The new credential is active immediately for new sandbox requests.");
-}
-
-/**
- * Read all data from stdin until EOF.
- */
-function readStdin(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    process.stdin.on("data", (chunk: Buffer) => chunks.push(chunk));
-    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8").trim()));
-    process.stdin.on("error", reject);
-    process.stdin.resume();
+  const { promptSecret, saveCredential } =
+    require("../credentials/store") as typeof import("../credentials/store");
+  return rotateSandboxToken(sandboxName, opts, {
+    appendAuditEntry,
+    captureOpenshellCommand,
+    fail: configFail,
+    loadSession: loadRotateTokenSession,
+    promptSecret,
+    resolveAgentConfig,
+    runOpenshellCommand,
+    saveCredential,
+    validateName,
   });
 }
 
@@ -1565,7 +1480,6 @@ export {
   formatConfigValueForLogs,
   parseConfig,
   parseConfigGetArgs,
-  privilegedSandboxExecArgv,
   readSandboxConfig,
   readStdin,
   recomputeSandboxConfigHash,

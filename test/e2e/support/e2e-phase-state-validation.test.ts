@@ -314,6 +314,43 @@ describe("state-validation phase fixture", () => {
     expect(result.probes.find((probe) => probe.id === "gateway-absent")?.results).toHaveLength(2);
   });
 
+  it("validates the sandbox retained after policy-presets onboarding fails (#11485)", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue(shellResult(0, "nemoclaw v0.0.0\n"));
+    runner.enqueue(shellResult(0, "NAME\ne2e-cloud-oc\n"));
+
+    const result = await fixture(runner).from(
+      "onboarding-failure-policy-presets-required",
+      instance({
+        expectedFailure: {
+          phase: "onboarding",
+          errorClass: "policy-presets-required",
+        },
+      }),
+    );
+
+    expect(result.probes.map((probe) => probe.id)).toEqual(["cli-installed", "sandbox-running"]);
+    expect(runner.calls.map((call) => call.args)).toEqual([["--version"], ["list"]]);
+  });
+
+  it("rejects a missing retained sandbox after policy-presets onboarding fails (#11485)", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue(shellResult(0, "nemoclaw v0.0.0\n"));
+    runner.enqueue(shellResult(0, "NAME\nother-sandbox\n"));
+
+    await expect(
+      fixture(runner).from(
+        "onboarding-failure-policy-presets-required",
+        instance({
+          expectedFailure: {
+            phase: "onboarding",
+            errorClass: "policy-presets-required",
+          },
+        }),
+      ),
+    ).rejects.toThrow("expected sandbox 'e2e-cloud-oc' to be running");
+  });
+
   it("fails a gateway-absent probe if the gateway is running", async () => {
     const runner = new FakeRunner();
     runner.enqueue(shellResult(0, "nemoclaw v0.0.0\n"));
@@ -444,10 +481,10 @@ describe("state-validation phase fixture", () => {
 
       await fixture(runner).from("preflight-failure-no-sandbox", instance());
 
-      for (const call of runner.calls.slice(1)) {
+      runner.calls.slice(1).forEach((call) => {
         expect(call.options?.env).toEqual(expect.objectContaining({ PATH: expect.any(String) }));
         expect(call.options?.env).not.toHaveProperty("NVIDIA_INFERENCE_API_KEY");
-      }
+      });
     } finally {
       if (original === undefined) {
         delete process.env.NVIDIA_INFERENCE_API_KEY;

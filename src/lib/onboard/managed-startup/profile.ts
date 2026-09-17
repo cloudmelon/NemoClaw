@@ -4,6 +4,10 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
+import { isLoopbackDashboardUrl } from "../../dashboard/url.ts";
+import { listMessagingCredentialEnvAssignments } from "../../messaging/channels/metadata.ts";
+import { authorizeMessagingManagedStartupFields } from "../../messaging/managed-startup-placeholders.ts";
+import { isValidDcodeUpstreamProvider } from "./dcode-upstream-provider.ts";
 
 /**
  * Versioned, bounded schema for managed-image startup intent.
@@ -55,9 +59,24 @@ const NON_SECRET_KEY_METADATA_NAMES = new Set([
   "installCacheEnvKey",
   "providerEnvKey",
   "stateKey",
+  "targetEnvKey",
 ]);
 const MESSAGING_CREDENTIAL_PLACEHOLDER_RE =
-  /^(?:openshell:resolve:env:|[A-Za-z0-9]+-OPENSHELL-RESOLVE-ENV-)(?:v[0-9]+_)?[A-Z][A-Z0-9_]*$/u;
+  /^(?:openshell:resolve:env:|[A-Za-z0-9]+-OPENSHELL-RESOLVE-ENV-)(?:(?:v[0-9]{1,20}|s[a-f0-9]{64})_)?[A-Z][A-Z0-9_]*$/u;
+const MESSAGING_CREDENTIAL_ENV_ALIASES = new Set(
+  listMessagingCredentialEnvAssignments()
+    .filter(({ sourceEnvKey, targetEnvKey }) => sourceEnvKey !== targetEnvKey)
+    .map(({ agent, sourceEnvKey, targetEnvKey }) => `${agent}\0${sourceEnvKey}\0${targetEnvKey}`),
+);
+const MESSAGING_CREDENTIAL_RUNTIME_ENV_ALIASES = new Set(
+  listMessagingCredentialEnvAssignments()
+    .filter(({ sourceEnvKey, targetEnvKey }) => sourceEnvKey !== targetEnvKey)
+    .map(
+      ({ agent, channelId, sourceEnvKey, targetEnvKey }) =>
+        `${agent}\0${channelId}\0${sourceEnvKey}\0${targetEnvKey}`,
+    ),
+);
+const JSON_ARRAY_INDEX_SEGMENT_RE = /^\[(?:0|[1-9][0-9]*)\]$/u;
 const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
   /nvapi-[A-Za-z0-9_-]{10,}/u,
   /nvcf-[A-Za-z0-9_-]{10,}/u,
@@ -92,6 +111,7 @@ export type ManagedStartupReasoningEffort = (typeof MANAGED_STARTUP_REASONING_EF
 export const MANAGED_STARTUP_DCODE_AUTO_APPROVAL_MODES = ["disabled", "thread-opt-in"] as const;
 export type ManagedStartupDcodeAutoApprovalMode =
   (typeof MANAGED_STARTUP_DCODE_AUTO_APPROVAL_MODES)[number];
+
 export const MANAGED_STARTUP_HERMES_TOOL_GATEWAYS = [
   "nous-web",
   "nous-image",
@@ -104,7 +124,12 @@ export type ManagedStartupInputModality = "text" | "image";
 export type ManagedStartupWebSearchProvider = "brave" | "tavily";
 export type ManagedStartupDeviceAuthOptOutSource = "operator" | "managed-onboard";
 
-export const MANAGED_STARTUP_AGENTS = ["openclaw", "hermes", "langchain-deepagents-code"] as const;
+export const MANAGED_STARTUP_AGENTS = [
+  "openclaw",
+  "hermes",
+  "langchain-deepagents-code",
+  "pi",
+] as const;
 
 export type ManagedStartupAgent = (typeof MANAGED_STARTUP_AGENTS)[number];
 export const MANAGED_STARTUP_MESSAGING_AGENTS = ["openclaw", "hermes"] as const;
@@ -164,8 +189,10 @@ export interface ManagedStartupOpenClawDashboard {
 export interface ManagedStartupHermesDashboardDisabled {
   readonly agent: "hermes";
   readonly mode: "disabled";
-  /** CHAT_UI_URL remains a stock image input even when host forwarding is off. */
+  /** Loopback URL retained for the OpenShell forwarding contract. */
   readonly url: string;
+  /** Browser-facing URL supplied to Hermes. Absent only in profiles created before this field. */
+  readonly browserUrl?: string;
   readonly publicPort: null;
   readonly internalPort: null;
   readonly tuiEnabled: false;
@@ -174,7 +201,10 @@ export interface ManagedStartupHermesDashboardDisabled {
 export interface ManagedStartupHermesDashboardForwarded {
   readonly agent: "hermes";
   readonly mode: "loopback-forwarded";
+  /** Loopback URL retained for the OpenShell forwarding contract. */
   readonly url: string;
+  /** Browser-facing URL supplied to Hermes. Absent only in profiles created before this field. */
+  readonly browserUrl?: string;
   readonly publicPort: number;
   readonly internalPort: number;
   readonly tuiEnabled: boolean;
@@ -189,10 +219,16 @@ export interface ManagedStartupDcodeDashboard {
   readonly mode: "disabled";
 }
 
+export interface ManagedStartupPiDashboard {
+  readonly agent: "pi";
+  readonly mode: "disabled";
+}
+
 export type ManagedStartupDashboard =
   | ManagedStartupOpenClawDashboard
   | ManagedStartupHermesDashboard
-  | ManagedStartupDcodeDashboard;
+  | ManagedStartupDcodeDashboard
+  | ManagedStartupPiDashboard;
 
 export interface ManagedStartupWebSearch {
   readonly enabled: boolean;
@@ -280,16 +316,21 @@ export interface ManagedStartupDcodeConfig {
   readonly observabilityEnabled: boolean;
 }
 
+export interface ManagedStartupPiConfig {
+  readonly agent: "pi";
+}
+
 export type ManagedStartupAgentConfig =
   | ManagedStartupOpenClawConfig
   | ManagedStartupHermesConfig
-  | ManagedStartupDcodeConfig;
+  | ManagedStartupDcodeConfig
+  | ManagedStartupPiConfig;
 
 export interface ManagedStartupProfile {
   readonly schemaVersion: typeof MANAGED_STARTUP_PROFILE_SCHEMA_VERSION;
   readonly agent: ManagedStartupAgent;
   readonly agentConfig: ManagedStartupAgentConfig;
-  readonly inference: ManagedStartupInference;
+  readonly inference: ManagedStartupInference | null;
   readonly proxy: ManagedStartupProxy;
   readonly dashboard: ManagedStartupDashboard;
   readonly tools: ManagedStartupTools;
@@ -402,6 +443,25 @@ const PROFILE_CAPABILITIES = {
     observability: "dcode-marker",
     supportsMinimalBootstrap: false,
   },
+  pi: {
+    inferenceApis: ["openai-completions"],
+    dashboardModes: ["disabled"],
+    inputModalities: [],
+    webSearchProviders: [],
+    toolGateways: [],
+    tuningFields: ["contextWindow", "maxTokens", "reasoning"],
+    supportsMessaging: false,
+    supportsInferenceCompatibility: false,
+    supportsUpstreamEndpoint: false,
+    supportsHostProxyIntent: true,
+    supportsPrimaryModelRef: false,
+    supportsAgentTimeout: false,
+    supportsHeartbeat: false,
+    supportsExtraAgents: false,
+    supportsDeviceAuth: false,
+    observability: "none",
+    supportsMinimalBootstrap: false,
+  },
 } satisfies Record<ManagedStartupAgent, ManagedStartupAgentCapabilities>;
 
 for (const agent of MANAGED_STARTUP_AGENTS) {
@@ -507,7 +567,7 @@ export const MANAGED_STARTUP_PROFILE_AFFORDANCE_INVENTORY = {
     affordance("NEMOCLAW_WEB_SEARCH_ENABLED", "agentConfig.webSearch.enabled"),
     affordance("NEMOCLAW_WEB_SEARCH_PROVIDER", "agentConfig.webSearch.provider"),
     affordance("NEMOCLAW_MESSAGING_PLAN_B64", "messaging.plan"),
-    affordance("CHAT_UI_URL", "dashboard.url"),
+    affordance("CHAT_UI_URL", "dashboard.browserUrl"),
     affordance("NEMOCLAW_DASHBOARD_PORT", "dashboard.publicPort", "runtime-env"),
     affordance("NEMOCLAW_HERMES_DASHBOARD", "dashboard.mode", "runtime-env"),
     affordance("NEMOCLAW_HERMES_DASHBOARD_PORT", "dashboard.publicPort", "runtime-env"),
@@ -536,6 +596,26 @@ export const MANAGED_STARTUP_PROFILE_AFFORDANCE_INVENTORY = {
     affordance("NEMOCLAW_PROXY_HOST", "proxy.managedHost"),
     affordance("NEMOCLAW_PROXY_PORT", "proxy.managedPort"),
     affordance("NEMOCLAW_OBSERVABILITY", "agentConfig.observabilityEnabled", "runtime-env"),
+    affordance(
+      "NEMOCLAW_CORPORATE_CA_B64",
+      "corporateCa.bundleSha256",
+      "host-material",
+      "digest-handoff",
+    ),
+    ...HOST_PROXY_AFFORDANCES,
+  ],
+  pi: [
+    affordance("NEMOCLAW_MODEL", "inference.model"),
+    affordance("NEMOCLAW_INFERENCE_PROVIDER_ID", "inference.routeProvider"),
+    affordance("NEMOCLAW_UPSTREAM_PROVIDER", "inference.upstreamProvider"),
+    affordance("NEMOCLAW_INFERENCE_BASE_URL", "inference.routedBaseUrl"),
+    affordance("NEMOCLAW_INFERENCE_API", "inference.api"),
+    affordance("NEMOCLAW_CONTEXT_WINDOW", "tuning.contextWindow"),
+    affordance("NEMOCLAW_MAX_TOKENS", "tuning.maxTokens"),
+    affordance("NEMOCLAW_REASONING", "tuning.reasoning"),
+    affordance("NEMOCLAW_TOOL_DISCLOSURE", "tools.disclosure"),
+    affordance("NEMOCLAW_PROXY_HOST", "proxy.managedHost"),
+    affordance("NEMOCLAW_PROXY_PORT", "proxy.managedPort"),
     affordance(
       "NEMOCLAW_CORPORATE_CA_B64",
       "corporateCa.bundleSha256",
@@ -661,6 +741,13 @@ export const MANAGED_STARTUP_PROFILE_DEFERRED_RUNTIME_INPUTS = Object.freeze({
       "credential provider construction owns key metadata outside the secret-free profile",
     ),
   ]),
+  pi: Object.freeze([
+    deferredRuntimeInput(
+      "NEMOCLAW_EXTRA_PLACEHOLDER_KEYS",
+      "credential-plumbing",
+      "credential provider construction owns key metadata outside the secret-free profile",
+    ),
+  ]),
 }) satisfies Readonly<Record<ManagedStartupAgent, readonly ManagedStartupDeferredRuntimeInput[]>>;
 
 export interface ManagedStartupRuntimeCleanupObligation {
@@ -762,6 +849,7 @@ export const MANAGED_STARTUP_PROFILE_EXCLUDED_DOCKER_INPUTS = {
     { input: "NEMOCLAW_HERMES_CRON_RESTORE_CONTROLLER_SHA256", reason: "integrity-pin" },
     { input: "NEMOCLAW_HERMES_CRON_RUNTIME_PATCHER_SHA256", reason: "integrity-pin" },
     { input: "NEMOCLAW_HERMES_IMAGE_BUILD_PROBES_SHA256", reason: "integrity-pin" },
+    { input: "NEMOCLAW_HERMES_AUXILIARY_TOKEN_LIMIT_PATCHER_SHA256", reason: "integrity-pin" },
     { input: "NEMOCLAW_HERMES_CRON_EXECUTIONS_SOURCE_SHA256", reason: "integrity-pin" },
     { input: "NEMOCLAW_HERMES_BACKUP_SOURCE_SHA256", reason: "integrity-pin" },
     { input: "NEMOCLAW_HERMES_SQLITE_TEMP_STORE_PATCHER_SHA256", reason: "integrity-pin" },
@@ -783,6 +871,15 @@ export const MANAGED_STARTUP_PROFILE_EXCLUDED_DOCKER_INPUTS = {
   "langchain-deepagents-code": [
     { input: "BASE_IMAGE", reason: "release-composition" },
     { input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION", reason: "release-composition" },
+    { input: "NEMOCLAW_BUILD_ID", reason: "build-provenance" },
+    { input: "NEMOCLAW_DARWIN_VM_COMPAT", reason: "platform-build" },
+    { input: "TARGETARCH", reason: "platform-build" },
+    { input: "NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER", reason: "fixed-image-contract" },
+  ],
+  pi: [
+    { input: "BASE_IMAGE", reason: "release-composition" },
+    { input: "NEMOCLAW_MANAGED_IMAGE_CAPABILITY_UNION", reason: "release-composition" },
+    { input: "PI_VERSION", reason: "integrity-pin" },
     { input: "NEMOCLAW_BUILD_ID", reason: "build-provenance" },
     { input: "NEMOCLAW_DARWIN_VM_COMPAT", reason: "platform-build" },
     { input: "TARGETARCH", reason: "platform-build" },
@@ -839,6 +936,7 @@ const HERMES_DASHBOARD_KEYS = new Set([
   "agent",
   "mode",
   "url",
+  "browserUrl",
   "publicPort",
   "internalPort",
   "tuiEnabled",
@@ -846,7 +944,13 @@ const HERMES_DASHBOARD_KEYS = new Set([
 const DCODE_DASHBOARD_KEYS = new Set(["agent", "mode"]);
 const TOOLS_KEYS = new Set(["disclosure", "enabledGateways"]);
 const MESSAGING_KEYS = new Set(["plan"]);
-const TUNING_KEYS = new Set(["contextWindow", "maxTokens", "reasoning", "reasoningEffort"]);
+const TUNING_FIELD_ORDER = [
+  "contextWindow",
+  "maxTokens",
+  "reasoning",
+  "reasoningEffort",
+] as const satisfies readonly (keyof ManagedStartupTuning)[];
+const TUNING_KEYS = new Set<string>(TUNING_FIELD_ORDER);
 const CORPORATE_CA_KEYS = new Set(["bundleSha256"]);
 const OPENCLAW_CONFIG_KEYS = new Set([
   "agent",
@@ -860,6 +964,8 @@ const OPENCLAW_CONFIG_KEYS = new Set([
 ]);
 const HERMES_CONFIG_KEYS = new Set(["agent", "webSearch"]);
 const DCODE_CONFIG_KEYS = new Set(["agent", "autoApprovalMode", "observabilityEnabled"]);
+const PI_CONFIG_KEYS = new Set(["agent"]);
+const PI_DASHBOARD_KEYS = new Set(["agent", "mode"]);
 const WEB_SEARCH_KEYS = new Set(["enabled", "provider"]);
 const OTEL_KEYS = new Set(["enabled", "endpointUrl", "serviceName", "sampleRate"]);
 const DEVICE_AUTH_KEYS = new Set(["disabled", "optOutSource"]);
@@ -867,7 +973,22 @@ const EXTRA_AGENTS_KEYS = new Set(["agents", "defaults", "main"]);
 const MANAGED_STARTUP_AGENT_SET = new Set<string>(MANAGED_STARTUP_AGENTS);
 const DCODE_AUTO_APPROVAL_MODE_SET = new Set<string>(MANAGED_STARTUP_DCODE_AUTO_APPROVAL_MODES);
 const REASONING_EFFORT_SET = new Set<string>(MANAGED_STARTUP_REASONING_EFFORTS);
-const HERMES_RESERVED_API_PORTS = new Set([8642, 18_642]);
+const HERMES_INTERNAL_API_PORT = 18_642;
+
+const HERMES_API_PORT_RANGE_START = 8642;
+const HERMES_API_PORT_RANGE_END = 8652;
+
+function isHermesApiPort(port: number): boolean {
+  return port >= HERMES_API_PORT_RANGE_START && port <= HERMES_API_PORT_RANGE_END;
+}
+
+// A dashboard must not use the internal API port, and must not use any port in
+// the range that each Hermes sandbox allocates its public API port from.
+function isHermesReservedApiPort(port: number): boolean {
+  return port === HERMES_INTERNAL_API_PORT || isHermesApiPort(port);
+}
+
+const HERMES_RESERVED_API_PORT_LABEL = `${HERMES_API_PORT_RANGE_START}-${HERMES_API_PORT_RANGE_END} or ${HERMES_INTERNAL_API_PORT}`;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -896,13 +1017,174 @@ function valueLooksLikeSecret(value: string): boolean {
   return false;
 }
 
-function isMessagingCredentialPlaceholder(path: readonly string[], value: unknown): boolean {
-  return (
-    path.length >= 2 &&
+function isMessagingCredentialPlaceholder(
+  path: readonly string[],
+  value: unknown,
+  allowedBuildStepPlaceholders: ReadonlySet<string>,
+  allowedMessagingCredentialFields: ReadonlySet<string>,
+): boolean {
+  if (typeof value !== "string" || !MESSAGING_CREDENTIAL_PLACEHOLDER_RE.test(value)) {
+    return false;
+  }
+  if (
+    requiresMessagingSchemaFieldAuthorization(path) &&
+    !allowedMessagingCredentialFields.has(messagingAuthorizedFieldKey(path))
+  ) {
+    return false;
+  }
+  const isCredentialBindingPlaceholder =
+    path.length === 5 &&
     path[0] === "messaging" &&
     path[1] === "plan" &&
-    typeof value === "string" &&
-    MESSAGING_CREDENTIAL_PLACEHOLDER_RE.test(value)
+    path[2] === "credentialBindings" &&
+    JSON_ARRAY_INDEX_SEGMENT_RE.test(path[3] ?? "") &&
+    path[4] === "placeholder";
+  const isAgentRenderValuePlaceholder =
+    path.length >= 5 &&
+    path[0] === "messaging" &&
+    path[1] === "plan" &&
+    path[2] === "agentRender" &&
+    JSON_ARRAY_INDEX_SEGMENT_RE.test(path[3] ?? "") &&
+    path[4] === "value";
+  const isAuthorizedBuildStepPlaceholder = allowedBuildStepPlaceholders.has(
+    buildStepPlaceholderKey(path, value),
+  );
+  return (
+    isCredentialBindingPlaceholder ||
+    isAgentRenderValuePlaceholder ||
+    isAuthorizedBuildStepPlaceholder
+  );
+}
+
+function requiresMessagingSchemaFieldAuthorization(path: readonly string[]): boolean {
+  const fieldName = path[path.length - 1];
+  return fieldName === "webhook";
+}
+
+function messagingAuthorizedFieldKey(path: readonly string[]): string {
+  return JSON.stringify(path);
+}
+
+function buildStepPlaceholderKey(path: readonly string[], value: string): string {
+  return JSON.stringify([path, value]);
+}
+
+function messagingCredentialPlaceholderEnvKey(value: string): string | null {
+  if (!MESSAGING_CREDENTIAL_PLACEHOLDER_RE.test(value)) return null;
+  const marker = value.startsWith("openshell:resolve:env:")
+    ? "openshell:resolve:env:"
+    : "-OPENSHELL-RESOLVE-ENV-";
+  const key = value.slice(value.indexOf(marker) + marker.length);
+  return key.replace(/^(?:v[0-9]{1,20}|s[a-f0-9]{64})_/u, "");
+}
+
+function containsMessagingCredentialPlaceholder(value: string): boolean {
+  return value.includes("openshell:resolve:env:") || value.includes("-OPENSHELL-RESOLVE-ENV-");
+}
+
+function isMessagingCredentialPlaceholderAssignment(
+  selectedAgent: unknown,
+  path: readonly string[],
+  value: string,
+): boolean {
+  if (
+    path.length !== 6 ||
+    path[0] !== "messaging" ||
+    path[1] !== "plan" ||
+    path[2] !== "agentRender" ||
+    !JSON_ARRAY_INDEX_SEGMENT_RE.test(path[3] ?? "") ||
+    path[4] !== "lines" ||
+    !JSON_ARRAY_INDEX_SEGMENT_RE.test(path[5] ?? "")
+  ) {
+    return false;
+  }
+  const separator = value.indexOf("=");
+  if (separator <= 0 || value.indexOf("=", separator + 1) !== -1) return false;
+  const envKey = value.slice(0, separator);
+  const placeholder = value.slice(separator + 1);
+  const placeholderEnvKey = messagingCredentialPlaceholderEnvKey(placeholder);
+  return (
+    CREDENTIAL_ENV_NAME_PATTERN.test(envKey) &&
+    placeholderEnvKey !== null &&
+    (envKey === placeholderEnvKey ||
+      (typeof selectedAgent === "string" &&
+        MESSAGING_CREDENTIAL_ENV_ALIASES.has(`${selectedAgent}\0${placeholderEnvKey}\0${envKey}`)))
+  );
+}
+
+function isMessagingRuntimeEnvAliasPath(path: readonly string[]): boolean {
+  return (
+    path.length === 5 &&
+    path[0] === "messaging" &&
+    path[1] === "plan" &&
+    path[2] === "runtimeSetup" &&
+    path[3] === "envAliases" &&
+    JSON_ARRAY_INDEX_SEGMENT_RE.test(path[4] ?? "")
+  );
+}
+
+function ownDataPropertyValue(value: Record<string, unknown>, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function isCanonicalMessagingRuntimeEnvAlias(
+  selectedAgent: unknown,
+  path: readonly string[],
+  value: Record<string, unknown>,
+): boolean {
+  if (!isMessagingRuntimeEnvAliasPath(path)) return false;
+  const channelId = ownDataPropertyValue(value, "channelId");
+  const envKey = ownDataPropertyValue(value, "envKey");
+  const targetEnvKey = ownDataPropertyValue(value, "targetEnvKey");
+  const match = ownDataPropertyValue(value, "match");
+  const placeholder = ownDataPropertyValue(value, "value");
+  const expectedMatch =
+    targetEnvKey === undefined
+      ? `^openshell:resolve:env:((?:v[0-9]{1,20}|s[a-f0-9]{64})_)?${envKey}$`
+      : `^openshell:resolve:env:(?:v[0-9]{1,20}|s[a-f0-9]{64})_${envKey}$`;
+  return (
+    typeof envKey === "string" &&
+    CREDENTIAL_ENV_NAME_PATTERN.test(envKey) &&
+    match === expectedMatch &&
+    typeof placeholder === "string" &&
+    messagingCredentialPlaceholderEnvKey(placeholder) === envKey &&
+    (targetEnvKey === undefined ||
+      (typeof selectedAgent === "string" &&
+        typeof channelId === "string" &&
+        typeof targetEnvKey === "string" &&
+        CREDENTIAL_ENV_NAME_PATTERN.test(targetEnvKey) &&
+        MESSAGING_CREDENTIAL_RUNTIME_ENV_ALIASES.has(
+          `${selectedAgent}\0${channelId}\0${envKey}\0${targetEnvKey}`,
+        )))
+  );
+}
+
+function isAllowedMessagingRuntimeAliasStringPath(
+  path: readonly string[],
+  allowedAliasIndexes: ReadonlySet<string>,
+): boolean {
+  return (
+    path.length === 6 &&
+    path[0] === "messaging" &&
+    path[1] === "plan" &&
+    path[2] === "runtimeSetup" &&
+    path[3] === "envAliases" &&
+    allowedAliasIndexes.has(path[4] ?? "") &&
+    (path[5] === "match" || path[5] === "value" || path[5] === "targetEnvKey")
+  );
+}
+
+function isMessagingPackagePin(path: readonly string[], value: unknown): boolean {
+  return (
+    path.length === 6 &&
+    path[0] === "messaging" &&
+    path[1] === "plan" &&
+    path[2] === "buildSteps" &&
+    JSON_ARRAY_INDEX_SEGMENT_RE.test(path[3] ?? "") &&
+    path[4] === "value" &&
+    path[5] === "pin" &&
+    typeof value === "boolean"
   );
 }
 
@@ -1215,16 +1497,6 @@ function requireManagedProxyHost(value: unknown, where: string): string {
   return host;
 }
 
-function isLoopbackUrl(value: string): boolean {
-  const hostname = new URL(value).hostname.toLowerCase();
-  return (
-    hostname === "localhost" ||
-    hostname === "127.0.0.1" ||
-    hostname === "::1" ||
-    hostname === "[::1]"
-  );
-}
-
 function configuredDashboardPort(value: string): number {
   const explicit = new URL(value).port;
   return explicit === "" ? 18_789 : Number(explicit);
@@ -1243,6 +1515,10 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
     depth: number;
     path: readonly string[];
   }> = [{ value: root, depth: 0, path: [] }];
+  const allowedRuntimeAliasIndexes = new Set<string>();
+  const allowedMessagingCredentialFields = new Set<string>();
+  const allowedBuildStepPlaceholders = new Set<string>();
+  const selectedAgent = isPlainObject(root) ? ownDataPropertyValue(root, "agent") : undefined;
   let discoveredNodes = 1;
   let observedBytes = 0;
 
@@ -1270,8 +1546,16 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
     if (typeof current.value === "string") {
       observeText(current.value);
       if (
-        !isMessagingCredentialPlaceholder(current.path, current.value) &&
-        valueLooksLikeSecret(current.value)
+        !isAllowedMessagingRuntimeAliasStringPath(current.path, allowedRuntimeAliasIndexes) &&
+        !isMessagingCredentialPlaceholder(
+          current.path,
+          current.value,
+          allowedBuildStepPlaceholders,
+          allowedMessagingCredentialFields,
+        ) &&
+        !isMessagingCredentialPlaceholderAssignment(selectedAgent, current.path, current.value) &&
+        (valueLooksLikeSecret(current.value) ||
+          containsMessagingCredentialPlaceholder(current.value))
       ) {
         invalid(
           `payload field ${payloadPath(current.path)} contains credential-shaped string data`,
@@ -1327,6 +1611,30 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
       if ("toJSON" in current.value) {
         invalid("payload must not define a custom JSON serializer");
       }
+      if (isCanonicalMessagingRuntimeEnvAlias(selectedAgent, current.path, current.value)) {
+        allowedRuntimeAliasIndexes.add(current.path[4] as string);
+      }
+      const messagingPlanSection = current.path[2];
+      if (
+        current.path.length === 4 &&
+        current.path[0] === "messaging" &&
+        current.path[1] === "plan" &&
+        (messagingPlanSection === "buildSteps" || messagingPlanSection === "agentRender") &&
+        JSON_ARRAY_INDEX_SEGMENT_RE.test(current.path[3] ?? "")
+      ) {
+        for (const authorization of authorizeMessagingManagedStartupFields(
+          current.value,
+          messagingPlanSection,
+        )) {
+          const authorizedPath = [...current.path, ...authorization.path];
+          allowedMessagingCredentialFields.add(messagingAuthorizedFieldKey(authorizedPath));
+          if (typeof authorization.value === "string") {
+            allowedBuildStepPlaceholders.add(
+              buildStepPlaceholderKey(authorizedPath, authorization.value),
+            );
+          }
+        }
+      }
       const keys = Object.getOwnPropertyNames(current.value);
       if (
         Object.getOwnPropertySymbols(current.value).length > 0 ||
@@ -1354,7 +1662,19 @@ function assertPayloadStructureAndCredentialShapes(root: unknown): void {
           invalid("payload must contain only JSON data properties");
         }
         const child = descriptor.value;
-        if (isCredentialShapedName(key) && !isMessagingCredentialPlaceholder(current.path, child)) {
+        if (
+          isCredentialShapedName(key) &&
+          !allowedMessagingCredentialFields.has(
+            messagingAuthorizedFieldKey([...current.path, key]),
+          ) &&
+          !isMessagingCredentialPlaceholder(
+            [...current.path, key],
+            child,
+            allowedBuildStepPlaceholders,
+            allowedMessagingCredentialFields,
+          ) &&
+          !isMessagingPackagePin([...current.path, key], child)
+        ) {
           invalid(
             `payload field ${payloadPath([...current.path, key])} has a credential-shaped field name`,
           );
@@ -1493,6 +1813,11 @@ function validateAgentConfig(
     return { agent, webSearch: validateWebSearch(config.webSearch, agent) };
   }
 
+  if (agent === "pi") {
+    rejectUnknownKeys(config, PI_CONFIG_KEYS, "agentConfig");
+    return { agent };
+  }
+
   rejectUnknownKeys(config, DCODE_CONFIG_KEYS, "agentConfig");
   return {
     agent,
@@ -1534,13 +1859,16 @@ function validateDashboard(
       "dashboard.bindAddress",
     );
     const wslExposure = requireBoolean(dashboard.wslExposure, "dashboard.wslExposure");
-    const hasRemoteExposure = !isLoopbackUrl(url) || bindAddress === "0.0.0.0" || wslExposure;
+    const hasRemoteExposure =
+      !isLoopbackDashboardUrl(url) || bindAddress === "0.0.0.0" || wslExposure;
     if ((mode === "remote") !== hasRemoteExposure) {
       invalid("OpenClaw dashboard.mode must reflect its URL, bind address, and WSL exposure");
     }
     const port = requirePort(dashboard.port, "dashboard.port", 1024);
-    if (port === 8642)
-      invalid("OpenClaw dashboard.port must not use reserved Hermes API port 8642");
+    if (isHermesApiPort(port))
+      invalid(
+        `OpenClaw dashboard.port must not use a reserved Hermes API port (${HERMES_API_PORT_RANGE_START}-${HERMES_API_PORT_RANGE_END})`,
+      );
     if (configuredDashboardPort(url) !== port) {
       invalid("OpenClaw dashboard.port must match dashboard.url");
     }
@@ -1561,8 +1889,19 @@ function validateDashboard(
       "dashboard.mode",
     );
     const url = requireHttpUrl(dashboard.url, "dashboard.url");
-    if (!isLoopbackUrl(url)) {
+    if (!isLoopbackDashboardUrl(url)) {
       invalid("Hermes dashboard.url must remain loopback; OpenShell owns the host forward");
+    }
+    const browserUrl =
+      dashboard.browserUrl === undefined
+        ? undefined
+        : requireHttpUrl(dashboard.browserUrl, "dashboard.browserUrl");
+    if (
+      browserUrl !== undefined &&
+      !isLoopbackDashboardUrl(browserUrl) &&
+      new URL(browserUrl).protocol !== "https:"
+    ) {
+      invalid("Hermes dashboard.browserUrl must use HTTPS unless it is loopback");
     }
     if (mode === "disabled") {
       if (
@@ -1576,6 +1915,7 @@ function validateDashboard(
         agent,
         mode,
         url,
+        ...(browserUrl === undefined ? {} : { browserUrl }),
         publicPort: null,
         internalPort: null,
         tuiEnabled: false,
@@ -1586,20 +1926,36 @@ function validateDashboard(
     if (publicPort === internalPort) {
       invalid("Hermes dashboard publicPort and internalPort must differ");
     }
-    if (HERMES_RESERVED_API_PORTS.has(publicPort) || HERMES_RESERVED_API_PORTS.has(internalPort)) {
-      invalid("Hermes dashboard ports must not use reserved API ports 8642 or 18642");
+    if (isHermesReservedApiPort(publicPort) || isHermesReservedApiPort(internalPort)) {
+      invalid(
+        `Hermes dashboard ports must not use reserved API ports ${HERMES_RESERVED_API_PORT_LABEL}`,
+      );
     }
     if (configuredDashboardPort(url) !== publicPort) {
       invalid("Hermes dashboard.publicPort must match dashboard.url");
+    }
+    if (
+      browserUrl !== undefined &&
+      isLoopbackDashboardUrl(browserUrl) &&
+      configuredDashboardPort(browserUrl) !== publicPort
+    ) {
+      invalid("Hermes dashboard.publicPort must match dashboard.browserUrl");
     }
     return {
       agent,
       mode,
       url,
+      ...(browserUrl === undefined ? {} : { browserUrl }),
       publicPort,
       internalPort,
       tuiEnabled: requireBoolean(dashboard.tuiEnabled, "dashboard.tuiEnabled"),
     };
+  }
+
+  if (agent === "pi") {
+    rejectUnknownKeys(dashboard, PI_DASHBOARD_KEYS, "dashboard");
+    if (dashboard.mode !== "disabled") invalid("pi dashboard.mode must be disabled");
+    return { agent, mode: "disabled" };
   }
 
   rejectUnknownKeys(dashboard, DCODE_DASHBOARD_KEYS, "dashboard");
@@ -1609,10 +1965,22 @@ function validateDashboard(
   return { agent, mode: "disabled" };
 }
 
-function validateInference(value: unknown, agent: ManagedStartupAgent): ManagedStartupInference {
+function validateInference(
+  value: unknown,
+  agent: ManagedStartupAgent,
+): ManagedStartupInference | null {
+  if (value === null) {
+    if (agent !== "openclaw" && agent !== "hermes")
+      invalid(`${agent} requires inference configuration`);
+    return null;
+  }
   const inference = requireRecord(value, "inference");
   rejectUnknownKeys(inference, INFERENCE_KEYS, "inference");
   const routeProvider = requireBoundedString(inference.routeProvider, "inference.routeProvider");
+  const upstreamProvider = requireBoundedString(
+    inference.upstreamProvider,
+    "inference.upstreamProvider",
+  );
   const model = requireBoundedString(inference.model, "inference.model", MAX_MODEL_BYTES);
   const api = requireStringEnum<ManagedStartupInferenceApi>(
     inference.api,
@@ -1642,10 +2010,14 @@ function validateInference(value: unknown, agent: ManagedStartupAgent): ManagedS
           { allowEmpty: false },
         );
 
+  if (
+    upstreamEndpointUrl !== null &&
+    !MANAGED_STARTUP_PROFILE_CAPABILITIES[agent].supportsUpstreamEndpoint
+  ) {
+    invalid(`inference.upstreamEndpointUrl must be null for ${agent}`);
+  }
+
   if (agent === "openclaw") {
-    if (upstreamEndpointUrl !== null) {
-      invalid("inference.upstreamEndpointUrl must be null for openclaw");
-    }
     if (primaryModelRef === null || inputModalities === null) {
       invalid("openclaw requires primaryModelRef and inputModalities");
     }
@@ -1656,17 +2028,16 @@ function validateInference(value: unknown, agent: ManagedStartupAgent): ManagedS
     if (primaryModelRef !== null || compatibility !== null || inputModalities !== null) {
       invalid(`${agent} does not support primaryModelRef, compatibility, or inputModalities`);
     }
-    if (agent === "hermes" && upstreamEndpointUrl !== null) {
-      invalid("inference.upstreamEndpointUrl must be null for hermes");
+    if (agent === "langchain-deepagents-code" && !isValidDcodeUpstreamProvider(upstreamProvider)) {
+      invalid(
+        "inference.upstreamProvider must start with an ASCII letter or digit and contain 1-64 ASCII letters, digits, dots, underscores, or hyphens for DCode",
+      );
     }
   }
 
   return {
     routeProvider,
-    upstreamProvider: requireBoundedString(
-      inference.upstreamProvider,
-      "inference.upstreamProvider",
-    ),
+    upstreamProvider,
     model,
     routedBaseUrl: requireHttpUrl(inference.routedBaseUrl, "inference.routedBaseUrl"),
     upstreamEndpointUrl,
@@ -1739,30 +2110,27 @@ function validateTuning(value: unknown, agent: ManagedStartupAgent): ManagedStar
             "tuning.reasoningEffort",
           ),
   };
+  const advertised = new Set<string>(MANAGED_STARTUP_PROFILE_CAPABILITIES[agent].tuningFields);
+  const unsupported = TUNING_FIELD_ORDER.filter(
+    (field) => result[field] !== null && !advertised.has(field),
+  );
+  if (unsupported.length > 0) {
+    invalid(`${agent} does not support startup tuning fields: ${unsupported.join(", ")}`);
+  }
   if (agent === "openclaw") {
-    if (
-      result.contextWindow === null ||
-      result.maxTokens === null ||
-      result.reasoning === null ||
-      result.reasoningEffort === null
-    ) {
-      invalid("openclaw requires contextWindow, maxTokens, reasoning, and reasoningEffort tuning");
-    }
-  } else if (agent === "hermes") {
-    if (result.contextWindow !== null && result.contextWindow < MIN_HERMES_CONTEXT_WINDOW) {
-      invalid(`hermes contextWindow must be at least ${String(MIN_HERMES_CONTEXT_WINDOW)} tokens`);
-    }
-    if (result.maxTokens !== null || result.reasoning !== null || result.reasoningEffort !== null) {
-      invalid("hermes supports only contextWindow tuning");
-    }
-  } else if (
-    result.contextWindow !== null ||
-    result.maxTokens !== null ||
-    result.reasoning !== null
-  ) {
-    invalid(
-      "langchain-deepagents-code does not support startup tuning fields beyond reasoningEffort",
+    const missing = TUNING_FIELD_ORDER.filter(
+      (field) => advertised.has(field) && result[field] === null,
     );
+    if (missing.length > 0) {
+      invalid(`openclaw requires ${missing.join(", ")} tuning`);
+    }
+  }
+  if (
+    agent === "hermes" &&
+    result.contextWindow !== null &&
+    result.contextWindow < MIN_HERMES_CONTEXT_WINDOW
+  ) {
+    invalid(`hermes contextWindow must be at least ${String(MIN_HERMES_CONTEXT_WINDOW)} tokens`);
   }
   return result;
 }
@@ -1790,8 +2158,8 @@ export function validateManagedStartupProfile(value: unknown): ManagedStartupPro
   const messaging = requireRecord(profile.messaging, "messaging");
   rejectUnknownKeys(messaging, MESSAGING_KEYS, "messaging");
   const messagingPlan = requireJsonObjectOrNull(messaging.plan, "messaging.plan");
-  if (agent === "langchain-deepagents-code" && messagingPlan !== null) {
-    invalid("messaging.plan must be null for langchain-deepagents-code");
+  if (messagingPlan !== null && !MANAGED_STARTUP_PROFILE_CAPABILITIES[agent].supportsMessaging) {
+    invalid(`messaging.plan must be null for ${agent}`);
   }
   if (
     messagingPlan !== null &&
@@ -1802,7 +2170,6 @@ export function validateManagedStartupProfile(value: unknown): ManagedStartupPro
   ) {
     invalid("messaging.plan must be a version 1 plan for the selected agent");
   }
-
   const corporateCa = requireRecord(profile.corporateCa, "corporateCa");
   rejectUnknownKeys(corporateCa, CORPORATE_CA_KEYS, "corporateCa");
   const bundleSha256 = corporateCa.bundleSha256;

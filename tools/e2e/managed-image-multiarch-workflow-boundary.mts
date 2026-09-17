@@ -29,11 +29,14 @@ type WorkflowStep = WorkflowRecord & {
 
 const JOB_ID = PROTECTED_MANAGED_IMAGE_MULTIARCH_JOB_ID;
 const PROTECTED_RUNTIME_JOB_ID = "managed-image-protected-runtime";
-const SELECTOR = `\${{ github.repository == 'NVIDIA/NemoClaw' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.jobs == '' && inputs.targets == '') || contains(format(',{0},', inputs.jobs), ',${JOB_ID},') || contains(format(',{0},', inputs.targets), ',${JOB_ID},') || contains(format(',{0},', inputs.jobs), ',${PROTECTED_RUNTIME_JOB_ID},') || contains(format(',{0},', inputs.targets), ',${PROTECTED_RUNTIME_JOB_ID},')) }}`;
+const SELECTOR = `\${{ github.repository == 'NVIDIA/NemoClaw' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && (contains(fromJSON(needs.generate-matrix.outputs.selected_jobs), '${JOB_ID}') || contains(fromJSON(needs.generate-matrix.outputs.selected_jobs), '${PROTECTED_RUNTIME_JOB_ID}')) }}`;
 const ACTIVATION_PATH = PROTECTED_MANAGED_IMAGE_ACTIVATION_PATH;
 const DIRECT_TEST_PATH = "test/e2e/live/managed-image-multiarch-startup.test.ts";
 const REGISTRY_IMAGE =
   "docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
+const CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+const TRUSTED_HERMES_RESOLVER_ROOT = ".trusted-hermes-resolver";
+const REVIEWED_HERMES_PLATFORM_ACTION = `./${TRUSTED_HERMES_RESOLVER_ROOT}/.github/actions/resolve-reviewed-hermes-platform`;
 
 function record(value: unknown): WorkflowRecord {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -107,9 +110,10 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
     return [`workflow missing ${JOB_ID} job`];
   }
 
-  if (job.needs !== "generate-matrix") errors.push(`${JOB_ID} must depend on generate-matrix`);
-  if (job.if !== SELECTOR)
-    errors.push(`${JOB_ID} must run on main pushes and retain manual selectors`);
+  if (!isDeepStrictEqual(job.needs, ["base-image-publication", "generate-matrix"])) {
+    errors.push(`${JOB_ID} must depend on base-image-publication and generate-matrix`);
+  }
+  if (job.if !== SELECTOR) errors.push(`${JOB_ID} must use the trusted execution plan`);
   if (job["runs-on"] !== "${{ matrix.runner }}") {
     errors.push(`${JOB_ID} must run on the native matrix runner`);
   }
@@ -129,11 +133,15 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
           platform: "linux/amd64",
           runner: "ubuntu-24.04",
           shard: "linux-amd64",
+          environment_or_inference_endpoint: "AMD64 Ubuntu; exact managed image startup",
+          coverage_variant: "linux-amd64",
         },
         {
           platform: "linux/arm64",
           runner: "ubuntu-24.04-arm",
           shard: "linux-arm64",
+          environment_or_inference_endpoint: "Arm64 Ubuntu; exact managed image startup",
+          coverage_variant: "linux-arm64",
         },
       ],
     },
@@ -147,7 +155,7 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
       "${{ github.workspace }}/e2e-artifacts/live/managed-image-multiarch-startup/${{ matrix.shard }}",
     E2E_JOB: "1",
     E2E_TARGET_ID: JOB_ID,
-    NEMOCLAW_E2E_EXPECTED_SHA: "${{ inputs.checkout_sha }}",
+    NEMOCLAW_E2E_EXPECTED_SHA: "${{ inputs.checkout_sha || github.sha }}",
     NEMOCLAW_E2E_SHARD: "${{ matrix.shard }}",
     NEMOCLAW_PROTECTED_MANAGED_IMAGE_BASE_SHA:
       "${{ inputs.base_sha || github.event.before || github.sha }}",
@@ -186,6 +194,7 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
   requireFragments(errors, guard, [
     '"NVIDIA/NemoClaw"',
     '"refs/heads/main"',
+    '"$REF" == refs/heads/*',
     '"push"',
     '"workflow_dispatch"',
     '[[ "$CHECKOUT_SHA" =~ ^[a-f0-9]{40}$ && "$BASE_SHA" =~ ^[a-f0-9]{40}$ ]]',
@@ -194,13 +203,49 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
   ]);
 
   const checkouts = steps.filter((step) => text(step.uses).startsWith("actions/checkout@"));
-  if (checkouts.length !== 1) errors.push(`${JOB_ID} must define exactly one candidate checkout`);
-  requireValues(errors, `${JOB_ID} candidate checkout`, record(checkouts[0]?.with), {
+  if (checkouts.length !== 2) {
+    errors.push(`${JOB_ID} must define one candidate checkout and one trusted resolver checkout`);
+  }
+  const candidateCheckout = requireStep(
+    errors,
+    steps,
+    "Checkout protected managed-image candidate source",
+  );
+  const trustedResolverPath = requireStep(
+    errors,
+    steps,
+    "Validate trusted Hermes resolver checkout path",
+  );
+  const trustedResolverCheckout = requireStep(errors, steps, "Checkout trusted Hermes resolver");
+  if (
+    candidateCheckout?.uses !== CHECKOUT_ACTION ||
+    trustedResolverCheckout?.uses !== CHECKOUT_ACTION
+  ) {
+    errors.push(`${JOB_ID} must pin the candidate and trusted resolver checkouts`);
+  }
+  requireValues(errors, `${JOB_ID} candidate checkout`, record(candidateCheckout?.with), {
     repository: "${{ inputs.checkout_repository || github.repository }}",
     ref: "${{ inputs.checkout_sha || github.sha }}",
     "fetch-depth": 0,
     "persist-credentials": false,
   });
+  requireFragments(errors, trustedResolverPath, [
+    `trusted_resolver_root="$GITHUB_WORKSPACE/${TRUSTED_HERMES_RESOLVER_ROOT}"`,
+    '[[ ! -e "$trusted_resolver_root" && ! -L "$trusted_resolver_root" ]]',
+  ]);
+  requireValues(
+    errors,
+    `${JOB_ID} trusted Hermes resolver checkout`,
+    record(trustedResolverCheckout?.with),
+    {
+      repository: "${{ github.repository }}",
+      ref: "${{ inputs.workflow_sha || github.workflow_sha }}",
+      path: TRUSTED_HERMES_RESOLVER_ROOT,
+      "sparse-checkout": ".github/actions/resolve-reviewed-hermes-platform",
+      "fetch-depth": 1,
+      "persist-credentials": false,
+    },
+  );
 
   const buildx = requireStep(errors, steps, "Set up protected managed-image Buildx");
   if (buildx?.uses !== "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c") {
@@ -221,7 +266,35 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
     '.platforms == ["linux/amd64", "linux/arm64"]',
   ]);
 
-  const bases = requireStep(errors, steps, "Resolve exact platform base images");
+  const hermesBase = requireStep(errors, steps, "Resolve reviewed Hermes platform base image");
+  if (hermesBase?.uses !== REVIEWED_HERMES_PLATFORM_ACTION) {
+    errors.push(`${JOB_ID} must use the shared reviewed Hermes platform resolver`);
+  }
+  requireValues(errors, `${JOB_ID} Hermes platform resolver`, record(hermesBase?.with), {
+    "dockerfile-path": "agents/hermes/Dockerfile",
+    platform: "${{ matrix.platform }}",
+  });
+
+  const trustedResolverCleanup = requireStep(
+    errors,
+    steps,
+    "Remove trusted Hermes resolver checkout",
+  );
+  if (trustedResolverCleanup?.if !== "always()") {
+    errors.push(`${JOB_ID} trusted Hermes resolver cleanup must always run`);
+  }
+  requireFragments(errors, trustedResolverCleanup, [
+    `trusted_resolver_root="$GITHUB_WORKSPACE/${TRUSTED_HERMES_RESOLVER_ROOT}"`,
+    '[[ -d "$trusted_resolver_root" && ! -L "$trusted_resolver_root" ]]',
+    'rm -rf -- "$trusted_resolver_root"',
+    '[[ ! -e "$trusted_resolver_root" && ! -L "$trusted_resolver_root" ]]',
+  ]);
+
+  const bases = requireStep(errors, steps, "Resolve digest-pinned platform base images");
+  requireValues(errors, `${JOB_ID} exact base resolution`, record(bases?.env), {
+    DCODE_BASE_CONTRACT: "${{ needs.base-image-publication.outputs.dcode_base_contract }}",
+    PLATFORM: "${{ matrix.platform }}",
+  });
   requireFragments(errors, bases, [
     'arch="${PLATFORM#linux/}"',
     'docker buildx imagetools inspect "$alias" --raw',
@@ -229,15 +302,27 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
     'reference="${repository}@${digest}"',
     '"sha256:$(sha256sum "$exact_raw" | awk \'{print $1}\')" == "$digest"',
     "ghcr.io/nvidia/nemoclaw/sandbox-base:latest",
-    "ghcr.io/nvidia/nemoclaw/hermes-sandbox-base:latest",
-    "ghcr.io/nvidia/nemoclaw/langchain-deepagents-code-sandbox-base:latest",
+    "'.platformReferences[$platform]' <<< \"$DCODE_BASE_CONTRACT\"",
+    'docker buildx imagetools inspect "$dcode_reference" --raw',
+    '"sha256:$(sha256sum "$work_dir/dcode-exact.raw" | awk \'{print $1}\')" == "$dcode_digest"',
+    'printf \'dcode=%s\\n\' "$dcode_reference" >> "$GITHUB_OUTPUT"',
   ]);
+  if (
+    text(bases?.run).includes(
+      "ghcr.io/nvidia/nemoclaw/langchain-deepagents-code-sandbox-base:latest",
+    )
+  ) {
+    errors.push(`${JOB_ID} must not resolve the DCode base from a mutable alias`);
+  }
+  if (text(bases?.run).includes("ghcr.io/nvidia/nemoclaw/hermes-sandbox-base:latest")) {
+    errors.push(`${JOB_ID} must resolve Hermes from the immutable reviewed Dockerfile index`);
+  }
 
   const registry = requireStep(errors, steps, "Start isolated protected managed-image registry");
   requireFragments(errors, registry, [
     'docker container inspect "$NEMOCLAW_PROTECTED_REGISTRY_NAME"',
     "http://127.0.0.1:5000/v2/",
-    "io.nvidia.nemoclaw.e2e-owner=${NEMOCLAW_PROTECTED_MANAGED_IMAGE_COHORT}",
+    "io.nvidia.nemoclaw.managed-image.cohort=${NEMOCLAW_PROTECTED_MANAGED_IMAGE_COHORT}",
     "--publish 127.0.0.1:5000:5000",
     REGISTRY_IMAGE,
   ]);
@@ -254,6 +339,10 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
     '--hermes-base "$BASE_HERMES"',
     '--dcode-base "$BASE_DCODE"',
   ]);
+  requireValues(errors, `${JOB_ID} protected build bases`, record(build?.env), {
+    BASE_HERMES:
+      "ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@${{ steps.hermes-base.outputs.digest }}",
+  });
 
   const direct = requireStep(errors, steps, "Run every exact managed-image contract directly");
   requireFragments(errors, direct, [
@@ -277,10 +366,22 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
   const cleanup = requireStep(errors, steps, "Remove isolated protected managed-image registry");
   if (cleanup?.if !== "always()") errors.push(`${JOB_ID} registry cleanup must always run`);
   requireFragments(errors, cleanup, [
-    "io.nvidia.nemoclaw.e2e-owner",
+    "io.nvidia.nemoclaw.managed-image.cohort",
     '[[ "$owner" == "$NEMOCLAW_PROTECTED_MANAGED_IMAGE_COHORT" ]]',
     'docker rm -f "$NEMOCLAW_PROTECTED_REGISTRY_NAME"',
     "http://127.0.0.1:5000/v2/",
+  ]);
+
+  const cohortCleanup = requireStep(
+    errors,
+    steps,
+    "Remove protected managed-image cohort resources",
+  );
+  if (cohortCleanup?.if !== "always()") errors.push(`${JOB_ID} cohort cleanup must always run`);
+  requireFragments(errors, cohortCleanup, [
+    'label="io.nvidia.nemoclaw.managed-image.cohort=${NEMOCLAW_PROTECTED_MANAGED_IMAGE_COHORT}"',
+    'docker image rm -f "${owned_images[@]}"',
+    'docker volume rm -f "${owned_volumes[@]}"',
   ]);
 
   const evidence = requireStep(errors, steps, "Validate protected managed-image evidence");
@@ -307,17 +408,50 @@ export function validateManagedImageMultiarchWorkflow(workflow: WorkflowRecord):
     "compression-level": 0,
     overwrite: true,
   });
+  const security = requireStep(errors, steps, "Validate OpenClaw managed-image security boundary");
+  if (security?.["continue-on-error"] !== undefined) {
+    errors.push(`${JOB_ID} managed-image security boundary must not continue on error`);
+  }
+  requireFragments(errors, security, [
+    "env -u DOCKER_CONFIG -u DOCKERHUB_USERNAME -u DOCKERHUB_TOKEN",
+    "npx vitest run --project integration",
+    "test/e2e-runtime/managed-image-openclaw-security.test.ts",
+    "--reporter=test/e2e/risk-signal-reporter.ts",
+  ]);
+  const glibc = requireStep(errors, steps, "Validate managed-image glibc probe lifecycle");
+  if (glibc?.if !== "${{ !cancelled() }}") {
+    errors.push(`${JOB_ID} managed-image glibc probe must run unless cancelled`);
+  }
+  if (glibc?.["continue-on-error"] !== undefined) {
+    errors.push(`${JOB_ID} managed-image glibc probe must not continue on error`);
+  }
+  requireFragments(errors, glibc, [
+    "export NEMOCLAW_RUN_GLIBC_PROBE_DOCKER_E2E=1",
+    "NEMOCLAW_TEST_IMAGE=",
+    "env -u DOCKER_CONFIG -u DOCKERHUB_USERNAME -u DOCKERHUB_TOKEN",
+    "npx vitest run --project integration",
+    "test/e2e-runtime/image-compatibility-docker-lifecycle.test.ts",
+    "--reporter=test/e2e/risk-signal-reporter.ts",
+  ]);
   requireStep(errors, steps, "Upload protected managed-image evidence");
   requireStep(errors, steps, "Clean up Docker auth");
   requireOrderedSteps(errors, steps, [
     "Validate protected exact-head dispatch",
+    "Checkout protected managed-image candidate source",
+    "Validate trusted Hermes resolver checkout path",
+    "Checkout trusted Hermes resolver",
     "Validate candidate activation contract",
-    "Resolve exact platform base images",
+    "Resolve reviewed Hermes platform base image",
+    "Remove trusted Hermes resolver checkout",
+    "Resolve digest-pinned platform base images",
     "Start isolated protected managed-image registry",
     "Build exact all-agent protected managed images",
     "Run every exact managed-image contract directly",
     "Remove isolated protected managed-image registry",
     "Validate protected managed-image evidence",
+    "Validate OpenClaw managed-image security boundary",
+    "Validate managed-image glibc probe lifecycle",
+    "Remove protected managed-image cohort resources",
     "Publish exact amd64 protected runtime build cache",
     "Upload protected managed-image evidence",
     "Clean up Docker auth",

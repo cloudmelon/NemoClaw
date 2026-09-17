@@ -160,10 +160,11 @@ function registryFields(
   profile: ManagedStartupProfile,
   source: SandboxEntry,
 ): ManagedWorkloadCloneRegistryFields {
+  if (profile.inference === null) fail("Cannot clone a sandbox without configured inference");
   const webSearch =
-    profile.agentConfig.agent === "langchain-deepagents-code"
-      ? null
-      : profile.agentConfig.webSearch;
+    profile.agentConfig.agent === "openclaw" || profile.agentConfig.agent === "hermes"
+      ? profile.agentConfig.webSearch
+      : null;
   const hermesDashboard = profile.dashboard.agent === "hermes" ? profile.dashboard : null;
   const dcodeConfig =
     profile.agentConfig.agent === "langchain-deepagents-code" ? profile.agentConfig : null;
@@ -250,8 +251,8 @@ function reboundMessaging(
   destinationSandboxName: string,
 ): SandboxMessagingState | undefined {
   if (profile.messaging.plan === null) return undefined;
-  if (profile.agent === "langchain-deepagents-code") {
-    fail("DCode clone unexpectedly produced a messaging plan");
+  if (profile.agent === "langchain-deepagents-code" || profile.agent === "pi") {
+    fail(`${profile.agent} clone unexpectedly produced a messaging plan`);
   }
   const agent = profile.agent;
   const manifestRegistry = createBuiltInChannelManifestRegistry();

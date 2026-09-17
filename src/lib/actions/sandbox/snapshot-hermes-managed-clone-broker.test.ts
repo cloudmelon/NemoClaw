@@ -4,6 +4,7 @@
 import { createHash } from "node:crypto";
 
 import { describe, expect, it, type Mock, vi } from "vitest";
+import { createManagedProviderAdapter } from "../../adapters/openshell/managed-provider-adapter";
 import { managedStartupE2eProfile } from "../../../../scripts/checks/generate-managed-startup-profile-fixture.mts";
 import type { HermesToolGatewayCloneBroker } from "../../hermes-tool-gateway-clone-broker";
 import {
@@ -65,8 +66,8 @@ function sourceEntry(profile: ManagedStartupProfile): SandboxEntry {
     workload: receipt,
     lifecycleGeneration: "generation-source",
     lifecycleLiveIdentityFingerprint: createHash("sha256").update("source").digest("hex"),
-    provider: profile.inference.upstreamProvider,
-    model: profile.inference.model,
+    provider: profile.inference!.upstreamProvider,
+    model: profile.inference!.model,
     hermesToolGateways: ["nous-web"],
     hermesInferenceProvider: "source-hermes-inference",
   };
@@ -230,13 +231,13 @@ describe("Hermes managed clone broker transaction", () => {
     expect(runDeviceCodeFlow).toHaveBeenCalledOnce();
   });
 
-  it("stages one secret-free provider-neutral transaction and activates after exact creation", () => {
+  it("stages one secret-free provider-neutral transaction and activates after exact creation", async () => {
     const profile = hermesProfile();
     const source = sourceEntry(profile);
     const preparedHandoff = handoff(profile);
     const runner = providerRunner();
     const hostBroker = broker();
-    const prepared = prepareHermesManagedCloneBrokerTransaction({
+    const prepared = await prepareHermesManagedCloneBrokerTransaction({
       handoff: preparedHandoff,
       destination: null,
       environment: environment(),
@@ -252,7 +253,7 @@ describe("Hermes managed clone broker transaction", () => {
     ]);
     expect(JSON.stringify(prepared)).not.toContain("test-only-refresh-token");
 
-    const receipt = provisionHermesManagedCloneBrokerTransaction(prepared, {
+    const receipt = await provisionHermesManagedCloneBrokerTransaction(prepared, {
       ...authority(source),
       environment: environment(),
       runOpenshell: runner.run,
@@ -274,7 +275,7 @@ describe("Hermes managed clone broker transaction", () => {
     expect(receipt.phase).toBe("activated");
   });
 
-  it("preserves exact providers when activation outcome is unknown", () => {
+  it("preserves exact providers when activation outcome is unknown", async () => {
     const profile = hermesProfile();
     const source = sourceEntry(profile);
     const runner = providerRunner();
@@ -284,7 +285,7 @@ describe("Hermes managed clone broker transaction", () => {
         code: "hermes_clone_activation_outcome_unknown",
       });
     });
-    const prepared = prepareHermesManagedCloneBrokerTransaction({
+    const prepared = await prepareHermesManagedCloneBrokerTransaction({
       handoff: handoff(profile),
       destination: null,
       environment: environment(),
@@ -295,7 +296,7 @@ describe("Hermes managed clone broker transaction", () => {
 
     let thrown: unknown;
     try {
-      provisionHermesManagedCloneBrokerTransaction(prepared, {
+      await provisionHermesManagedCloneBrokerTransaction(prepared, {
         ...authority(source),
         environment: environment(),
         runOpenshell: runner.run,
@@ -310,15 +311,17 @@ describe("Hermes managed clone broker transaction", () => {
     expect(hostBroker.discardHermesToolGatewayCloneBinding).not.toHaveBeenCalled();
   });
 
-  it("rolls back only its provider receipt when activation fails definitively", () => {
+  it("rolls back only its provider receipt when activation fails definitively", async () => {
     const profile = hermesProfile();
     const source = sourceEntry(profile);
     const runner = providerRunner();
+    const providerAdapter = createManagedProviderAdapter(runner.run);
+    const deleteProvider = vi.spyOn(providerAdapter, "deleteProvider");
     const hostBroker = broker();
     hostBroker.activateHermesToolGatewayCloneBinding.mockImplementation(() => {
       throw new Error("activation rejected");
     });
-    const prepared = prepareHermesManagedCloneBrokerTransaction({
+    const prepared = await prepareHermesManagedCloneBrokerTransaction({
       handoff: handoff(profile),
       destination: null,
       environment: environment(),
@@ -327,15 +330,17 @@ describe("Hermes managed clone broker transaction", () => {
       transactionId: "3".repeat(32),
     });
 
-    expect(() =>
+    await expect(
       provisionHermesManagedCloneBrokerTransaction(prepared, {
         ...authority(source),
         environment: environment(),
         runOpenshell: runner.run,
+        providerAdapter,
         broker: hostBroker,
       }),
-    ).toThrow("activation rejected");
+    ).rejects.toThrow("activation rejected");
     expect(runner.live.size).toBe(0);
+    expect(deleteProvider).toHaveBeenCalledTimes(2);
     expect(hostBroker.discardHermesToolGatewayCloneBinding).toHaveBeenCalledOnce();
   });
 });

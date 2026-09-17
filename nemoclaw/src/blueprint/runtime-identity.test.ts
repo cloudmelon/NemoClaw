@@ -22,6 +22,7 @@ import {
   compensateRuntimeIdentityApply,
   isRuntimeIdentityConfig,
   isRuntimeIdentityReceipt,
+  mintRuntimeIdentityCredential,
   parseRuntimeIdentityProviderMetadata,
   prepareRuntimeIdentity,
   type RuntimeIdentityCommandResult,
@@ -57,6 +58,20 @@ const matchingProvider = [
 const matchingProviderResult: RuntimeIdentityCommandResult = {
   exitCode: 0,
   stdout: matchingProvider,
+  stderr: "",
+};
+const configuredProviderResult: RuntimeIdentityCommandResult = {
+  exitCode: 0,
+  stdout: matchingProvider.replace("Credential keys: OKTA_ACCESS_TOKEN", "Credential keys: <none>"),
+  stderr: "",
+};
+const configuredRefreshResult: RuntimeIdentityCommandResult = {
+  exitCode: 0,
+  stdout: [
+    "PROVIDER                  CREDENTIAL_KEY                STRATEGY                      STATUS",
+    "acme-okta-runtime        OKTA_ACCESS_TOKEN             oauth2_refresh_token          configured",
+    "",
+  ].join("\n"),
   stderr: "",
 };
 const profileDocument = [
@@ -282,15 +297,14 @@ describe("runtime identity contract", () => {
     expect(resolveRuntimeIdentityProfilePath(config.profile_path, root)).toBe(profilePath);
   });
 
-  it.each([
-    "/absolute-profile.yaml",
-    "../outside-profile.yaml",
-    "missing-profile.yaml",
-  ])("rejects an unsafe or missing profile path: %s", (candidate) => {
-    expect(() => resolveRuntimeIdentityProfilePath(candidate, root)).toThrow(
-      /must (?:be relative|stay inside|name an existing file)/,
-    );
-  });
+  it.each(["/absolute-profile.yaml", "../outside-profile.yaml", "missing-profile.yaml"])(
+    "rejects an unsafe or missing profile path: %s",
+    (candidate) => {
+      expect(() => resolveRuntimeIdentityProfilePath(candidate, root)).toThrow(
+        /must (?:be relative|stay inside|name an existing file)/,
+      );
+    },
+  );
 
   it("rejects a directory and an outward symlink as profiles", () => {
     mkdirSync(join(root, "provider-profiles", "directory"));
@@ -320,7 +334,6 @@ describe("runtime identity contract", () => {
       "provider profile import --file",
       "provider create --name acme-okta-runtime --type okta-runtime-v1 --runtime-credentials",
       "provider refresh configure acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN --strategy oauth2-refresh-token --material client_id=client-id --secret-material-env refresh_token=OKTA_REFRESH_TOKEN --secret-material-env client_secret=OKTA_CLIENT_SECRET",
-      "provider refresh rotate acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN",
     ]);
     expect(calls.flatMap(({ args }) => args)).not.toContain("refresh-secret");
     expect(calls.flatMap(({ args }) => args)).not.toContain("client-secret");
@@ -538,15 +551,18 @@ describe("runtime identity contract", () => {
       entraProfileDocument.replace("login.microsoftonline.com", "graph.microsoft.com"),
       /refresh token_url host 'graph\.microsoft\.com' is outside/,
     ],
-  ])("rejects an Entra profile that changes the reviewed %s", async (_boundary, profile, message) => {
-    writeFileSync(join(root, entraConfig.profile_path), profile);
-    environment.ENTRA_CLIENT_ID = "entra-client-id";
-    environment.ENTRA_REFRESH_TOKEN = "entra-refresh-secret";
-    environment.ENTRA_CLIENT_SECRET = "entra-client-secret";
+  ])(
+    "rejects an Entra profile that changes the reviewed %s",
+    async (_boundary, profile, message) => {
+      writeFileSync(join(root, entraConfig.profile_path), profile);
+      environment.ENTRA_CLIENT_ID = "entra-client-id";
+      environment.ENTRA_REFRESH_TOKEN = "entra-refresh-secret";
+      environment.ENTRA_CLIENT_SECRET = "entra-client-secret";
 
-    await expect(prepareRuntimeIdentity(entraConfig, deps)).rejects.toThrow(message);
-    expect(calls).toEqual([]);
-  });
+      await expect(prepareRuntimeIdentity(entraConfig, deps)).rejects.toThrow(message);
+      expect(calls).toEqual([]);
+    },
+  );
 
   it("rejects DNS-backed destinations unless the reviewed profile policy owns DNS", async () => {
     deps.validateEndpointUrl = async () => ({ dnsResolved: true });
@@ -735,7 +751,7 @@ describe("runtime identity contract", () => {
     await expect(prepareRuntimeIdentity(configWithoutSecret, deps)).resolves.toEqual(
       createdReceipt,
     );
-    expect(calls.at(-2)?.env).toEqual({ OKTA_REFRESH_TOKEN: "refresh-secret" });
+    expect(calls.at(-1)?.env).toEqual({ OKTA_REFRESH_TOKEN: "refresh-secret" });
   });
 
   it("imports the validated bytes when the original profile is replaced before import", async () => {
@@ -838,23 +854,31 @@ describe("runtime identity contract", () => {
     ]);
   });
 
-  it.each([
-    [
-      "provider refresh configure acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN --strategy oauth2-refresh-token --material client_id=client-id --secret-material-env refresh_token=OKTA_REFRESH_TOKEN --secret-material-env client_secret=OKTA_CLIENT_SECRET",
-      "configure failed",
-    ],
-    [
-      "provider refresh rotate acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN",
-      "rotate failed",
-    ],
-  ])("deletes a newly created provider after %s fails", async (failedCommand, message) => {
+  it("deletes a newly created provider after refresh configuration fails", async () => {
     responses.set("provider get acme-okta-runtime", [missingProvider, matchingProviderResult]);
-    responses.set(failedCommand, [{ exitCode: 1, stdout: "", stderr: message }]);
+    responses.set(
+      "provider refresh configure acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN --strategy oauth2-refresh-token --material client_id=client-id --secret-material-env refresh_token=OKTA_REFRESH_TOKEN --secret-material-env client_secret=OKTA_CLIENT_SECRET",
+      [{ exitCode: 1, stdout: "", stderr: "configure failed" }],
+    );
 
-    await expect(prepareRuntimeIdentity(config, deps)).rejects.toThrow(message);
+    await expect(prepareRuntimeIdentity(config, deps)).rejects.toThrow("configure failed");
     expect(calls.map(({ args }) => commandKey(args))).toContain(
       "provider delete acme-okta-runtime",
     );
+  });
+
+  it("preserves a created provider when its ownership receipt is not durable (#9833)", async () => {
+    responses.set("provider get acme-okta-runtime", [missingProvider]);
+    deps.persistReceipt = () => {
+      throw new Error("receipt persistence failed");
+    };
+
+    await expect(prepareRuntimeIdentity(config, deps)).rejects.toThrow(
+      "receipt persistence failed",
+    );
+    const commands = calls.map(({ args }) => commandKey(args));
+    expect(commands).not.toContain("provider delete acme-okta-runtime");
+    expect(commands.join("\n")).not.toContain("provider refresh configure");
   });
 
   it("redacts client ID and secret material from refresh configuration errors", async () => {
@@ -880,15 +904,16 @@ describe("runtime identity contract", () => {
 
   it("reports cleanup failure after preparation fails", async () => {
     responses.set("provider get acme-okta-runtime", [missingProvider, matchingProviderResult]);
-    responses.set("provider refresh rotate acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN", [
-      { exitCode: 1, stdout: "", stderr: "rotate failed" },
-    ]);
+    responses.set(
+      "provider refresh configure acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN --strategy oauth2-refresh-token --material client_id=client-id --secret-material-env refresh_token=OKTA_REFRESH_TOKEN --secret-material-env client_secret=OKTA_CLIENT_SECRET",
+      [{ exitCode: 1, stdout: "", stderr: "configure failed" }],
+    );
     responses.set("provider delete acme-okta-runtime", [
       { exitCode: 1, stdout: "", stderr: "delete failed" },
     ]);
 
     await expect(prepareRuntimeIdentity(config, deps)).rejects.toThrow(
-      /rotate failed[\s\S]*cleanup failed[\s\S]*delete failed/,
+      /configure failed[\s\S]*cleanup failed[\s\S]*delete failed/,
     );
     expect(persistedReceipts).toEqual([createdReceipt]);
   });
@@ -905,15 +930,34 @@ describe("runtime identity contract", () => {
         stderr: "",
       },
     ]);
-    responses.set("provider refresh rotate acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN", [
-      { exitCode: 1, stdout: "", stderr: "rotate failed" },
-    ]);
+    responses.set(
+      "provider refresh configure acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN --strategy oauth2-refresh-token --material client_id=client-id --secret-material-env refresh_token=OKTA_REFRESH_TOKEN --secret-material-env client_secret=OKTA_CLIENT_SECRET",
+      [{ exitCode: 1, stdout: "", stderr: "configure failed" }],
+    );
 
     await expect(prepareRuntimeIdentity(config, deps)).rejects.toThrow(
       /cleanup failed[\s\S]*incompatible non-secret binding/,
     );
     expect(calls.map(({ args }) => commandKey(args))).not.toContain(
       "provider delete acme-okta-runtime",
+    );
+  });
+
+  it("runs the initial runtime identity credential mint", async () => {
+    await expect(mintRuntimeIdentityCredential(createdReceipt, deps)).resolves.toBeUndefined();
+
+    expect(calls.map(({ args }) => commandKey(args))).toEqual([
+      "provider refresh rotate acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN",
+    ]);
+  });
+
+  it("reports an initial credential mint failure", async () => {
+    responses.set("provider refresh rotate acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN", [
+      { exitCode: 1, stdout: "", stderr: "rotate failed" },
+    ]);
+
+    await expect(mintRuntimeIdentityCredential(createdReceipt, deps)).rejects.toThrow(
+      /Failed to mint runtime identity credential:\s+rotate failed/,
     );
   });
 
@@ -926,6 +970,32 @@ describe("runtime identity contract", () => {
       "provider get acme-okta-runtime",
       "sandbox provider attach sandbox acme-okta-runtime",
     ]);
+  });
+
+  it("attaches a provider whose refresh is configured before its first mint", async () => {
+    responses.set("provider get acme-okta-runtime", [configuredProviderResult]);
+    responses.set("provider refresh status acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN", [
+      configuredRefreshResult,
+    ]);
+
+    await expect(attachRuntimeIdentity(createdReceipt, "sandbox", deps)).resolves.toBe(true);
+    expect(calls.map(({ args }) => commandKey(args))).toEqual([
+      "settings get --global --json",
+      "provider get acme-okta-runtime",
+      "provider refresh status acme-okta-runtime --credential-key OKTA_ACCESS_TOKEN",
+      "sandbox provider attach sandbox acme-okta-runtime",
+    ]);
+  });
+
+  it("rejects an empty provider without its configured refresh binding", async () => {
+    responses.set("provider get acme-okta-runtime", [configuredProviderResult]);
+
+    await expect(attachRuntimeIdentity(createdReceipt, "sandbox", deps)).rejects.toThrow(
+      /incompatible non-secret refresh binding/,
+    );
+    expect(calls.map(({ args }) => commandKey(args))).not.toContain(
+      "sandbox provider attach sandbox acme-okta-runtime",
+    );
   });
 
   it("fails before attachment when provider-derived policy was disabled after preparation", async () => {

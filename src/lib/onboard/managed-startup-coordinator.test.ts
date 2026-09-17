@@ -78,6 +78,9 @@ function adaptersFor(order: string[] = []): {
     "langchain-deepagents-code": vi.fn(async () => {
       order.push("apply:langchain-deepagents-code");
     }),
+    pi: vi.fn(async () => {
+      order.push("apply:pi");
+    }),
   };
   return {
     adapters: [
@@ -87,43 +90,43 @@ function adaptersFor(order: string[] = []): {
         agent: "langchain-deepagents-code",
         apply: applyByAgent["langchain-deepagents-code"],
       },
+      { agent: "pi", apply: applyByAgent.pi },
     ],
     applyByAgent,
   };
 }
 
 describe("managed startup coordinator", () => {
-  it.each([
-    "openclaw",
-    "hermes",
-    "langchain-deepagents-code",
-  ] as const)("dispatches exactly the %s adapter before commit", async (agent) => {
-    const order: string[] = [];
-    const prepared = preparedFor(agent);
-    const dependencies = dependenciesFor(prepared, order);
-    const { adapters, applyByAgent } = adaptersFor(order);
+  it.each(["openclaw", "hermes", "langchain-deepagents-code"] as const)(
+    "dispatches exactly the %s adapter before commit",
+    async (agent) => {
+      const order: string[] = [];
+      const prepared = preparedFor(agent);
+      const dependencies = dependenciesFor(prepared, order);
+      const { adapters, applyByAgent } = adaptersFor(order);
 
-    const result = await coordinateManagedStartupApplication(
-      inputFor(agent),
-      adapters,
-      dependencies,
-    );
+      const result = await coordinateManagedStartupApplication(
+        inputFor(agent),
+        adapters,
+        dependencies,
+      );
 
-    expect(result.adapterApplied).toBe(true);
-    expect(result.application.status).toBe("committed");
-    expect(order).toEqual(["prepare", `apply:${agent}`, "commit"]);
-    expect(applyByAgent[agent]).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        agent,
-        profile: prepared.profile,
-        fingerprint: prepared.fingerprint,
-      }),
-    );
-    for (const otherAgent of ["openclaw", "hermes", "langchain-deepagents-code"] as const) {
-      expect(applyByAgent[otherAgent]).toHaveBeenCalledTimes(otherAgent === agent ? 1 : 0);
-    }
-    expect(dependencies.commitApplication).toHaveBeenCalledWith(prepared);
-  });
+      expect(result.adapterApplied).toBe(true);
+      expect(result.application.status).toBe("committed");
+      expect(order).toEqual(["prepare", `apply:${agent}`, "commit"]);
+      expect(applyByAgent[agent]).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          agent,
+          profile: prepared.profile,
+          fingerprint: prepared.fingerprint,
+        }),
+      );
+      (["openclaw", "hermes", "langchain-deepagents-code"] as const).forEach((otherAgent) => {
+        expect(applyByAgent[otherAgent]).toHaveBeenCalledTimes(otherAgent === agent ? 1 : 0);
+      });
+      expect(dependencies.commitApplication).toHaveBeenCalledWith(prepared);
+    },
+  );
 
   it("does not reapply mutable config for an already committed profile", async () => {
     const prepared = preparedFor("openclaw", "already-committed");
@@ -138,9 +141,9 @@ describe("managed startup coordinator", () => {
 
     expect(result.adapterApplied).toBe(false);
     expect(dependencies.commitApplication).toHaveBeenCalledExactlyOnceWith(prepared);
-    for (const apply of Object.values(applyByAgent)) {
+    Object.values(applyByAgent).forEach((apply) => {
       expect(apply).not.toHaveBeenCalled();
-    }
+    });
   });
 
   it("rejects a missing adapter before preparing state", async () => {
@@ -200,9 +203,9 @@ describe("managed startup coordinator", () => {
       coordinateManagedStartupApplication(inputFor("openclaw"), adapters, dependencies),
     ).rejects.toThrow(/targets hermes, expected openclaw/u);
     expect(dependencies.commitApplication).not.toHaveBeenCalled();
-    for (const apply of Object.values(applyByAgent)) {
+    Object.values(applyByAgent).forEach((apply) => {
       expect(apply).not.toHaveBeenCalled();
-    }
+    });
   });
 
   it("does not commit an adapter failure and can retry the pending profile", async () => {

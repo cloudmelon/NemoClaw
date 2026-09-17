@@ -24,6 +24,9 @@ current diff and repository evidence while evaluating these gates and expectatio
 
 ## Manual review inputs
 
+Before manual review, complete shared [PR follow-up](../_shared/pr-follow-up.md) successfully for one
+unchanged latest PR commit. A first-time fork check-approval review is the only exception.
+
 The PR Review Advisor provides review input. It does not authorize a merge.
 Read its comment and verify each claim against code, tests, and workflow evidence.
 Apply a confirmed problem to the related gate. Ask the user about ambiguous or design-changing advice.
@@ -55,11 +58,13 @@ The team follows a daily ship cycle. All maintainer skills operate within this r
 
 1. **Morning** (`/nemoclaw-maintainer-morning`) — triage the backlog, pick items for the day, label them with the target version (e.g., `v0.0.8`).
 2. **During the day** (`/nemoclaw-maintainer-day`) — land PRs using the maintainer loop. Version labels make progress visible on dashboards.
-3. **Evening** (`/nemoclaw-maintainer-evening`) — Check shipped work and the pre-tag changelog PR.
-   Confirm that the pre-tag changelog PR contains `docs/changelog/YYYY-MM-DD.mdx` for the release.
-   Identify open items and prepare the QA summary. Record the release SHA and required E2E evidence.
-   Cut the tag after confirmation. Move open items to the next patch label and delete the released label.
-   Prepare the Announcement.
+3. **Evening** (`/nemoclaw-maintainer-evening`) — check shipped work and the cumulative
+   documentation PR. Confirm that it covers every merged change selected for the release and
+   contains `docs/changelog/YYYY-MM-DD.mdx` for the release.
+   Identify open items and prepare the Markdown release brief. Show the newest full E2E result and
+   let the maintainer choose focused tests, the full suite, or the displayed status.
+   Cut the tag after confirmation. Treat aliases, labels, publication, and the Announcement as work
+   outside tag cutting; some share a workflow or depend on another post-tag state.
 4. **Overnight** — A QA team in another time zone validates the tag.
    Put new issues into the next morning's triage.
 

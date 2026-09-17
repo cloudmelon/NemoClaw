@@ -3,6 +3,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 
+import type { SandboxRuntimeSnapshot } from "../../state/registry/runtime-snapshot";
 import type { SandboxEntry } from "../../state/registry/types";
 import type { OpenShellDockerSandboxRuntimeSnapshotQuery } from "../openshell-docker-sandbox-containers";
 import type {
@@ -15,6 +16,7 @@ import {
   createRuntimeProviderSnapshotSurface,
   observeDockerRuntimeSnapshot,
   observeOpenShellRuntimeSnapshot,
+  resolveDockerSnapshotRecreateGpuDevice,
   type RuntimeProviderSnapshotObservation,
 } from "./snapshot";
 
@@ -120,7 +122,11 @@ describe("runtime provider snapshot surface", () => {
       managedProfile,
     );
 
-    expect(restoreManagedProfile).toHaveBeenCalledWith(target, managedProfile);
+    expect(restoreManagedProfile).toHaveBeenCalledWith(
+      target,
+      managedProfile,
+      observation().runtime,
+    );
     expect(receipt).toMatchObject({
       providerId: "mxc",
       sandboxName: "alpha",
@@ -228,7 +234,9 @@ describe("runtime provider snapshot surface", () => {
   ])("rejects current-runtime changes $label", ({ observations, expectedRestoreCalls }) => {
     const restoreManagedProfile = vi.fn(() => "provider-restore-proof");
     const observe = vi.fn<() => RuntimeProviderSnapshotObservation>();
-    for (const value of observations) observe.mockReturnValueOnce(value);
+    observations.forEach((value) => {
+      observe.mockReturnValueOnce(value);
+    });
     const surface = requireSupportedSurface(
       createRuntimeProviderSnapshotSurface("mxc", surfaceDriver(observe, restoreManagedProfile)),
     );
@@ -501,44 +509,46 @@ describe("OpenShell snapshot observation", () => {
     ).toBe(expected);
   });
 
-  it("rejects mismatched provider, failed inspection, or missing generation", () => {
-    const capture = vi.fn();
-    expect(() =>
-      observeOpenShellRuntimeSnapshot(sandbox({ openshellDriver: "docker" }), "mxc", {
-        capture: capture as never,
-      }),
-    ).toThrow(/belongs to another runtime provider/u);
-    expect(capture).not.toHaveBeenCalled();
+  it.each([
+    { status: 1, output: "not found", stdout: "", stderr: "" },
+    {
+      status: 0,
+      signal: "SIGTERM",
+      output: "Id: sandbox-id\nState: Ready\nGeneration: generation-1\n",
+      stdout: "",
+      stderr: "",
+    },
+  ])(
+    "rejects mismatched provider, failed inspection, or missing generation [case %#]",
+    (result) => {
+      const capture = vi.fn();
+      expect(() =>
+        observeOpenShellRuntimeSnapshot(sandbox({ openshellDriver: "docker" }), "mxc", {
+          capture: capture as never,
+        }),
+      ).toThrow(/belongs to another runtime provider/u);
+      expect(capture).not.toHaveBeenCalled();
 
-    for (const result of [
-      { status: 1, output: "not found", stdout: "", stderr: "" },
-      {
-        status: 0,
-        signal: "SIGTERM",
-        output: "Id: sandbox-id\nState: Ready\nGeneration: generation-1\n",
-        stdout: "",
-        stderr: "",
-      },
-    ]) {
       expect(() =>
         observeOpenShellRuntimeSnapshot(sandbox(), "mxc", {
           capture: (() => result) as never,
           observeAcceleration: () => ({ kind: "none" }),
         }),
       ).toThrow(/runtime identity could not be inspected/u);
-    }
-    expect(() =>
-      observeOpenShellRuntimeSnapshot(sandbox(), "mxc", {
-        capture: (() => ({
-          status: 0,
-          output: "Id: sandbox-id\nState: Ready\n",
-          stdout: "",
-          stderr: "",
-        })) as never,
-        observeAcceleration: () => ({ kind: "none" }),
-      }),
-    ).toThrow(/lifecycle generation cannot be represented/u);
-  });
+
+      expect(() =>
+        observeOpenShellRuntimeSnapshot(sandbox(), "mxc", {
+          capture: (() => ({
+            status: 0,
+            output: "Id: sandbox-id\nState: Ready\n",
+            stdout: "",
+            stderr: "",
+          })) as never,
+          observeAcceleration: () => ({ kind: "none" }),
+        }),
+      ).toThrow(/lifecycle generation cannot be represented/u);
+    },
+  );
 });
 
 function dockerSnapshot(
@@ -563,7 +573,7 @@ function dockerLifecycleCapture(
   containerId = "c".repeat(64),
   overrides: { status?: string; paused?: boolean; restartCount?: number } = {},
 ) {
-  return vi.fn(() => ({
+  return vi.fn((_command: string, _args: string[], _timeout?: number) => ({
     status: 0,
     stdout: JSON.stringify([
       containerId,
@@ -577,7 +587,96 @@ function dockerLifecycleCapture(
   }));
 }
 
+function dockerRestoreCapture(
+  restoreResult: {
+    status: number;
+    stdout: string;
+    stderr: string;
+    error?: Error;
+  } = {
+    status: 0,
+    stdout: "[managed-startup] verified profile completion\n",
+    stderr: "",
+  },
+) {
+  const lifecycleCapture = dockerLifecycleCapture();
+  return vi.fn((command: string, args: string[], timeout?: number) =>
+    args[0] === "exec" ? restoreResult : lifecycleCapture(command, args, timeout),
+  );
+}
+
+function dockerGpuSnapshot(deviceIds: readonly string[] | null, driver = "") {
+  return dockerSnapshot({
+    deviceRequests: [
+      {
+        Driver: driver,
+        Count: deviceIds === null ? -1 : 0,
+        DeviceIDs: deviceIds && [...deviceIds],
+        Capabilities: driver === "cdi" ? null : [["gpu"]],
+        Options: null,
+      },
+    ],
+    nativeGpuAttachmentState: "present",
+  });
+}
+
+function capturedDockerGpuRuntime(devices: readonly string[]): SandboxRuntimeSnapshot {
+  return {
+    schemaVersion: 1,
+    providerId: "docker",
+    providerHandle: "provider-handle",
+    lifecycleState: "running",
+    lifecycleGeneration: "generation-1",
+    runtime: {
+      schemaVersion: 1,
+      providerId: "docker",
+      runtime: { kind: "docker-container", handle: "c".repeat(64) },
+      acceleration: { kind: "gpu", vendor: "nvidia", devices: [...devices] },
+    },
+  };
+}
+
+function dockerSnapshotSurface(
+  snapshot: ReturnType<typeof dockerSnapshot>,
+  captureHostCommand = dockerRestoreCapture(),
+) {
+  return requireSupportedSurface(
+    createDockerRuntimeProviderSnapshotSurface("docker", {
+      captureHostCommand,
+      queryRuntimeSnapshot: () => snapshot,
+    }),
+  );
+}
+
 describe("Docker provider snapshot evidence", () => {
+  it.each([
+    ["exact CDI", ["nvidia.com/gpu=0"], "nvidia.com/gpu=0"],
+    ["all-GPU", ["nvidia.com/gpu=all"], "nvidia.com/gpu=all"],
+    [
+      "exact CDI with device paths",
+      [
+        "docker-device-path:/dev/dri/renderD128=>/dev/dri/renderD128:rwm",
+        "nvidia.com/gpu=GPU-live-0",
+      ],
+      "nvidia.com/gpu=GPU-live-0",
+    ],
+  ] as const)(
+    "resolves %s snapshot authority for rebuild recreation",
+    (_label, devices, expected) => {
+      expect(resolveDockerSnapshotRecreateGpuDevice(capturedDockerGpuRuntime(devices))).toBe(
+        expected,
+      );
+    },
+  );
+
+  it("refuses a captured multi-selector GPU authority that one create selector cannot replay", () => {
+    expect(() =>
+      resolveDockerSnapshotRecreateGpuDevice(
+        capturedDockerGpuRuntime(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),
+      ),
+    ).toThrow(/cannot be replayed by one sandbox GPU selector/u);
+  });
+
   it("normalizes Docker's explicit paused status", () => {
     const observed = observeDockerRuntimeSnapshot(
       sandbox({ openshellDriver: "docker" }),
@@ -628,69 +727,200 @@ describe("Docker provider snapshot evidence", () => {
         acceleration: {
           kind: "gpu",
           vendor: "nvidia",
-          devices: ["docker-device-id:GPU-live-0", "docker-nvidia-visible-device:GPU-live-0"],
+          devices: ["nvidia.com/gpu=GPU-live-0"],
         },
       },
     });
   });
 
-  it("accepts Docker's explicit count=-1 selector but rejects inferred or ambiguous GPU state", () => {
-    const allDevices = observeDockerRuntimeSnapshot(
-      sandbox({ openshellDriver: "docker" }),
-      "docker",
-      {
-        captureHostCommand: dockerLifecycleCapture(),
-        queryRuntimeSnapshot: () =>
-          dockerSnapshot({
-            deviceRequests: [
-              {
-                Driver: "nvidia",
-                Count: -1,
-                DeviceIDs: null,
-                Capabilities: [["gpu"]],
-                Options: null,
-              },
-            ],
-            nativeGpuAttachmentState: "present",
-            runtime: "nvidia",
-            nvidiaVisibleDevices: "all",
-          }),
-      },
-    );
-    expect(allDevices.runtime.acceleration).toMatchObject({
-      devices: ["docker-device-request:nvidia:count=-1", "docker-nvidia-visible-devices:all"],
-    });
+  it.each([
+    ["all", null],
+    ["0", ["0"]],
+    ["GPU-0", ["GPU-0"]],
+  ] as const)(
+    "restores GPU selection %s across CDI and Docker capability forms (#10758)",
+    (device, deviceIds) => {
+      const target = sandbox({ openshellDriver: "docker" });
+      const sourceSurface = dockerSnapshotSurface(
+        dockerGpuSnapshot([`nvidia.com/gpu=${device}`], "cdi"),
+      );
+      const sourcePreflight = sourceSurface.preflight("backup", target);
+      const source = snapshotSource(
+        sourcePreflight,
+        sourceSurface.capture(target, sourcePreflight),
+      );
+      const verifyProfile = dockerRestoreCapture();
+      const targetSurface = dockerSnapshotSurface(dockerGpuSnapshot(deviceIds), verifyProfile);
 
-    for (const snapshot of [
+      expect(source.runtime.acceleration).toEqual({
+        kind: "gpu",
+        vendor: "nvidia",
+        devices: [`nvidia.com/gpu=${device}`],
+      });
+      expect(
+        targetSurface.restore(
+          target,
+          targetSurface.preflight("restore", target),
+          source,
+          managedProfile,
+        ),
+      ).toMatchObject({
+        runtime: { acceleration: source.runtime.acceleration },
+      });
+      expect(verifyProfile).toHaveBeenCalledWith(
+        "docker",
+        expect.arrayContaining(["exec", "--user", "root"]),
+        15_000,
+      );
+    },
+  );
+
+  it.each([
+    {
+      label: "all-GPU",
+      snapshot: dockerGpuSnapshot(null),
+      error: /cannot represent the snapshot acceleration state/u,
+    },
+    {
+      label: "non-NVIDIA",
+      snapshot: dockerGpuSnapshot(["GPU-0"], "amd"),
+      error: /does not prove NVIDIA acceleration authority/u,
+    },
+  ])(
+    "rejects an incompatible $label target before profile restoration (#10758)",
+    ({ snapshot, error }) => {
+      const target = sandbox({ openshellDriver: "docker" });
+      const sourceSurface = dockerSnapshotSurface(
+        dockerGpuSnapshot(["nvidia.com/gpu=GPU-0"], "cdi"),
+      );
+      const sourcePreflight = sourceSurface.preflight("backup", target);
+      const source = snapshotSource(
+        sourcePreflight,
+        sourceSurface.capture(target, sourcePreflight),
+      );
+      const verifyProfile = dockerRestoreCapture();
+      const targetSurface = dockerSnapshotSurface(snapshot, verifyProfile);
+
+      expect(() =>
+        targetSurface.restore(
+          target,
+          targetSurface.preflight("restore", target),
+          source,
+          managedProfile,
+        ),
+      ).toThrow(error);
+      expect(verifyProfile).not.toHaveBeenCalledWith(
+        "docker",
+        expect.arrayContaining(["exec"]),
+        expect.any(Number),
+      );
+    },
+  );
+
+  it("rejects mapping-only GPU evidence without NVIDIA selectors (#10758)", () => {
+    const capture = dockerRestoreCapture();
+    const surface = dockerSnapshotSurface(
       dockerSnapshot({
-        deviceRequests: null,
-        nativeGpuAttachmentState: "present",
-        runtime: "nvidia",
-        nvidiaVisibleDevices: null,
-      }),
-      dockerSnapshot({
-        deviceRequests: [
+        devices: [
           {
-            Driver: "nvidia",
-            Count: 1,
-            DeviceIDs: null,
-            Capabilities: [["gpu"]],
-            Options: null,
+            PathOnHost: "/dev/dri/renderD128",
+            PathInContainer: "/dev/dri/renderD128",
+            CgroupPermissions: "rwm",
           },
         ],
         nativeGpuAttachmentState: "present",
-        runtime: "nvidia",
       }),
-      dockerSnapshot({ nativeGpuAttachmentState: "unknown", runtime: "custom-runtime" }),
-    ]) {
+      capture,
+    );
+    const acceleration = {
+      kind: "gpu" as const,
+      vendor: "nvidia",
+      devices: ["docker-device-path:/dev/dri/renderD128=>/dev/dri/renderD128:rwm"],
+    };
+
+    expect(() => surface.preflight("restore", sandbox({ openshellDriver: "docker" }))).toThrow(
+      /exact live device selectors/u,
+    );
+    expect(surface.canRepresentAcceleration?.(acceleration, acceleration)).toBe(false);
+    expect(capture.mock.calls.some(([, args]) => args[0] === "exec")).toBe(false);
+  });
+
+  it.each(
+    Array.from(
+      [
+        dockerGpuSnapshot(["amd.com/gpu=0"]),
+        dockerSnapshot({
+          deviceRequests: null,
+          nativeGpuAttachmentState: "present",
+          runtime: "nvidia",
+          nvidiaVisibleDevices: null,
+        }),
+        dockerSnapshot({
+          deviceRequests: [
+            {
+              Driver: "nvidia",
+              Count: 1,
+              DeviceIDs: null,
+              Capabilities: [["gpu"]],
+              Options: null,
+            },
+          ],
+          nativeGpuAttachmentState: "present",
+          runtime: "nvidia",
+        }),
+        dockerSnapshot({
+          deviceRequests: [
+            {
+              Driver: "cdi",
+              Count: 0,
+              DeviceIDs: ["nvidia.com/gpu="],
+              Capabilities: null,
+              Options: null,
+            },
+          ],
+          nativeGpuAttachmentState: "present",
+        }),
+        dockerSnapshot({ nativeGpuAttachmentState: "unknown", runtime: "custom-runtime" }),
+      ],
+      (value) => [value],
+    ),
+  )(
+    "accepts Docker's explicit count=-1 selector but rejects inferred or ambiguous GPU state [case %#]",
+    (snapshot) => {
+      const allDevices = observeDockerRuntimeSnapshot(
+        sandbox({ openshellDriver: "docker" }),
+        "docker",
+        {
+          captureHostCommand: dockerLifecycleCapture(),
+          queryRuntimeSnapshot: () =>
+            dockerSnapshot({
+              deviceRequests: [
+                {
+                  Driver: "nvidia",
+                  Count: -1,
+                  DeviceIDs: null,
+                  Capabilities: [["gpu"]],
+                  Options: null,
+                },
+              ],
+              nativeGpuAttachmentState: "present",
+              runtime: "nvidia",
+              nvidiaVisibleDevices: "all",
+            }),
+        },
+      );
+      expect(allDevices.runtime.acceleration).toMatchObject({
+        devices: ["nvidia.com/gpu=all"],
+      });
+
       expect(() =>
         observeDockerRuntimeSnapshot(sandbox({ openshellDriver: "docker" }), "docker", {
           captureHostCommand: dockerLifecycleCapture(),
           queryRuntimeSnapshot: () => snapshot,
         }),
       ).toThrow(/acceleration|exact live device selectors/u);
-    }
-  });
+    },
+  );
 
   it("captures the NVIDIA Container Runtime selector used by Jetson", () => {
     const observed = observeDockerRuntimeSnapshot(
@@ -701,7 +931,13 @@ describe("Docker provider snapshot evidence", () => {
         queryRuntimeSnapshot: () =>
           dockerSnapshot({
             deviceRequests: null,
-            devices: null,
+            devices: [
+              {
+                PathOnHost: "/dev/nvhost-gpu",
+                PathInContainer: "/dev/nvhost-gpu",
+                CgroupPermissions: "rwm",
+              },
+            ],
             nativeGpuAttachmentState: "present",
             runtime: "nvidia",
             nvidiaVisibleDevices: "0,GPU-live-1",
@@ -712,84 +948,133 @@ describe("Docker provider snapshot evidence", () => {
     expect(observed.runtime.acceleration).toEqual({
       kind: "gpu",
       vendor: "nvidia",
-      devices: ["docker-nvidia-visible-device:0", "docker-nvidia-visible-device:GPU-live-1"],
+      devices: [
+        "docker-device-path:/dev/nvhost-gpu=>/dev/nvhost-gpu:rwm",
+        "nvidia.com/gpu=0",
+        "nvidia.com/gpu=GPU-live-1",
+      ],
     });
   });
 
-  it.each([
-    "openclaw",
-    "hermes",
-    "langchain-deepagents-code",
-  ] as const)("runs the in-sandbox %s profile verifier and fails closed on refusal", (agent) => {
-    const authority = {
-      agent,
-      profileFingerprint: managedProfile.profileFingerprint,
-    };
-    const captureOpenShell = vi.fn(() => ({
-      status: 0,
-      output: `[managed-startup] verified ${agent} profile completion\n`,
-      stdout: "",
-      stderr: "",
-    }));
-    const dependencies = {
-      captureHostCommand: dockerLifecycleCapture(),
-      captureOpenShell: captureOpenShell as never,
-      queryRuntimeSnapshot: () => dockerSnapshot(),
-    };
-    const surface = requireSupportedSurface(
-      createDockerRuntimeProviderSnapshotSurface("docker", dependencies),
+  it("rejects conflicting Docker GPU selectors instead of widening access", () => {
+    expect(() =>
+      observeDockerRuntimeSnapshot(sandbox({ openshellDriver: "docker" }), "docker", {
+        captureHostCommand: dockerLifecycleCapture(),
+        queryRuntimeSnapshot: () =>
+          dockerSnapshot({
+            deviceRequests: [
+              {
+                Driver: "nvidia",
+                Count: 0,
+                DeviceIDs: ["GPU-live-0"],
+                Capabilities: [["gpu"]],
+                Options: null,
+              },
+            ],
+            nativeGpuAttachmentState: "present",
+            runtime: "nvidia",
+            nvidiaVisibleDevices: "all",
+          }),
+      }),
+    ).toThrow(/conflicting live device selectors/u);
+  });
+
+  it.each(["openclaw", "hermes", "langchain-deepagents-code"] as const)(
+    "runs the exact-container %s profile verifier and fails closed on refusal",
+    (agent) => {
+      const authority = {
+        agent,
+        profileFingerprint: managedProfile.profileFingerprint,
+      };
+      const captureHostCommand = dockerRestoreCapture({
+        status: 0,
+        stdout: `[managed-startup] verified ${agent} profile completion\n`,
+        stderr: "",
+      });
+      const queryRuntimeSnapshot = vi.fn(() => dockerSnapshot());
+      const dependencies = {
+        captureHostCommand,
+        queryRuntimeSnapshot,
+      };
+      const surface = requireSupportedSurface(
+        createDockerRuntimeProviderSnapshotSurface("docker", dependencies),
+      );
+      const target = sandbox({ agent, openshellDriver: "docker" });
+      const preflight = surface.preflight("restore", target);
+      const source = snapshotSource(preflight, {
+        schemaVersion: 1,
+        providerId: "docker",
+        runtime: { kind: "docker-container", handle: "c".repeat(64) },
+        acceleration: { kind: "none" },
+      });
+      const receipt = surface.restore(target, preflight, source, authority);
+      expect(receipt.managedProfile).toEqual(authority);
+      expect(queryRuntimeSnapshot).toHaveBeenCalledTimes(3);
+      expect(captureHostCommand).toHaveBeenCalledWith(
+        "docker",
+        [
+          "exec",
+          "--user",
+          "root",
+          "c".repeat(64),
+          "/usr/bin/env",
+          "-i",
+          "HOME=/root",
+          "LANG=C.UTF-8",
+          "LC_ALL=C.UTF-8",
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "/usr/local/bin/node",
+          "/usr/local/lib/nemoclaw/managed-startup-image-runtime.cjs",
+          "--verify-completion",
+          "--agent",
+          agent,
+          "--profile-fingerprint",
+          authority.profileFingerprint,
+        ],
+        15_000,
+      );
+
+      const denied = requireSupportedSurface(
+        createDockerRuntimeProviderSnapshotSurface("docker", {
+          ...dependencies,
+          captureHostCommand: dockerRestoreCapture({
+            status: 1,
+            stdout: "",
+            stderr: "profile mismatch",
+          }),
+        }),
+      );
+      const deniedPreflight = denied.preflight("restore", target);
+      const deniedSource = snapshotSource(deniedPreflight, source.runtime);
+      expect(() => denied.restore(target, deniedPreflight, deniedSource, authority)).toThrow(
+        /managed profile restoration could not be proven \(status=1; output=profile mismatch\)/u,
+      );
+    },
+  );
+
+  it("sanitizes verifier failure diagnostics", () => {
+    const denied = requireSupportedSurface(
+      createDockerRuntimeProviderSnapshotSurface("docker", {
+        captureHostCommand: dockerRestoreCapture({
+          status: 1,
+          stdout: "",
+          stderr: "\u001b]0;unsafe\u0007profile \u001b[31mmismatch\u001b[0m\u0000",
+          error: new Error("\u009b31mspawn\u009b0m\u0001 failed"),
+        }),
+        queryRuntimeSnapshot: () => dockerSnapshot(),
+      }),
     );
-    const target = sandbox({ agent, openshellDriver: "docker" });
-    const preflight = surface.preflight("restore", target);
+    const target = sandbox({ openshellDriver: "docker" });
+    const preflight = denied.preflight("restore", target);
     const source = snapshotSource(preflight, {
       schemaVersion: 1,
       providerId: "docker",
       runtime: { kind: "docker-container", handle: "c".repeat(64) },
       acceleration: { kind: "none" },
     });
-    const receipt = surface.restore(target, preflight, source, authority);
-    expect(receipt.managedProfile).toEqual(authority);
-    expect(captureOpenShell).toHaveBeenCalledWith(
-      [
-        "sandbox",
-        "exec",
-        "--name",
-        "alpha",
-        "-g",
-        "nemoclaw-18080",
-        "--no-tty",
-        "--timeout",
-        "10",
-        "--",
-        "/usr/local/lib/nemoclaw/managed-startup-image-runtime.cjs",
-        "--verify-completion",
-        "--agent",
-        agent,
-        "--profile-fingerprint",
-        authority.profileFingerprint,
-      ],
-      expect.objectContaining({
-        ignoreError: true,
-        includeStderr: true,
-        timeout: 15_000,
-      }),
-    );
 
-    const denied = requireSupportedSurface(
-      createDockerRuntimeProviderSnapshotSurface("docker", {
-        ...dependencies,
-        captureOpenShell: (() => ({
-          status: 1,
-          output: "profile mismatch",
-          stdout: "",
-          stderr: "",
-        })) as never,
-      }),
-    );
-    const deniedPreflight = denied.preflight("restore", target);
-    const deniedSource = snapshotSource(deniedPreflight, source.runtime);
-    expect(() => denied.restore(target, deniedPreflight, deniedSource, authority)).toThrow(
-      /managed profile restoration could not be proven/u,
+    expect(() => denied.restore(target, preflight, source, managedProfile)).toThrow(
+      /status=1; error=spawn failed; output=profile mismatch\)/u,
     );
   });
 });

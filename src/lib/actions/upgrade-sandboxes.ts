@@ -26,10 +26,10 @@ import {
   captureNamedGatewaySandboxListReadOnly,
   captureSandboxListWithGatewayPreflightOrExit,
 } from "../openshell-sandbox-list";
-import { parseLiveSandboxEntries, parseReadySandboxNames } from "../runtime-recovery";
 import * as sandboxVersion from "../sandbox/version";
 import { diagnosticPreview, isValidName, NAME_ALLOWED_FORMAT } from "../sandbox-name-contract";
 import * as registry from "../state/registry";
+import { enforceRemovedImmutabilityMigrationBoundary } from "../state/migrations/removed-immutability";
 import * as sandboxState from "../state/sandbox";
 
 type RebuildModule = typeof import("./sandbox/rebuild");
@@ -58,7 +58,7 @@ export const upgradeSandboxesDependencies = {
 function checkAgentVersionForUpgrade(
   sandboxName: string,
   liveNames: Set<string>,
-): sandboxVersion.VersionCheckResult {
+): Promise<sandboxVersion.VersionCheckResult> {
   return sandboxVersion.checkAgentVersion(
     sandboxName,
     liveNames.has(sandboxName) ? { forceProbe: true } : undefined,
@@ -205,11 +205,15 @@ async function confirmAbsentRecoveryCandidates(
   };
   // #7279: a read-only check must never recover/select the gateway.
   const confirmation = checkOnly
-    ? captureNamedGatewaySandboxListReadOnly(context, selectedGatewayName)
+    ? await captureNamedGatewaySandboxListReadOnly(context, selectedGatewayName)
     : await captureSandboxListWithGatewayPreflightOrExit(context, {
         gatewayName: selectedGatewayName,
       });
-  const confirmedLiveNames = parseReadySandboxNames(confirmation.output || "");
+  const confirmedLiveNames = new Set(
+    confirmation.sandboxes
+      .filter((sandbox) => sandbox.readiness === "ready")
+      .map((sandbox) => sandbox.name),
+  );
   return absentCandidates.filter((sandbox) => !confirmedLiveNames.has(sandbox.name));
 }
 
@@ -262,7 +266,7 @@ export async function upgradeSandboxes(
 
   const sandboxes = registry
     .listSandboxes()
-    .sandboxes.filter((sandbox) => !registry.isRouteOnlySandboxReservation(sandbox));
+    .sandboxes.filter((sandbox) => registry.isPublishedSandboxRegistration(sandbox));
   if (sandboxes.length === 0) {
     console.log("  No sandboxes found in the registry.");
     return;
@@ -298,31 +302,38 @@ export async function upgradeSandboxes(
     command: `${CLI_NAME} upgrade-sandboxes`,
   };
   const liveResult = checkOnly
-    ? captureNamedGatewaySandboxListReadOnly(liveListContext, selectedGatewayName)
+    ? await captureNamedGatewaySandboxListReadOnly(liveListContext, selectedGatewayName)
     : await captureSandboxListWithGatewayPreflightOrExit(liveListContext, {
         gatewayName: selectedGatewayName,
       });
-  const liveNames = parseReadySandboxNames(liveResult.output || "");
+  const liveNames = new Set(
+    liveResult.sandboxes
+      .filter((sandbox) => sandbox.readiness === "ready")
+      .map((sandbox) => sandbox.name),
+  );
   // Sandboxes the selected gateway observes in a non-Ready phase. Absence from
   // the selected gateway and stale Ready/Running rows are handled by
   // isPreparedRecoveryCandidate, which recovers them only when they resolve to
   // the selected gateway.
   const nonReadyLiveNames = new Set(
-    parseLiveSandboxEntries(liveResult.output || "")
-      .filter(
-        (entry) => entry.phase !== null && entry.phase !== "Ready" && entry.phase !== "Running",
-      )
-      .map((entry) => entry.name),
+    liveResult.sandboxes
+      .filter((sandbox) => sandbox.phase !== null && sandbox.readiness !== "ready")
+      .map((sandbox) => sandbox.name),
   );
 
   // Classify sandboxes as stale, unknown, or current. Pass the running NemoClaw
   // build so a NemoClaw image/build change is detected even when the agent
   // version is unchanged (#5026).
+  const currentNemoclawVersion = resolveCurrentNemoclawVersion();
+  const versions = new Map<string, sandboxVersion.VersionCheckResult>();
+  for (const sandbox of sandboxes) {
+    versions.set(sandbox.name, await checkAgentVersionForUpgrade(sandbox.name, liveNames));
+  }
   const { stale, unknown } = classifyUpgradeableSandboxes(
     sandboxes,
     liveNames,
-    (name) => checkAgentVersionForUpgrade(name, liveNames),
-    { currentNemoclawVersion: resolveCurrentNemoclawVersion() },
+    (name) => versions.get(name)!,
+    { currentNemoclawVersion },
   );
 
   // Source boundary (#6114): a legacy OpenShell install can leave its already-
@@ -423,6 +434,11 @@ export async function upgradeSandboxes(
   ) {
     if (unobservedOwnGatewaySandboxes.length > 0) {
       printOrphanedRegistrySandboxes(unobservedOwnGatewaySandboxes);
+      // #10211: `--check` is read-only, so scripts gate on the exit code
+      // rather than parsing output. An orphan is actionable — it needs
+      // `upgrade-sandboxes` to reconcile — so it must not report the same
+      // exit code as a clean run.
+      if (checkOnly) process.exit(1);
       return;
     }
     console.log("  All sandboxes are up to date.");
@@ -484,7 +500,10 @@ export async function upgradeSandboxes(
     // Check mode must agree with auto mode on the orphan diagnosis (#6520).
     printOrphanedRegistrySandboxes(unobservedOwnGatewaySandboxes);
     console.log(`  Run \`${CLI_NAME} upgrade-sandboxes\` to rebuild them.`);
-    return;
+    // #10211: reached only when stale, unknown, a prepared recovery, or a
+    // rejected recovery was found — never the "all up to date" case above.
+    // `--check` is read-only, so scripts gate on the exit code.
+    process.exit(1);
   }
 
   const { rebuildable, stopped } = splitRebuildableSandboxes(stale);
@@ -533,6 +552,7 @@ export async function upgradeSandboxes(
       }
     }
     try {
+      enforceRemovedImmutabilityMigrationBoundary(sandbox.name, { allowStateRecord: true });
       await upgradeSandboxesDependencies.rebuildSandbox(sandbox.name, ["--yes"], {
         throwOnError: true,
         recoveryManifest: manifest ?? undefined,

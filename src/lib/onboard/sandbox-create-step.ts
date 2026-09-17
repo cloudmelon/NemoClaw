@@ -51,6 +51,7 @@ export type SandboxCreateStepDeps = {
   addTraceEvent: NonNullable<StreamSandboxCreateOptions["traceEvent"]>;
   runOpenshell: GpuPatchDeps["runOpenshell"];
   runCaptureOpenshell: NonNullable<GpuPatchDeps["runCaptureOpenshell"]>;
+  commandExecutor: NonNullable<GpuPatchDeps["commandExecutor"]>;
   sleepSeconds: GpuPatchDeps["sleep"];
 };
 
@@ -97,6 +98,7 @@ export async function runSandboxCreateStep(
   const startupCommandPatch = resolveDockerStartupCommandPatch(
     context.agent,
     context.prebuild.dockerDriverGateway,
+    context.env,
   );
   const deferRestartSafeCutover =
     startupCommandPatch.persistStartupCommand && !context.useDockerGpuPatch;
@@ -112,6 +114,7 @@ export async function runSandboxCreateStep(
     deps: {
       runOpenshell: deps.runOpenshell,
       runCaptureOpenshell: deps.runCaptureOpenshell,
+      commandExecutor: deps.commandExecutor,
       sleep: deps.sleepSeconds,
     },
   });
@@ -128,10 +131,11 @@ export async function runSandboxCreateStep(
       onPoll: () => {
         if (!deferRestartSafeCutover) dockerGpuCreatePatch.maybeApplyDuringCreate();
       },
-      readyCheckOutputPatterns: getReadyCheckOutputPatternsForAgent(
-        deps.isTerminalAgent(context.agent),
-        sandboxEnv,
-      ),
+      readyCheckOutputPatterns: getReadyCheckOutputPatternsForAgent({
+        isTerminalAgent: deps.isTerminalAgent(context.agent),
+        startupRunsDuringCreate: true,
+        env: sandboxEnv,
+      }),
       failureCheck: dockerGpuCreatePatch.createFailureMessage,
       traceEvent: deps.addTraceEvent,
       waitForReadyTermination: deferRestartSafeCutover,

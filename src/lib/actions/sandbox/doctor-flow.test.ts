@@ -8,23 +8,50 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import { testTimeoutOptions } from "../../../../test/helpers/timeouts";
 
-type RunSandboxDoctor = typeof import("./doctor")["runSandboxDoctor"];
+type RunSandboxDoctor = (typeof import("./doctor"))["runSandboxDoctor"];
+type PortableAgentReceiptDisposition = ReturnType<
+  (typeof import("../../onboard/experimental/portable-agent-lifecycle"))["inspectPortableAgentReceiptDisposition"]
+>;
+type WithMcpLifecycleLock =
+  (typeof import("../../state/mcp-lifecycle-lock-acquisition"))["withMcpLifecycleLock"];
+
+function hermesPortableDisposition(phase: "pending" | "configuring" | "active") {
+  return {
+    kind: "hermes" as const,
+    phase,
+    gatewayName: "nemoclaw-19080",
+    lifecycleGeneration: "generation-1",
+    liveIdentityFingerprint: phase === "pending" ? null : "fingerprint-1",
+  };
+}
+
+type DoctorHarnessOptions = {
+  portableDisposition?:
+    | PortableAgentReceiptDisposition
+    | Error
+    | (() => PortableAgentReceiptDisposition | Error);
+  registryEntry?: "present" | "missing";
+  registryAgent?: "openclaw" | "hermes";
+  registryOverrides?: Record<string, unknown>;
+  withMcpLifecycleLock?: WithMcpLifecycleLock;
+};
 
 const requireDist = createRequire(import.meta.url);
 const doctorModulePath = "./doctor.js";
 
-function createDoctorHarness(provider = "ollama-local"): {
+function createDoctorHarness(
+  provider = "ollama-local",
+  options: DoctorHarnessOptions = {},
+): {
   buildToolScopeChecksSpy: MockInstance;
   captureOpenShellSpy: MockInstance;
   captureHostCommandSpy: MockInstance;
   configuredMessagingChannelsSpy: MockInstance;
   executeSandboxCommandForVerificationSpy: MockInstance;
-  getBaselineExclusionsSpy: MockInstance;
-  getBaselineExclusionTransitionSpy: MockInstance;
-  getBaselineExclusionRuntimeStatusSpy: MockInstance;
   getSandboxSpy: MockInstance;
   getNamedGatewayLifecycleStateSpy: MockInstance;
   healthProbeSpy: MockInstance;
+  ollamaInventoryProbeSpy: MockInstance;
   inspectMutableConfigPermsSpy: MockInstance;
   loadAgentSpy: MockInstance;
   probeSandboxInferenceGatewayHealthSpy: MockInstance;
@@ -34,6 +61,7 @@ function createDoctorHarness(provider = "ollama-local"): {
   resolveOpenShellSpy: MockInstance;
   resolveSandboxGatewayNameSpy: MockInstance;
   runSandboxDoctor: RunSandboxDoctor;
+  withMcpLifecycleLockSpy: MockInstance;
 } {
   delete require.cache[requireDist.resolve(doctorModulePath)];
 
@@ -48,20 +76,50 @@ function createDoctorHarness(provider = "ollama-local"): {
   const health = requireDist("../../inference/health.js");
   const dockerDriverPlatform = requireDist("../../onboard/docker-driver-platform.js");
   const gatewayBinding = requireDist("../../onboard/gateway-binding.js");
-  const policy = requireDist("../../policy/index.js");
   const sandboxVerificationExec = requireDist("../../onboard/sandbox-verification-exec.js");
   const sandboxVersion = requireDist("../../sandbox/version.js");
-  const shields = requireDist("../../shields/index.js");
+  const mutableConfigPerms = requireDist("../../sandbox/mutable-config-perms.js");
   const registry = requireDist("../../state/registry.js");
   const statusCommandDeps = requireDist("../../status-command-deps.js");
   const tunnelServices = requireDist("../../tunnel/services.js");
   const doctorHostCommand = requireDist("./doctor-host-command.js");
   const doctorToolScope = requireDist("./doctor-tool-scope.js");
   const inferenceRouteHealth = requireDist("./inference-route-health.js");
+  const portableAgentLifecycle = requireDist(
+    "../../onboard/experimental/portable-agent-lifecycle.js",
+  );
+  const doctorSystemChecks = requireDist("./doctor-system-checks.js");
 
-  const getSandboxSpy = vi.spyOn(registry, "getSandbox").mockReturnValue({
+  const qualifyPortableAgentLifecycleAuthority =
+    portableAgentLifecycle.qualifyPortableAgentLifecycleAuthority;
+  vi.spyOn(doctorSystemChecks, "inspectSandboxDoctorPortableAuthority").mockImplementation(((
+    sandboxName: string,
+  ) => {
+    const disposition =
+      typeof options.portableDisposition === "function"
+        ? options.portableDisposition()
+        : options.portableDisposition;
+    switch (disposition instanceof Error) {
+      case true:
+        throw disposition;
+      default:
+        return qualifyPortableAgentLifecycleAuthority(sandboxName, {
+          inspectReceiptDisposition: () => disposition ?? { kind: "absent" },
+          readRegistry: () =>
+            options.registryEntry === "missing" ? null : (registryEntry as never),
+        });
+    }
+  }) as never);
+  const withMcpLifecycleLockSpy = vi
+    .spyOn(doctorSystemChecks, "withSandboxDoctorLifecycleLock")
+    .mockImplementation(
+      (options.withMcpLifecycleLock ??
+        (async (_sandboxName: string, operation: () => unknown) => await operation())) as never,
+    );
+
+  const registryEntry = {
     name: "alpha",
-    agent: "openclaw",
+    agent: options.registryAgent ?? "openclaw",
     model: "registry-model",
     provider,
     openshellDriver: "docker",
@@ -72,19 +130,18 @@ function createDoctorHarness(provider = "ollama-local"): {
     imageTag: "nemoclaw-openclaw:test",
     gatewayName: "nemoclaw-19080",
     gatewayPort: 19080,
+    lifecycleGeneration: "generation-1",
+    lifecycleLiveIdentityFingerprint: "fingerprint-1",
     messaging: undefined,
-  });
+    ...options.registryOverrides,
+  };
+  const getSandboxSpy = vi
+    .spyOn(registry, "getSandbox")
+    .mockReturnValue(options.registryEntry === "missing" ? null : registryEntry);
   const configuredMessagingChannelsSpy = vi
     .spyOn(registry, "getConfiguredMessagingChannelsFromEntry")
     .mockReturnValue([]);
   vi.spyOn(registry, "getDisabledMessagingChannelsFromEntry").mockReturnValue([]);
-  const getBaselineExclusionsSpy = vi.spyOn(registry, "getBaselineExclusions").mockReturnValue([]);
-  const getBaselineExclusionTransitionSpy = vi
-    .spyOn(registry, "getBaselineExclusionTransition")
-    .mockReturnValue(null);
-  const getBaselineExclusionRuntimeStatusSpy = vi
-    .spyOn(policy, "getBaselineExclusionRuntimeStatus")
-    .mockReturnValue("excluded");
   const resolveOpenShellSpy = vi
     .spyOn(resolve, "resolveOpenshell")
     .mockReturnValue("/usr/bin/openshell");
@@ -96,17 +153,28 @@ function createDoctorHarness(provider = "ollama-local"): {
   const recoverNamedGatewayRuntimeSpy = vi
     .spyOn(gatewayRuntime, "recoverNamedGatewayRuntime")
     .mockResolvedValue({
-      before: { state: "healthy_named", status: "Status: Connected", gatewayInfo: "" },
-      after: { state: "healthy_named", status: "Status: Connected", gatewayInfo: "" },
+      before: {
+        state: "healthy_named",
+        diagnostic: "Status: Connected",
+        recoveryBlocked: false,
+        unavailable: false,
+      },
+      after: {
+        state: "healthy_named",
+        diagnostic: "Status: Connected",
+        recoveryBlocked: false,
+        unavailable: false,
+      },
       recovered: false,
     });
   const getNamedGatewayLifecycleStateSpy = vi
     .spyOn(gatewayRuntime, "getNamedGatewayLifecycleState")
-    .mockReturnValue({
+    .mockResolvedValue({
       state: "healthy_named",
-      status: "Status: Connected",
-      gatewayInfo: "Gateway: nemoclaw-19080",
       activeGateway: "nemoclaw-19080",
+      diagnostic: "Status: Connected",
+      recoveryBlocked: false,
+      unavailable: false,
     });
   const captureOpenShellSpy = vi
     .spyOn(runtime, "captureOpenshell")
@@ -136,6 +204,10 @@ function createDoctorHarness(provider = "ollama-local"): {
     endpoint: "http://127.0.0.1:11434/v1/chat/completions",
     detail: "healthy",
   });
+  const ollamaInventoryProbeSpy = vi.spyOn(health, "probeOllamaHostInventory").mockReturnValue({
+    endpoint: "http://127.0.0.1:11434/api/tags",
+    inventory: ["m"],
+  });
   const probeSandboxInferenceGatewayHealthSpy = vi
     .spyOn(inferenceRouteHealth, "probeSandboxInferenceGatewayHealth")
     .mockResolvedValue({
@@ -150,30 +222,20 @@ function createDoctorHarness(provider = "ollama-local"): {
   });
   vi.spyOn(agentRuntime, "getSessionAgent").mockReturnValue({ name: "openclaw" });
   vi.spyOn(agentRuntime, "getAgentDisplayName").mockReturnValue("OpenClaw");
-  vi.spyOn(sandboxVersion, "checkAgentVersion").mockReturnValue({
+  vi.spyOn(sandboxVersion, "checkAgentVersion").mockResolvedValue({
     sandboxVersion: "0.1.0",
     expectedVersion: "0.2.0",
     isStale: true,
   });
-  vi.spyOn(shields, "getShieldsPosture").mockReturnValue({
-    mode: "temporarily_unlocked",
-    detail: "temporarily unlocked for maintenance",
-  });
   const inspectMutableConfigPermsSpy = vi
-    .spyOn(shields, "inspectMutableConfigPerms")
+    .spyOn(mutableConfigPerms, "inspectMutableConfigPerms")
     .mockReturnValue({
       applies: true,
       ok: true,
-      dirMode: "2770",
-      dirOwner: "sandbox:sandbox",
-      fileMode: "660",
-      fileOwner: "sandbox:sandbox",
-      configDir: "/sandbox/.openclaw",
-      configFile: "openclaw.json",
       issues: [],
     });
   const repairMutableConfigPermsSpy = vi
-    .spyOn(shields, "repairMutableConfigPerms")
+    .spyOn(mutableConfigPerms, "repairMutableConfigPerms")
     .mockReturnValue({
       applied: true,
       verified: true,
@@ -215,12 +277,10 @@ function createDoctorHarness(provider = "ollama-local"): {
     captureHostCommandSpy,
     configuredMessagingChannelsSpy,
     executeSandboxCommandForVerificationSpy,
-    getBaselineExclusionsSpy,
-    getBaselineExclusionTransitionSpy,
-    getBaselineExclusionRuntimeStatusSpy,
     getSandboxSpy,
     getNamedGatewayLifecycleStateSpy,
     healthProbeSpy,
+    ollamaInventoryProbeSpy,
     inspectMutableConfigPermsSpy,
     loadAgentSpy,
     probeSandboxInferenceGatewayHealthSpy,
@@ -230,6 +290,7 @@ function createDoctorHarness(provider = "ollama-local"): {
     resolveOpenShellSpy,
     resolveSandboxGatewayNameSpy,
     runSandboxDoctor,
+    withMcpLifecycleLockSpy,
   };
 }
 
@@ -245,6 +306,147 @@ describe("runSandboxDoctor flow", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     delete require.cache[requireDist.resolve(doctorModulePath)];
+  });
+
+  it.each(["pending", "configuring", "active"] as const)(
+    "reports Hermes portable receipt phase %s without Docker or OpenClaw doctor work (#9203)",
+    testTimeoutOptions(30_000),
+    async (phase) => {
+      const harness = createDoctorHarness("ollama-local", {
+        portableDisposition: hermesPortableDisposition(phase),
+        registryEntry: phase === "pending" ? "missing" : "present",
+        registryAgent: "hermes",
+      });
+
+      const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
+
+      expect(report).toMatchObject({
+        sandbox: "alpha",
+        status: phase === "active" ? "ok" : "warn",
+        checks: [
+          {
+            label: "Portable lifecycle",
+            detail: `agent=Hermes; phase=${phase}`,
+          },
+        ],
+      });
+      expect(harness.captureOpenShellSpy).not.toHaveBeenCalled();
+      expect(harness.captureHostCommandSpy).not.toHaveBeenCalled();
+      expect(harness.recoverNamedGatewayRuntimeSpy).not.toHaveBeenCalled();
+      expect(harness.executeSandboxCommandForVerificationSpy).not.toHaveBeenCalled();
+      expect(harness.withMcpLifecycleLockSpy).toHaveBeenCalledWith("alpha", expect.any(Function));
+    },
+  );
+
+  it("renders plain Hermes portable doctor output without recovery (#9203)", async () => {
+    const harness = createDoctorHarness("ollama-local", {
+      portableDisposition: hermesPortableDisposition("active"),
+      registryAgent: "hermes",
+    });
+
+    await expect(harness.runSandboxDoctor("alpha")).resolves.toBeUndefined();
+
+    expect(harness.logSpy.mock.calls.flat().join("\n")).toContain(
+      "Portable lifecycle: agent=Hermes; phase=active",
+    );
+    expect(harness.captureHostCommandSpy).not.toHaveBeenCalled();
+    expect(harness.recoverNamedGatewayRuntimeSpy).not.toHaveBeenCalled();
+  });
+
+  it("releases the lifecycle lock before a failing doctor report exits (#9203)", async () => {
+    const events: string[] = [];
+    const harness = createDoctorHarness("ollama-local", {
+      withMcpLifecycleLock: async (_sandboxName, operation) => {
+        events.push("lock-enter");
+        try {
+          return await operation();
+        } finally {
+          events.push("lock-exit");
+        }
+      },
+    });
+    exitSpy.mockImplementationOnce(((code?: number) => {
+      events.push(`exit-${String(code)}`);
+      throw new Error(`process.exit(${String(code)})`);
+    }) as never);
+
+    await expect(harness.runSandboxDoctor("alpha")).rejects.toThrow("process.exit(1)");
+    expect(events).toEqual(["lock-enter", "lock-exit", "exit-1"]);
+  });
+
+  it("rejects malformed portable receipt authority before doctor probes (#9203)", async () => {
+    const harness = createDoctorHarness("ollama-local", {
+      portableDisposition: new Error("invalid portable lifecycle receipt"),
+    });
+
+    await expect(
+      harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true }),
+    ).rejects.toThrow("invalid portable lifecycle receipt");
+    expect(harness.captureOpenShellSpy).not.toHaveBeenCalled();
+    expect(harness.captureHostCommandSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { field: "gatewayName", value: "other-gateway" },
+    { field: "lifecycleGeneration", value: "other-generation" },
+    { field: "lifecycleLiveIdentityFingerprint", value: "other-fingerprint" },
+  ] as const)("rejects Hermes portable registry disagreement in $field (#9203)", async (drift) => {
+    const harness = createDoctorHarness("ollama-local", {
+      portableDisposition: hermesPortableDisposition("active"),
+      registryAgent: "hermes",
+      registryOverrides: { [drift.field]: drift.value },
+    });
+
+    await expect(
+      harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true }),
+    ).rejects.toThrow("receipt and registry authority disagree");
+    expect(harness.captureOpenShellSpy).not.toHaveBeenCalled();
+    expect(harness.captureHostCommandSpy).not.toHaveBeenCalled();
+  });
+
+  it("rejects an active Hermes receipt with no registry row (#9203)", async () => {
+    const harness = createDoctorHarness("ollama-local", {
+      portableDisposition: hermesPortableDisposition("active"),
+      registryEntry: "missing",
+    });
+
+    await expect(
+      harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true }),
+    ).rejects.toThrow("missing its registry authority");
+    expect(harness.captureOpenShellSpy).not.toHaveBeenCalled();
+    expect(harness.captureHostCommandSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves schema-4 OpenClaw doctor behavior under the lifecycle fence (#9203)", async () => {
+    const harness = createDoctorHarness("ollama-local", {
+      portableDisposition: { kind: "openclaw" },
+    });
+
+    await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
+
+    expect(harness.captureOpenShellSpy).toHaveBeenCalled();
+    expect(harness.captureHostCommandSpy).toHaveBeenCalled();
+    expect(harness.withMcpLifecycleLockSpy).toHaveBeenCalledWith("alpha", expect.any(Function));
+  });
+
+  it("classifies publication while waiting for the doctor lifecycle fence (#9203)", async () => {
+    let disposition: PortableAgentReceiptDisposition = { kind: "absent" };
+    const harness = createDoctorHarness("ollama-local", {
+      portableDisposition: () => disposition,
+      registryAgent: "hermes",
+      withMcpLifecycleLock: async (_sandboxName, operation) => {
+        disposition = hermesPortableDisposition("active");
+        return await operation();
+      },
+    });
+
+    const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
+
+    expect(report?.checks).toEqual([
+      expect.objectContaining({ detail: "agent=Hermes; phase=active" }),
+    ]);
+    expect(harness.captureOpenShellSpy).not.toHaveBeenCalled();
+    expect(harness.captureHostCommandSpy).not.toHaveBeenCalled();
   });
 
   it(
@@ -263,6 +465,13 @@ describe("runSandboxDoctor flow", () => {
       expect(report?.checks).toEqual(
         expect.arrayContaining([
           expect.objectContaining({ group: "Host", label: "Docker daemon", status: "ok" }),
+          // #10223: the documented check line for a resolved gateway binding.
+          expect.objectContaining({
+            group: "Gateway",
+            label: "Registered gateway binding",
+            status: "ok",
+            detail: "resolved to 'nemoclaw-19080'",
+          }),
           expect.objectContaining({ group: "Gateway", label: "OpenShell status", status: "ok" }),
           expect.objectContaining({ group: "Sandbox", label: "Live sandbox", status: "ok" }),
           expect.objectContaining({
@@ -290,9 +499,30 @@ describe("runSandboxDoctor flow", () => {
         ]),
       );
       expect(exitSpy).not.toHaveBeenCalled();
+      expect(harness.ollamaInventoryProbeSpy).toHaveBeenCalledOnce();
       expect(harness.logSpy).not.toHaveBeenCalled();
     },
   );
+
+  it("does not report a registered gateway binding for an unregistered sandbox name (#10230)", async () => {
+    const harness = createDoctorHarness("ollama-local", { registryEntry: "missing" });
+
+    const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
+
+    // resolveDoctorGatewayName falls back to the ambient default gateway for
+    // an unregistered sandbox name, so the Gateway section still runs — but
+    // it must not claim a registered binding that does not exist.
+    expect(
+      report?.checks.some(
+        (check) => check.group === "Gateway" && check.label === "Registered gateway binding",
+      ),
+    ).toBe(false);
+    expect(report?.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ group: "Gateway", label: "OpenShell status", status: "ok" }),
+      ]),
+    );
+  });
 
   it("fails the JSON host check for an unknown durable runtime provider", async () => {
     const harness = createDoctorHarness();
@@ -325,222 +555,83 @@ describe("runSandboxDoctor flow", () => {
   it.each([
     ["high", "high"],
     [null, "endpoint-default"],
-  ] as const)("reports effective reasoning effort in doctor JSON (%s) (#7659)", async (stored, expected) => {
-    const harness = createDoctorHarness("compatible-endpoint");
-    harness.getSandboxSpy.mockReturnValue({
-      name: "alpha",
-      agent: "openclaw",
-      model: "registry-model",
-      provider: "compatible-endpoint",
-      preferredInferenceApi: "openai-completions",
-      compatibleEndpointReasoningEffort: stored,
-      openshellDriver: "docker",
-      openshellVersion: "0.0.72",
-      nemoclawVersion: "0.0.83",
-      fromDockerfile: null,
-      dashboardPort: 18789,
-      imageTag: "nemoclaw-openclaw:test",
-      gatewayName: "nemoclaw-19080",
-      gatewayPort: 19080,
-    });
-
-    const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
-
-    expect(report?.checks).toContainEqual({
-      group: "Inference",
-      label: "Reasoning effort",
-      status: "info",
-      detail: expected,
-    });
-  });
-
-  it(
-    "reports baseline exclusions and flags content drift since approval (#7194)",
-    testTimeoutOptions(30_000),
-    async () => {
-      const harness = createDoctorHarness();
-      harness.getBaselineExclusionsSpy.mockReturnValue([
-        {
-          version: 1,
-          agent: "openclaw",
-          key: "nous_research",
-          digest: "digest-1",
-          acknowledgedAt: "2026-07-19T00:00:00.000Z",
-        },
-        {
-          version: 1,
-          agent: "openclaw",
-          key: "changed_entry",
-          digest: "digest-stale",
-          acknowledgedAt: "2026-07-18T00:00:00.000Z",
-        },
-        {
-          version: 1,
-          agent: "openclaw",
-          key: "dropped_entry",
-          digest: "digest-2",
-          acknowledgedAt: "2026-07-17T00:00:00.000Z",
-        },
-      ]);
-      const statuses: Record<string, "excluded" | "content-changed" | "no-longer-in-baseline"> = {
-        nous_research: "excluded",
-        changed_entry: "content-changed",
-        dropped_entry: "no-longer-in-baseline",
-      };
-      harness.getBaselineExclusionRuntimeStatusSpy.mockImplementation(
-        (_sandbox, entry) => statuses[entry.key],
-      );
+  ] as const)(
+    "reports effective reasoning effort in doctor JSON (%s) (#7659)",
+    async (stored, expected) => {
+      const harness = createDoctorHarness("compatible-endpoint");
+      harness.getSandboxSpy.mockReturnValue({
+        name: "alpha",
+        agent: "openclaw",
+        model: "registry-model",
+        provider: "compatible-endpoint",
+        preferredInferenceApi: "openai-completions",
+        compatibleEndpointReasoningEffort: stored,
+        openshellDriver: "docker",
+        openshellVersion: "0.0.72",
+        nemoclawVersion: "0.0.83",
+        fromDockerfile: null,
+        dashboardPort: 18789,
+        imageTag: "nemoclaw-openclaw:test",
+        gatewayName: "nemoclaw-19080",
+        gatewayPort: 19080,
+      });
 
       const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
 
-      expect(report?.checks).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            group: "Sandbox",
-            label: "Baseline exclusion: nous_research",
-            status: "info",
-          }),
-          expect.objectContaining({
-            group: "Sandbox",
-            label: "Baseline exclusion: changed_entry",
-            status: "warn",
-            hint: expect.stringContaining("policy restore changed_entry"),
-          }),
-          expect.objectContaining({
-            group: "Sandbox",
-            label: "Baseline exclusion: dropped_entry",
-            status: "warn",
-            detail:
-              "Baseline entry 'dropped_entry' no longer exists; rebuild fails closed until the stale exclusion is cleared.",
-            hint: "key no longer exists in the baseline; run `nemoclaw alpha policy restore dropped_entry` to clear the stale record",
-          }),
-        ]),
-      );
+      expect(report?.checks).toContainEqual({
+        group: "Inference",
+        label: "Reasoning effort",
+        status: "info",
+        detail: expected,
+      });
     },
   );
 
-  it("fails when registry intent is not enforced by the live policy (#7194)", async () => {
-    const harness = createDoctorHarness();
-    harness.getBaselineExclusionsSpy.mockReturnValue([
-      {
-        version: 1,
-        agent: "hermes",
-        key: "pypi",
-        digest: "a".repeat(64),
-      },
-    ]);
-    harness.getBaselineExclusionRuntimeStatusSpy.mockReturnValue("live-policy-mismatch");
+  it.each(["openclaw", "hermes"] as const)(
+    "pins %s health to the recorded gateway and leaves serving-process health unchecked (#7003)",
+    async (agent) => {
+      const harness = createDoctorHarness();
+      harness.loadAgentSpy.mockReturnValue({
+        name: agent,
+        runtime: { kind: "gateway" },
+        configPaths: {
+          dir: "/sandbox/.agent",
+          configFile: "config.json",
+          format: "json",
+        },
+      });
+      harness.getSandboxSpy.mockReturnValue({
+        name: "alpha",
+        agent,
+        model: "registry-model",
+        provider: "ollama-local",
+        openshellDriver: "docker",
+        openshellVersion: "0.0.72",
+        nemoclawVersion: "0.0.83",
+        fromDockerfile: null,
+        dashboardPort: 18789,
+        imageTag: "nemoclaw-openclaw:test",
+        gatewayName: "nemoclaw-19080",
+        gatewayPort: 19080,
+      });
 
-    const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
+      const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
 
-    expect(report?.checks).toContainEqual(
-      expect.objectContaining({
-        label: "Baseline exclusion: pypi",
-        status: "fail",
-        detail: expect.stringContaining("not enforced"),
-      }),
-    );
-  });
-
-  it("flags an interrupted baseline transaction as a rebuild-blocking repair (#7178)", async () => {
-    const harness = createDoctorHarness();
-    harness.getBaselineExclusionTransitionSpy.mockReturnValue({
-      id: "tx-1",
-      operation: "restore",
-      exclusion: { version: 1, agent: "openclaw", key: "nous_research", digest: "approved" },
-      targetLiveDigest: "current",
-      startedAt: "2026-07-19T00:00:00.000Z",
-    });
-
-    const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
-
-    expect(report?.checks).toEqual(
-      expect.arrayContaining([
+      expect(harness.loadAgentSpy).toHaveBeenCalledWith(agent);
+      expect(harness.probeSandboxInferenceGatewayHealthSpy).toHaveBeenCalledWith("alpha", {
+        gatewayName: "nemoclaw-19080",
+      });
+      expect(harness.probeSandboxInferenceGatewayHealthSpy).toHaveBeenCalledOnce();
+      expect(report?.checks).toContainEqual(
         expect.objectContaining({
-          group: "Sandbox",
-          label: "Baseline exclusion: nous_research",
-          status: "warn",
-          detail: expect.stringContaining("interrupted"),
-          hint: "re-run `nemoclaw alpha policy restore nous_research`",
+          group: "Inference",
+          label: "Serving process",
+          status: "info",
+          detail: "not checked — serving-process probing is not implemented",
         }),
-      ]),
-    );
-  });
-
-  it("keeps repair guidance visible when another exclusion baseline is unreadable (#7194)", async () => {
-    const harness = createDoctorHarness();
-    harness.getBaselineExclusionsSpy.mockReturnValue([
-      { version: 1, agent: "openclaw", key: "another_entry", digest: "c".repeat(64) },
-      { version: 1, agent: "openclaw", key: "nous_research", digest: "a".repeat(64) },
-    ]);
-    harness.getBaselineExclusionTransitionSpy.mockReturnValue({
-      id: "0b2f3297-a9ab-4c2f-80da-bf1760a1afbf",
-      operation: "restore",
-      exclusion: { version: 1, agent: "openclaw", key: "nous_research", digest: "a".repeat(64) },
-      targetLiveDigest: "b".repeat(64),
-      startedAt: "2026-07-19T00:00:00.000Z",
-    });
-    harness.getBaselineExclusionRuntimeStatusSpy.mockReturnValue("baseline-unreadable");
-
-    const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
-
-    expect(report?.checks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          label: "Baseline exclusion: another_entry",
-          status: "warn",
-          detail: expect.stringContaining("unreadable"),
-        }),
-        expect.objectContaining({
-          label: "Baseline exclusion: nous_research",
-          status: "warn",
-          detail: expect.stringContaining("interrupted"),
-        }),
-      ]),
-    );
-  });
-
-  it.each([
-    "openclaw",
-    "hermes",
-  ] as const)("keeps serving-process health explicitly unchecked for the %s gateway (#7003)", async (agent) => {
-    const harness = createDoctorHarness();
-    harness.loadAgentSpy.mockReturnValue({
-      name: agent,
-      runtime: { kind: "gateway" },
-      configPaths: {
-        dir: "/sandbox/.agent",
-        configFile: "config.json",
-        format: "json",
-      },
-    });
-    harness.getSandboxSpy.mockReturnValue({
-      name: "alpha",
-      agent,
-      model: "registry-model",
-      provider: "ollama-local",
-      openshellDriver: "docker",
-      openshellVersion: "0.0.72",
-      nemoclawVersion: "0.0.83",
-      fromDockerfile: null,
-      dashboardPort: 18789,
-      imageTag: "nemoclaw-openclaw:test",
-      gatewayName: "nemoclaw-19080",
-      gatewayPort: 19080,
-    });
-
-    const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
-
-    expect(harness.loadAgentSpy).toHaveBeenCalledWith(agent);
-    expect(report?.checks).toContainEqual(
-      expect.objectContaining({
-        group: "Inference",
-        label: "Serving process",
-        status: "info",
-        detail: "not checked — serving-process probing is not implemented",
-      }),
-    );
-  });
+      );
+    },
+  );
 
   it("rejects mutating --fix when JSON output was requested", async () => {
     const harness = createDoctorHarness();
@@ -570,11 +661,12 @@ describe("runSandboxDoctor flow", () => {
   it("does not run live or tool-scope probes when the named gateway is disconnected", async () => {
     const harness = createDoctorHarness();
     harness.configuredMessagingChannelsSpy.mockReturnValue(["telegram"]);
-    harness.getNamedGatewayLifecycleStateSpy.mockReturnValue({
+    harness.getNamedGatewayLifecycleStateSpy.mockResolvedValue({
       state: "missing_named",
-      status: "Status: Disconnected",
-      gatewayInfo: "",
       activeGateway: null,
+      diagnostic: "Status: Disconnected",
+      recoveryBlocked: false,
+      unavailable: false,
     });
 
     const report = await harness.runSandboxDoctor("alpha", ["--json"], { quietJson: true });
@@ -716,13 +808,15 @@ describe("runSandboxDoctor flow", () => {
     harness.recoverNamedGatewayRuntimeSpy.mockResolvedValue({
       before: {
         state: "missing_named",
-        status: "Status: Disconnected",
-        gatewayInfo: "",
+        diagnostic: "Status: Disconnected",
+        recoveryBlocked: false,
+        unavailable: false,
       },
       after: {
         state: "healthy_named",
-        status: "Status: Connected",
-        gatewayInfo: "Gateway: nemoclaw-19080",
+        diagnostic: "Status: Connected",
+        recoveryBlocked: false,
+        unavailable: false,
       },
       recovered: true,
     });
@@ -739,10 +833,16 @@ describe("runSandboxDoctor flow", () => {
       gatewayName: "nemoclaw-19080",
     });
     expect(harness.captureOpenShellSpy).toHaveBeenCalledWith(
-      ["sandbox", "list"],
+      ["sandbox", "list", "-g", "nemoclaw-19080"],
       expect.any(Object),
     );
-    expect(harness.probeSandboxInferenceGatewayHealthSpy).toHaveBeenCalledWith("alpha");
+    expect(harness.captureOpenShellSpy).toHaveBeenCalledWith(
+      ["inference", "get", "-g", "nemoclaw-19080"],
+      expect.any(Object),
+    );
+    expect(harness.probeSandboxInferenceGatewayHealthSpy).toHaveBeenCalledWith("alpha", {
+      gatewayName: "nemoclaw-19080",
+    });
     expect(harness.executeSandboxCommandForVerificationSpy).toHaveBeenCalled();
     expect(harness.buildToolScopeChecksSpy).toHaveBeenCalledWith(
       "alpha",
@@ -760,13 +860,7 @@ describe("runSandboxDoctor flow", () => {
     harness.inspectMutableConfigPermsSpy.mockReturnValue({
       applies: true,
       ok: false,
-      dirMode: "700",
-      dirOwner: "sandbox:sandbox",
-      fileMode: "600",
-      fileOwner: "sandbox:sandbox",
-      configDir: "/sandbox/.openclaw",
-      configFile: "openclaw.json",
-      issues: ["directory mode is 700"],
+      issues: ["directory mode differs from runtime contract"],
     });
     const inferenceRouteHealth = requireDist("./inference-route-health.js");
     vi.mocked(inferenceRouteHealth.probeSandboxInferenceGatewayHealth).mockResolvedValue({

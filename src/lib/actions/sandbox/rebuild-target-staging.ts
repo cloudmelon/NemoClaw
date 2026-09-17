@@ -2,11 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { hydrateMessagingChannelConfig } from "../../messaging-channel-config";
+import {
+  isN1xManagedVllmProviderModel,
+  isRecordedN1xManagedVllmRebuildEligible,
+} from "../../domain/sandbox/n1x-managed-vllm-rebuild";
+import {
+  isN1xOnboardingProviderKey,
+  persistedProviderNameToSelectionKey,
+  type RemoteProviderConfigEntryLike,
+} from "../../onboard/inference-providers/provider-selection-keys";
 import { getStoredMessagingChannelConfig } from "../../onboard/messaging-config";
 import {
   createRebuildRouteHandoff,
   type RegistryInferenceRoute,
 } from "../../onboard/rebuild-route-handoff";
+import { parseHostLocalInferenceReceipt } from "../../onboard/runtime-provider/host-local-inference";
 import type { SandboxBaseImageResolutionMetadata } from "../../sandbox-base-image";
 import * as onboardSession from "../../state/onboard-session";
 import type { RebuildBail } from "./rebuild-credential-preflight";
@@ -20,6 +30,10 @@ import {
   type RebuildRecreateOnboardOpts,
 } from "./rebuild-gpu-opt-out";
 import { printRebuildPreflightFailure } from "./rebuild-preflight-error";
+
+const { REMOTE_PROVIDER_CONFIG } = require("../../onboard/providers") as {
+  REMOTE_PROVIDER_CONFIG: Record<string, RemoteProviderConfigEntryLike>;
+};
 
 export function prepareRebuildRecreateOptions(
   sandboxName: string,
@@ -82,6 +96,67 @@ export function stageRebuildHermesDashboardConfig(
     else process.env[key] = value;
   }
   return true;
+}
+
+/** Stage a validated recorded N1x provider decision for authoritative rebuild readiness. */
+export function stageRecordedDeferredN1xIntent(
+  recreateOptions: Pick<
+    RebuildRecreateOnboardOpts,
+    "allowDeferredN1xManagedVllm" | "reinstallDeferredN1xManagedVllm"
+  >,
+  sandboxEntry: Pick<
+    RebuildSandboxEntry,
+    | "provider"
+    | "model"
+    | "endpointUrl"
+    | "endpointSource"
+    | "openshellDriver"
+    | "hostLocalInferenceReceipt"
+    | "deferredN1xManagedVllmAccepted"
+    | "nimContainer"
+  >,
+  rebuildSelection: {
+    provider: string;
+    model: string;
+    pinEndpoint: boolean;
+    endpointUrl: string | null;
+  },
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): void {
+  const explicitPreviewIntent = String(env.NEMOCLAW_PROVIDER ?? "").trim() === "install-vllm";
+  const selectionMatchesRecord =
+    rebuildSelection.provider === sandboxEntry.provider &&
+    rebuildSelection.model === sandboxEntry.model;
+  const isManagedVllmIdentity = isN1xManagedVllmProviderModel(
+    sandboxEntry.provider,
+    sandboxEntry.model,
+  );
+  const recordedStandardProviderIsEligible =
+    selectionMatchesRecord &&
+    !isManagedVllmIdentity &&
+    isN1xOnboardingProviderKey(
+      persistedProviderNameToSelectionKey(
+        sandboxEntry.provider,
+        { hasNimContainer: Boolean(sandboxEntry.nimContainer) },
+        REMOTE_PROVIDER_CONFIG,
+      ),
+    );
+  const recordedManagedVllmIsEligible =
+    !sandboxEntry.nimContainer &&
+    isRecordedN1xManagedVllmRebuildEligible(
+      sandboxEntry,
+      rebuildSelection,
+      parseHostLocalInferenceReceipt,
+      {
+        explicitPreviewIntent,
+      },
+    );
+  if (recordedStandardProviderIsEligible || recordedManagedVllmIsEligible) {
+    recreateOptions.allowDeferredN1xManagedVllm = true;
+  }
+  if (recordedManagedVllmIsEligible && explicitPreviewIntent) {
+    recreateOptions.reinstallDeferredN1xManagedVllm = true;
+  }
 }
 
 export function hydrateMessagingConfigForRebuild(

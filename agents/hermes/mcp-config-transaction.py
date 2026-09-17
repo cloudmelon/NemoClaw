@@ -52,6 +52,7 @@ GATEWAY_PID_PATH = f"{HERMES_DIR}/runtime/gateway.pid"
 STRICT_HASH_PATH = "/etc/nemoclaw/hermes.config-hash"
 GUARD_PATH = "/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py"
 ROOT_LIFECYCLE_MARKER = "/run/nemoclaw/hermes-root-lifecycle"
+GATEWAY_PUBLIC_PORT_PATH = "/run/nemoclaw/hermes-api-port"
 SERVICE_MANAGER_PATH = b"/usr/local/bin/nemoclaw-start"
 RELOAD_TIMEOUT_SECONDS = 300
 SERVER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
@@ -70,8 +71,17 @@ MCP_ROUTED_PRIVATE_IPV4_NETWORKS = tuple(
 ENV_PLACEHOLDER_RE = re.compile(
     r"^Bearer openshell:resolve:env:([A-Za-z_][A-Za-z0-9_]{0,127})$"
 )
+REVISIONED_ENV_PLACEHOLDER_RE = re.compile(
+    r"^Bearer openshell:resolve:env:(v[0-9]{1,20})_([A-Za-z_][A-Za-z0-9_]{0,127})$"
+)
+STABLE_ENV_PLACEHOLDER_RE = re.compile(
+    r"^Bearer openshell:resolve:env:(s[a-f0-9]{64})_([A-Za-z_][A-Za-z0-9_]{0,127})$"
+)
 OPENSHELL_REVISIONED_CREDENTIAL_NAME_RE = re.compile(r"^v[0-9]+_[A-Za-z0-9_]+$")
-BOUNDARY_MANIFEST_NAME = "openshell-child-visible-credentials.v0.0.101.json"
+OPENSHELL_STABLE_CREDENTIAL_NAME_RE = re.compile(
+    r"^s[a-f0-9]{64}_[A-Za-z0-9_]+$"
+)
+BOUNDARY_MANIFEST_NAME = "openshell-child-visible-credentials.v0.0.116.json"
 ANSI_ESCAPE_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-_])"
 )
@@ -93,7 +103,95 @@ SENSITIVE_PAYLOAD_KEY_RE = re.compile(
 MAX_ERROR_MESSAGE_LENGTH = 512
 MAX_GATEWAY_PID_RECORD_BYTES = 4096
 MCP_RACE_RECOVERY_ATTEMPTS = 3
+MAX_GATEWAY_PUBLIC_PORT_RECORD_BYTES = 16
 GATEWAY_INTERNAL_PORT = 18642
+GATEWAY_NOT_READY_MESSAGE = "Hermes gateway is not running for managed MCP reload"
+MANAGED_API_RELAY_TARGET = f"TCP:127.0.0.1:{GATEWAY_INTERNAL_PORT}".encode()
+MANAGED_API_RELAY_PROCESS_NAME = b"socat"
+MANAGED_API_RELAY_LISTEN_PREFIX = b"TCP-LISTEN:"
+MANAGED_API_RELAY_LISTEN_SUFFIX = b",bind=0.0.0.0,fork,reuseaddr"
+
+
+def _parse_gateway_public_port(raw: str) -> int:
+    """Parse one allocated Hermes API port."""
+    if re.fullmatch(r"[0-9]+", raw) is None:
+        raise PermissionError("Hermes API port is malformed")
+    try:
+        port = int(raw, 10)
+    except ValueError as error:
+        raise PermissionError("Hermes API port is malformed") from error
+    if not 8642 <= port <= 8652:
+        raise PermissionError("Hermes API port is outside the allocated range")
+    return port
+
+
+def _root_gateway_public_port_marker() -> int | None:
+    """Read the root-owned API-port marker without following links."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise PermissionError("Hermes API port marker cannot be opened safely")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
+
+    try:
+        descriptor = os.open(GATEWAY_PUBLIC_PORT_PATH, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise PermissionError(
+            "Hermes API port marker cannot be opened safely"
+        ) from error
+
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o444
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > MAX_GATEWAY_PUBLIC_PORT_RECORD_BYTES
+        ):
+            raise PermissionError("Hermes API port marker is unsafe")
+        raw = os.read(descriptor, MAX_GATEWAY_PUBLIC_PORT_RECORD_BYTES + 1)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) != before.st_size
+            or len(raw) > MAX_GATEWAY_PUBLIC_PORT_RECORD_BYTES
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+        ):
+            raise PermissionError("Hermes API port marker changed while reading")
+    finally:
+        os.close(descriptor)
+
+    try:
+        decoded = raw.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise PermissionError("Hermes API port marker is malformed") from error
+    return _parse_gateway_public_port(decoded)
+
+
 GATEWAY_PUBLIC_PORT = 8642
 TRUSTED_HERMES_GATEWAY_LAUNCHERS = {
     b"/usr/local/bin/hermes.real",
@@ -107,7 +205,8 @@ def _load_credential_boundary_manifest() -> dict[str, object]:
     # corrupt, or wrong-version OpenShell boundary manifest.
     # sourceBoundary: NemoClaw owns one reviewed manifest installed beside this
     # helper in images; the second path is the deterministic source-checkout layout.
-    # whyNotSourceFix: OpenShell v0.0.101 has no machine-readable child-env contract.
+    # whyNotSourceFix: OpenShell v0.0.106 through v0.0.116 have no
+    # machine-readable child-env contract.
     # It also deliberately hides the supervisor identity mount from workload
     # children and the Hermes image contains no OpenShell CLI. Executing
     # ``openshell --version`` here would therefore either fail every real
@@ -135,7 +234,7 @@ def _load_credential_boundary_manifest() -> dict[str, object]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if (
         not isinstance(manifest, dict)
-        or manifest.get("openshellVersion") != "0.0.101"
+        or manifest.get("openshellVersion") != "0.0.116"
     ):
         raise RuntimeError("Hermes MCP credential boundary manifest is invalid")
     return manifest
@@ -170,6 +269,7 @@ _RUNTIME_CONTROL_PREFIXES = _manifest_strings(
 def _credential_name_is_reserved(name: str) -> bool:
     return (
         OPENSHELL_REVISIONED_CREDENTIAL_NAME_RE.fullmatch(name) is not None
+        or OPENSHELL_STABLE_CREDENTIAL_NAME_RE.fullmatch(name) is not None
         or name in _RAW_CHILD_VALUE_KEYS
         or name in _REWRITTEN_CHILD_VALUE_KEYS
         or name in _RUNTIME_CONTROL_KEYS
@@ -203,8 +303,8 @@ def _assert_mutable_snapshot(snapshot: object) -> None:
         owner_matches = uid == os.geteuid()
     if not owner_matches or not (mode & stat.S_IWUSR):
         raise RuntimeError(
-            "Hermes config is locked or is not owned by the sandbox identity. "
-            "Lower shields before changing managed MCP servers."
+            "Hermes config is not writable or is not owned by the sandbox identity. "
+            "Rebuild or recreate the sandbox before changing managed MCP servers."
         )
 
 
@@ -319,7 +419,7 @@ def _validate_payload(action: str, payload: dict[str, object]) -> None:
     }
     if action == "add" and hostname in host_aliases:
         raise ValueError(
-            "Authenticated MCP OpenShell host aliases are unavailable with OpenShell v0.0.101"
+            "Authenticated MCP OpenShell host aliases are unavailable with OpenShell v0.0.116"
         )
     # Host preflight owns destination trust and binds every accepted endpoint to
     # exact OpenShell address pins. This in-sandbox check revalidates canonical
@@ -364,16 +464,46 @@ def _validate_payload(action: str, payload: dict[str, object]) -> None:
     if not isinstance(headers, dict) or set(headers) != {"Authorization"}:
         raise ValueError("MCP mutation payload must contain one Authorization header")
     authorization = headers.get("Authorization")
-    authorization_match = (
+    revisioned_authorization_match = (
+        REVISIONED_ENV_PLACEHOLDER_RE.fullmatch(authorization)
+        if isinstance(authorization, str)
+        else None
+    )
+    stable_authorization_match = (
+        STABLE_ENV_PLACEHOLDER_RE.fullmatch(authorization)
+        if isinstance(authorization, str)
+        else None
+    )
+    canonical_authorization_match = (
         ENV_PLACEHOLDER_RE.fullmatch(authorization)
         if isinstance(authorization, str)
         else None
+    )
+    authorization_match = (
+        revisioned_authorization_match
+        or stable_authorization_match
+        or canonical_authorization_match
     )
     if authorization_match is None:
         raise ValueError(
             "Hermes MCP Authorization must contain an OpenShell environment placeholder"
         )
-    if action == "add" and _credential_name_is_reserved(authorization_match.group(1)):
+    credential_name = (
+        (revisioned_authorization_match or stable_authorization_match).group(2)
+        if revisioned_authorization_match is not None
+        or stable_authorization_match is not None
+        else canonical_authorization_match.group(1)
+    )
+    if action == "add" and (
+        revisioned_authorization_match is not None
+        or stable_authorization_match is not None
+    ):
+        expected_child_value = authorization.removeprefix("Bearer ")
+        if os.environ.get(credential_name) != expected_child_value:
+            raise ValueError(
+                "Hermes MCP Authorization generation does not match the OpenShell child environment"
+            )
+    if action == "add" and _credential_name_is_reserved(credential_name):
         raise ValueError(
             "Hermes MCP Authorization uses a reserved credential environment name"
         )
@@ -393,6 +523,56 @@ def _managed_candidate(payload: dict[str, object]) -> dict[str, object]:
     if headers:
         candidate["headers"] = headers
     return candidate
+
+
+def _managed_candidate_matches(
+    actual: object, expected: dict[str, object], allow_revisioned: bool
+) -> bool:
+    """Compare managed config with bounded revision equivalence when requested."""
+    if actual == expected:
+        return True
+    if not allow_revisioned or not isinstance(actual, dict):
+        return False
+    if set(actual) != set(expected):
+        return False
+    for name, value in expected.items():
+        if name != "headers" and actual.get(name) != value:
+            return False
+    actual_headers = actual.get("headers")
+    expected_headers = expected.get("headers")
+    if not isinstance(actual_headers, dict) or not isinstance(expected_headers, dict):
+        return False
+    if set(actual_headers) != {"Authorization"} or set(expected_headers) != {
+        "Authorization"
+    }:
+        return False
+    expected_authorization = expected_headers.get("Authorization")
+    actual_authorization = actual_headers.get("Authorization")
+    expected_match = (
+        ENV_PLACEHOLDER_RE.fullmatch(expected_authorization)
+        if isinstance(expected_authorization, str)
+        else None
+    )
+    if expected_match is None:
+        return False
+    expected_name = expected_match.group(1)
+    if (
+        OPENSHELL_REVISIONED_CREDENTIAL_NAME_RE.fullmatch(expected_name)
+        or OPENSHELL_STABLE_CREDENTIAL_NAME_RE.fullmatch(expected_name)
+    ):
+        return False
+    if not isinstance(actual_authorization, str):
+        return False
+    suffix = f"_{expected_name}"
+    revision_prefix = "Bearer openshell:resolve:env:v"
+    if actual_authorization.startswith(revision_prefix) and actual_authorization.endswith(suffix):
+        revision = actual_authorization[len(revision_prefix) : -len(suffix)]
+        return revision.isdigit() and 1 <= len(revision) <= 20
+    stable_prefix = "Bearer openshell:resolve:env:s"
+    if actual_authorization.startswith(stable_prefix) and actual_authorization.endswith(suffix):
+        handle = actual_authorization[len(stable_prefix) : -len(suffix)]
+        return len(handle) == 64 and all(char in "0123456789abcdef" for char in handle)
+    return False
 
 
 _MANAGED_CANDIDATE_FIELDS = frozenset(
@@ -445,7 +625,7 @@ def inspect_managed_config(payload: dict[str, object]) -> dict[str, object]:
     )
     # TOCTOU contract: this call reads config, env, and every hash anchor into
     # one authenticated snapshot. After comparing the returned config bytes to
-    # host intent, `assert_mcp_integrity_snapshot_current` reopens every path and
+    # the command's requested entry, `assert_mcp_integrity_snapshot_current` reopens every path and
     # requires the same inode/content metadata before any match is reported.
     integrity = guard.inspect_mcp_integrity_snapshot(
         HERMES_DIR, hash_path, compatibility_hash_path
@@ -456,25 +636,32 @@ def inspect_managed_config(payload: dict[str, object]) -> dict[str, object]:
     if parsed is None:
         parsed = {}
     if not isinstance(parsed, dict):
-        raise RuntimeError("Hermes MCP config does not match persisted managed intent")
+        raise RuntimeError("Hermes MCP config does not match the requested native entry")
     servers = parsed.get("mcp_servers", {})
     if servers is None:
         servers = {}
     if not isinstance(servers, dict):
-        raise RuntimeError("Hermes MCP config does not match persisted managed intent")
+        raise RuntimeError("Hermes MCP config does not match the requested native entry")
     present = payload["present"]
     absent = payload["absent"]
     if not isinstance(present, dict) or not isinstance(absent, list):
-        raise RuntimeError("Hermes MCP config does not match persisted managed intent")
-    matches = all(servers.get(name) == expected for name, expected in present.items())
+        raise RuntimeError("Hermes MCP config does not match the requested native entry")
+    matches = all(
+        _managed_candidate_matches(servers.get(name), expected, True)
+        for name, expected in present.items()
+    )
     matches = matches and all(name not in servers for name in absent)
     if not matches:
-        raise RuntimeError("Hermes MCP config does not match persisted managed intent")
+        raise RuntimeError("Hermes MCP config does not match the requested native entry")
     guard.assert_mcp_integrity_snapshot_current(integrity)
     return {"ok": True, "state": "matched"}
 
 
-def _mutate(data: object, action: str, payload: dict[str, object]) -> tuple[dict, bool]:
+def _mutate(
+    data: object,
+    action: str,
+    payload: dict[str, object],
+) -> tuple[dict, bool]:
     if not isinstance(data, dict):
         raise ValueError("Invalid Hermes config: expected a YAML object")
     server_name = payload.get("server")
@@ -506,7 +693,7 @@ def _mutate(data: object, action: str, payload: dict[str, object]) -> tuple[dict
         return data, False
     if payload.get("force") is not True:
         current = servers.get(server_name)
-        if current != _managed_candidate(payload):
+        if not _managed_candidate_matches(current, _managed_candidate(payload), True):
             raise ValueError(
                 f"Refusing to remove modified Hermes MCP server '{server_name}'. Use --force to remove it."
             )
@@ -560,12 +747,8 @@ def _refresh_and_verify_hashes(
         HERMES_DIR,
         STRICT_HASH_PATH if privileged else os.path.join(HERMES_DIR, ".config-hash"),
     )
-    expected_state = {
-        "apply": "current",
-        "rollback": "pending",
-    }.get(mcp_transition)
-    if expected_state is not None and state != expected_state:
-        raise RuntimeError("Hermes MCP applied hash state is stale")
+    if state != "current":
+        raise RuntimeError("Hermes config hash is stale")
 
 
 def _restore_hash_snapshots(
@@ -622,12 +805,15 @@ def apply_transaction(action: str, payload: dict[str, object]) -> bool:
     guard = _load_guard()
     original_text, original_snapshot = guard._read_text(CONFIG_PATH)
     _assert_mutable_snapshot(original_snapshot)
-    hash_originals = {
-        path: guard._read_text(path) for path in _managed_hash_paths(privileged)
-    }
     integrity_path = (
         STRICT_HASH_PATH if privileged else os.path.join(HERMES_DIR, ".config-hash")
     )
+    # Direct Hermes configuration changes are authoritative. Adopt the current
+    # source bytes into the file-integrity seal before this scoped mutation.
+    _refresh_and_verify_hashes(guard, privileged, "adopt")
+    hash_originals = {
+        path: guard._read_text(path) for path in _managed_hash_paths(privileged)
+    }
     guard.inspect_mcp_integrity(HERMES_DIR, integrity_path)
     parsed = yaml.safe_load(original_text)
     if parsed is None:
@@ -779,6 +965,18 @@ def _process_arguments(pid: int) -> list[bytes]:
         return []
 
 
+def _process_name(pid: int) -> bytes | None:
+    try:
+        with open(f"/proc/{pid}/status", "rb") as status_file:
+            for line in status_file:
+                if line.startswith(b"Name:"):
+                    fields = line.split(maxsplit=1)
+                    return fields[1].removesuffix(b"\n") if len(fields) == 2 else None
+    except FileNotFoundError:
+        return None
+    return None
+
+
 def _is_trusted_gateway_process(pid: int) -> bool:
     arguments = _process_arguments(pid)
     return any(
@@ -799,8 +997,7 @@ def _process_parent_pid(pid: int) -> int | None:
     return None
 
 
-def _is_service_manager_process(pid: int) -> bool:
-    arguments = _process_arguments(pid)
+def _is_service_manager_arguments(arguments: list[bytes]) -> bool:
     if not arguments:
         return False
     if arguments == [SERVICE_MANAGER_PATH]:
@@ -810,6 +1007,10 @@ def _is_service_manager_process(pid: int) -> bool:
         and len(arguments) == 2
         and arguments[1] == SERVICE_MANAGER_PATH
     )
+
+
+def _is_service_manager_process(pid: int) -> bool:
+    return _is_service_manager_arguments(_process_arguments(pid))
 
 
 def _gateway_has_managed_parent(pid: int) -> bool:
@@ -955,6 +1156,178 @@ def _gateway_identity() -> tuple[int, object] | None:
     return numeric_pid, start_time
 
 
+def _process_start_identity(pid: int) -> object | None:
+    os.environ["HERMES_HOME"] = HERMES_DIR
+    from gateway.status import get_process_start_time
+
+    return get_process_start_time(pid)
+
+
+def _managed_api_relay_port(arguments: list[bytes]) -> int | None:
+    if (
+        len(arguments) != 3
+        or os.path.basename(arguments[0]) != MANAGED_API_RELAY_PROCESS_NAME
+        or arguments[2] != MANAGED_API_RELAY_TARGET
+    ):
+        return None
+
+    listen = arguments[1]
+    if not (
+        listen.startswith(MANAGED_API_RELAY_LISTEN_PREFIX)
+        and listen.endswith(MANAGED_API_RELAY_LISTEN_SUFFIX)
+    ):
+        raise PermissionError("Hermes managed API relay arguments are malformed")
+    raw_port = listen[
+        len(MANAGED_API_RELAY_LISTEN_PREFIX) : -len(MANAGED_API_RELAY_LISTEN_SUFFIX)
+    ]
+    try:
+        decoded = raw_port.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise PermissionError("Hermes managed API relay port is malformed") from error
+    return _parse_gateway_public_port(decoded)
+
+
+def _managed_api_relay_public_port(
+    identity: tuple[int, object],
+) -> int:
+    """Resolve the public port from the service manager's API relay child."""
+    gateway_pid = identity[0]
+    manager_pid = _process_parent_pid(gateway_pid)
+    if manager_pid is None:
+        raise PermissionError(
+            "Hermes gateway is not running under the managed service lifecycle"
+        )
+
+    expected_uid = os.geteuid()
+    try:
+        manager_uid = os.stat(f"/proc/{manager_pid}").st_uid
+        manager_arguments = _process_arguments(manager_pid)
+        manager_start = _process_start_identity(manager_pid)
+    except FileNotFoundError:
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE) from None
+    except OSError as error:
+        raise PermissionError(
+            "Hermes service manager identity is unavailable"
+        ) from error
+    if (
+        manager_uid != expected_uid
+        or not _is_service_manager_arguments(manager_arguments)
+        or manager_start is None
+    ):
+        raise PermissionError(
+            "Hermes gateway is not running under the managed service lifecycle"
+        )
+
+    # The sandbox user can rewrite same-UID files. An unrelated sandbox process
+    # cannot choose the validated service manager as its parent.
+    candidates: list[tuple[int, object, int, list[bytes]]] = []
+    try:
+        with os.scandir("/proc") as process_entries:
+            process_names = [process_entry.name for process_entry in process_entries]
+    except OSError as error:
+        raise PermissionError("Hermes process table is unavailable") from error
+
+    for name in process_names:
+        if not name.isascii() or not name.isdigit():
+            continue
+        pid = int(name, 10)
+        if pid <= 1 or pid == gateway_pid:
+            continue
+        try:
+            owner_uid = os.stat(f"/proc/{pid}").st_uid
+            parent_pid = _process_parent_pid(pid)
+            process_name = _process_name(pid)
+        except OSError:
+            continue
+        if (
+            owner_uid != expected_uid
+            or parent_pid != manager_pid
+            or process_name != MANAGED_API_RELAY_PROCESS_NAME
+        ):
+            continue
+        try:
+            arguments = _process_arguments(pid)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise PermissionError(
+                "Hermes managed API relay identity is unavailable"
+            ) from error
+        port = _managed_api_relay_port(arguments)
+        if port is None:
+            continue
+        try:
+            start_identity = _process_start_identity(pid)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise PermissionError(
+                "Hermes managed API relay identity is unavailable"
+            ) from error
+        if start_identity is not None:
+            candidates.append((pid, start_identity, port, arguments))
+
+    if not candidates:
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE)
+    if len(candidates) != 1:
+        raise PermissionError("Hermes managed API relay identity is ambiguous")
+
+    relay_pid, relay_start, port, relay_arguments = candidates[0]
+    try:
+        relay_owner_uid = os.stat(f"/proc/{relay_pid}").st_uid
+    except FileNotFoundError:
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE) from None
+    except OSError as error:
+        raise PermissionError(
+            "Hermes managed API relay identity is unavailable"
+        ) from error
+    try:
+        relay_parent_pid = _process_parent_pid(relay_pid)
+        relay_process_name = _process_name(relay_pid)
+        current_arguments = _process_arguments(relay_pid)
+        current_start = _process_start_identity(relay_pid)
+        current_manager_uid = os.stat(f"/proc/{manager_pid}").st_uid
+        current_manager_arguments = _process_arguments(manager_pid)
+        current_manager_start = _process_start_identity(manager_pid)
+    except FileNotFoundError:
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE) from None
+    except OSError as error:
+        raise PermissionError(
+            "Hermes managed API relay identity is unavailable"
+        ) from error
+    if (
+        relay_owner_uid != expected_uid
+        or relay_parent_pid != manager_pid
+        or relay_process_name != MANAGED_API_RELAY_PROCESS_NAME
+        or current_arguments != relay_arguments
+        or current_start != relay_start
+        or current_manager_uid != manager_uid
+        or current_manager_arguments != manager_arguments
+        or current_manager_start != manager_start
+        or _process_parent_pid(gateway_pid) != manager_pid
+        or _gateway_identity() != identity
+    ):
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE)
+    return port
+
+
+def _resolve_gateway_public_port() -> int:
+    marker_port = _root_gateway_public_port_marker()
+    if marker_port is not None:
+        return marker_port
+    if os.geteuid() == 0:
+        raise PermissionError("Hermes root API port marker is unavailable")
+    identity = _gateway_identity()
+    if identity is None:
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE)
+    return _managed_api_relay_public_port(identity)
+
+
+def _configure_gateway_public_port() -> None:
+    global GATEWAY_PUBLIC_PORT
+    GATEWAY_PUBLIC_PORT = _resolve_gateway_public_port()
+
+
 def _gateway_health_endpoint_ready(port: int, timeout_seconds: float = 2) -> bool:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout_seconds)
     try:
@@ -981,12 +1354,12 @@ def _gateway_health_phase(deadline: float | None = None) -> tuple[bool, str]:
     if internal_timeout <= 0 or not _gateway_health_endpoint_ready(
         GATEWAY_INTERNAL_PORT, internal_timeout
     ):
-        return False, "waiting-for-internal-health-on-18642"
+        return False, "waiting-for-internal-health"
     public_timeout = probe_timeout()
     if public_timeout <= 0 or not _gateway_health_endpoint_ready(
         GATEWAY_PUBLIC_PORT, public_timeout
     ):
-        return False, "waiting-for-public-relay-health-on-8642"
+        return False, "waiting-for-public-relay-health"
     return True, "waiting-for-stable-replacement-identity"
 
 
@@ -1012,8 +1385,8 @@ def reload_gateway() -> bool:
     re_kick_sent = False
     phase_order = {
         "waiting-for-replacement-identity": 0,
-        "waiting-for-internal-health-on-18642": 1,
-        "waiting-for-public-relay-health-on-8642": 2,
+        "waiting-for-internal-health": 1,
+        "waiting-for-public-relay-health": 2,
         "waiting-for-stable-replacement-identity": 3,
     }
     last_safe_phase = "waiting-for-replacement-identity"
@@ -1053,7 +1426,7 @@ def reload_gateway() -> bool:
             # The managed supervisor owns the public socat relay. Once the
             # replacement gateway is internally healthy, another gateway
             # signal cannot repair that relay and only creates crash churn.
-            and observed_phase != "waiting-for-public-relay-health-on-8642"
+            and observed_phase != "waiting-for-public-relay-health"
             and current is not None
             and _gateway_has_managed_parent(current[0])
             and _gateway_identity() == current
@@ -1091,7 +1464,7 @@ def _assert_non_root_lifecycle_identity() -> None:
     # topology.
     # sourceBoundary: OpenShell owns workload topology; NemoClaw owns the
     # immutable root-lifecycle marker and validates it before mutation.
-    # whyNotSourceFix: OpenShell 0.0.101 supports both topologies but exposes no
+    # whyNotSourceFix: OpenShell 0.0.116 supports both topologies but exposes no
     # attested same-UID capability that this packaged helper can query.
     # regressionTest: hermes-mcp-config-transaction.test.ts rejects both probe
     # and add when the root-lifecycle marker identifies the legacy topology.
@@ -1109,19 +1482,20 @@ def _assert_non_root_lifecycle_identity() -> None:
         )
     identity = _gateway_identity()
     if identity is None:
-        raise RuntimeError("Hermes gateway is not running for managed MCP reload")
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE)
     if not _gateway_has_managed_parent(identity[0]):
         raise RuntimeError(
             "Hermes gateway is not running under the managed service lifecycle"
         )
     if _gateway_identity() != identity:
-        raise RuntimeError("Hermes gateway is not running for managed MCP reload")
+        raise RuntimeError(GATEWAY_NOT_READY_MESSAGE)
 
 
 def probe() -> dict[str, object]:
     """Prove the packaged helper is available without mutating config."""
     if os.geteuid() != 0:
         _assert_non_root_lifecycle_identity()
+    _configure_gateway_public_port()
     return {"ok": True}
 
 
@@ -1129,6 +1503,7 @@ def execute(action: str, payload: dict[str, object]) -> dict[str, object]:
     _validate_payload(action, payload)
     if os.geteuid() != 0:
         _assert_non_root_lifecycle_identity()
+    _configure_gateway_public_port()
     return apply_transaction_and_reload(action, payload)
 
 

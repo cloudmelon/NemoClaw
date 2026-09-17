@@ -3,17 +3,31 @@
 
 import { printOpenShellStateRpcIssue } from "../../adapters/openshell/gateway-drift";
 import { CLI_NAME } from "../../cli/branding";
+import { deferSandboxLifecycleExit, isSandboxLifecycleDeferredExit } from "../../core/process-exit";
 import { inspectManagedLlamaCppStatus } from "../../inference/llama-cpp/managed-status";
-import { parseSandboxPhase } from "../../state/gateway";
+import { getGatewayPresets } from "../../policy";
+import { withSandboxLifecycleLock } from "./lifecycle/lock";
 import * as registry from "../../state/registry";
+import { findSandboxAcrossGatewayRoots } from "../../state/registry/cross-port";
 import { getSandboxDockerRuntime } from "./docker-health";
+import {
+  qualifyPortableAgentLifecycleAuthority,
+  type HermesPortableAgentLifecycleAuthority,
+} from "./gateway-state";
 import { printSandboxGatewayLookupStatus } from "./status-lookup-rendering";
 import {
   getSandboxStatusPreflight,
   printSandboxStatusPreflightHeader,
+  resolveSandboxStatusPhase,
   withoutTerminalPhasePreflight,
 } from "./status-preflight";
-import { collectSandboxStatusSnapshot, resolveSandboxStatusAgent } from "./status-snapshot";
+import {
+  collectSandboxStatusSnapshot,
+  getSandboxStatusReport as getLegacySandboxStatusReport,
+  normalizeSandboxStatusHostMounts,
+  resolveSandboxStatusAgent,
+  type SandboxStatusReport,
+} from "./status-snapshot";
 import {
   printAgentProcessStatus,
   printDockerHealth,
@@ -30,6 +44,7 @@ export {
   isDockerDaemonUnreachableForStatus,
   printGatewayFailureLayerHeader,
   printSandboxStatusPreflightHeader,
+  resolveSandboxStatusPhase,
   type SandboxStatusFailureLayer,
   type SandboxStatusPreflightFailure,
   type SandboxStatusPreflightResult,
@@ -38,7 +53,6 @@ export {
 export {
   collectSandboxStatusSnapshot,
   getSandboxStatusInferenceHealth,
-  getSandboxStatusReport,
   isInferenceHealthFailing,
   maybeGetSandboxStatusInferenceHealth,
   resolveSandboxStatusDcodeAutoApprovalMode,
@@ -46,6 +60,83 @@ export {
   type SandboxStatusSnapshot,
   type ServingProcessHealth,
 } from "./status-snapshot";
+
+function inspectHermesPortableStatus(
+  sandboxName: string,
+): HermesPortableAgentLifecycleAuthority | null {
+  const authority = qualifyPortableAgentLifecycleAuthority(sandboxName, {
+    readRegistry: getPublishedSandbox,
+  });
+  return authority.kind === "hermes" ? authority : null;
+}
+
+function getPublishedSandbox(sandboxName: string): registry.SandboxEntry | null {
+  const entry = findSandboxAcrossGatewayRoots(sandboxName)?.entry ?? null;
+  return entry && registry.isPublishedSandboxRegistration(entry) ? entry : null;
+}
+
+async function hermesPortableStatusReport(
+  sandboxName: string,
+  authority: HermesPortableAgentLifecycleAuthority,
+  readPolicies: typeof getGatewayPresets,
+): Promise<SandboxStatusReport> {
+  const { entry, phase } = authority;
+  const model = entry?.model ?? "unknown";
+  const provider = entry?.provider ?? "unknown";
+  const livePolicies = await readPolicies(sandboxName);
+  return {
+    schemaVersion: 1,
+    name: sandboxName,
+    found: phase === "active",
+    agent: "hermes",
+    agentDisplayName: "Hermes",
+    agentRuntime: "gateway",
+    dcodeAutoApprovalMode: null,
+    model,
+    provider,
+    servingProfileProvenance: entry?.servingProfileProvenance ?? null,
+    recordedRoute:
+      entry?.provider && entry.model ? { provider: entry.provider, model: entry.model } : null,
+    liveRoute: null,
+    routeDrift: null,
+    phase: null,
+    portableLifecyclePhase: phase,
+    gatewayState: "not-probed",
+    inferenceHealth: null,
+    rpcIssue: null,
+    hostGpuDetected: entry?.hostGpuDetected === true,
+    sandboxGpuEnabled: entry?.sandboxGpuEnabled ?? entry?.gpuEnabled === true,
+    sandboxGpuMode: entry?.sandboxGpuMode ?? null,
+    sandboxGpuDevice: entry?.sandboxGpuDevice ?? null,
+    sandboxGpuProof: entry?.sandboxGpuProof ?? null,
+    hostMounts: normalizeSandboxStatusHostMounts(entry?.hostMounts),
+    openshellDriver: entry?.openshellDriver ?? "unknown",
+    openshellVersion: entry?.openshellVersion ?? "unknown",
+    policies: livePolicies ?? [],
+    policiesAvailable: livePolicies !== null,
+    failureLayer: null,
+    terminalRuntimeHealth: null,
+    servingProcessHealth: null,
+    dockerPaused: false,
+  };
+}
+
+export async function getSandboxStatusReport(
+  sandboxName: string,
+  deps: Parameters<typeof getLegacySandboxStatusReport>[1] = {},
+): Promise<SandboxStatusReport> {
+  return withSandboxLifecycleLock(sandboxName, async () => {
+    const hermesPortable = inspectHermesPortableStatus(sandboxName);
+    if (hermesPortable) {
+      return await hermesPortableStatusReport(
+        sandboxName,
+        hermesPortable,
+        deps.getGatewayPresets ?? getGatewayPresets,
+      );
+    }
+    return getLegacySandboxStatusReport(sandboxName, deps);
+  });
+}
 
 function maybeEnsureHermesToolGatewayBroker(sb: registry.SandboxEntry | null): void {
   if (
@@ -64,9 +155,29 @@ function maybeEnsureHermesToolGatewayBroker(sb: registry.SandboxEntry | null): v
   }
 }
 
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: status composes independent diagnostic surfaces.
 export async function showSandboxStatus(sandboxName: string): Promise<void> {
-  const preflight = await getSandboxStatusPreflight(registry.getSandbox(sandboxName));
+  let deferredExitCode: number | null = null;
+  try {
+    await withSandboxLifecycleLock(sandboxName, async () => {
+      const hermesPortable = inspectHermesPortableStatus(sandboxName);
+      if (hermesPortable) {
+        console.log(`  Sandbox: ${sandboxName}`);
+        console.log("  Agent: Hermes");
+        console.log(`  Saved Portable lifecycle phase: ${hermesPortable.phase}`);
+        console.log("  Runtime and agent health: not probed");
+        return;
+      }
+      await showLegacySandboxStatus(sandboxName);
+    });
+  } catch (error) {
+    if (!isSandboxLifecycleDeferredExit(error)) throw error;
+    deferredExitCode = error.exitCode;
+  }
+  if (deferredExitCode !== null) process.exit(deferredExitCode);
+}
+
+async function showLegacySandboxStatus(sandboxName: string): Promise<void> {
+  const preflight = await getSandboxStatusPreflight(getPublishedSandbox(sandboxName));
   // #2666: never let an unexpected throw from the gateway probe (e.g. openshell
   // hanging when its container is stopped and the published port is held by a
   // foreign listener) suppress the sandbox header. The downstream switch
@@ -82,6 +193,7 @@ export async function showSandboxStatus(sandboxName: string): Promise<void> {
     currentModel,
     currentProvider,
     routeDrift,
+    llamaCpp,
     inferenceHealth,
     terminalRuntimeHealth,
     servingProcessHealth,
@@ -89,7 +201,11 @@ export async function showSandboxStatus(sandboxName: string): Promise<void> {
   // Resolve the docker-driver container once: reused for the paused-container
   // recovery hint (#4495) and the Docker health line below (#3975).
   const dockerRuntime = lookup.state === "present" ? getSandboxDockerRuntime(sandboxName) : null;
-  const phase = lookup.state === "present" ? parseSandboxPhase(lookup.output || "") : null;
+  const observedPhase = lookup.state === "present" ? (lookup.phase ?? null) : null;
+  const phase = resolveSandboxStatusPhase(
+    observedPhase,
+    snapshot.postRecoveryPreflight ?? preflight,
+  );
   const effectivePreflight = withoutTerminalPhasePreflight(
     snapshot.postRecoveryPreflight ?? preflight,
     phase,
@@ -105,7 +221,7 @@ export async function showSandboxStatus(sandboxName: string): Promise<void> {
       action: `checking inference status for sandbox '${sandboxName}'`,
       command: `${CLI_NAME} ${sandboxName} status`,
     });
-    process.exit(1);
+    deferSandboxLifecycleExit(1);
   }
   const textContext: SandboxStatusTextContext = {
     sandboxName,
@@ -114,18 +230,24 @@ export async function showSandboxStatus(sandboxName: string): Promise<void> {
     currentModel,
     currentProvider,
     routeDrift,
+    llamaCpp,
     inferenceHealth,
     terminalRuntimeHealth,
     servingProcessHealth,
     statusAgent,
+    phase,
   };
-  const textOutcome = printSandboxDetails(textContext);
-  if (textOutcome.exitCode && (!process.exitCode || process.exitCode === 0)) {
-    process.exitCode = textOutcome.exitCode;
+  const textOutcome = await printSandboxDetails(textContext);
+  if (
+    (textOutcome.exitCode || llamaCpp?.kind === "unavailable") &&
+    (!process.exitCode || process.exitCode === 0)
+  ) {
+    process.exitCode = textOutcome.exitCode || 1;
   }
 
   await printSandboxGatewayLookupStatus({
     sandboxName,
+    registered: sb !== null,
     lookup,
     phase,
     dockerRuntime,

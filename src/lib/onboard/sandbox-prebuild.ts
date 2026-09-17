@@ -6,8 +6,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { dockerImageInspectFormat } from "../adapters/docker";
+import {
+  createCredentialFreeDockerConfig,
+  dockerBuildSubprocessEnv,
+  prepareDockerBuildEnvironment,
+  type PreparedDockerBuildEnvironment,
+  warnIfDockerBuildEnvironmentCleanupFailed,
+} from "../adapters/docker/client-isolation";
 import { dockerSpawn } from "../adapters/docker/exec";
+import { dockerImageInspectFormat } from "../adapters/docker/inspect";
 import { redirectInheritedChildStdoutToStderr } from "../cli/stdout-guard";
 import {
   LOCAL_SANDBOX_IMAGE_REPO,
@@ -17,20 +24,11 @@ import {
   SANDBOX_BUILD_CONTEXT_PREFIX,
   type SandboxBuildContextOrigin,
 } from "../sandbox/build-context";
-import { buildSubprocessEnv } from "../subprocess-env";
 import { isPortableExperimentalProfile } from "./docker-driver-platform";
 import { isImmutableDockerImageId } from "./openshell-docker-sandbox-containers";
 
 const TRUTHY_FLAG_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSY_FLAG_VALUES = new Set(["0", "false", "no", "off"]);
-const DOCKER_ENV_NAMES = [
-  "CONTAINERS_CONF",
-  "DOCKER_API_VERSION",
-  "DOCKER_CERT_PATH",
-  "DOCKER_CONFIG",
-  "DOCKER_CONTEXT",
-  "DOCKER_TLS_VERIFY",
-] as const;
 
 export interface SandboxPrebuildInput {
   buildCtx: string;
@@ -51,6 +49,9 @@ export interface SandboxPrebuildInput {
     options: { env: NodeJS.ProcessEnv; stdio: "inherit" },
   ) => Promise<number | null>;
   inspectImageId?: (imageRef: string) => string;
+  credentialHelperResponds?: (credsStore: string) => boolean;
+  dockerContextIsDefault?: (env: NodeJS.ProcessEnv) => boolean;
+  isWslHost?: boolean;
   log?: (message: string) => void;
 }
 
@@ -64,17 +65,6 @@ export interface SandboxPrebuildResult {
 interface TrustedStagedBuildContext {
   buildCtx: string;
   dockerfile: string;
-}
-
-function createCredentialFreeDockerConfig(): string {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-portable-docker-config-"));
-  fs.chmodSync(directory, 0o700);
-  fs.writeFileSync(path.join(directory, "config.json"), '{"auths":{}}\n', {
-    encoding: "utf-8",
-    flag: "wx",
-    mode: 0o600,
-  });
-  return directory;
 }
 
 function createHostImageCommand(
@@ -132,28 +122,6 @@ function resolveTrustedStagedBuildContext(buildCtx: string): TrustedStagedBuildC
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
-}
-
-/** Restrict the host Docker build to environment values used by Docker itself. */
-export function dockerBuildSubprocessEnv(): Record<string, string> {
-  const env = buildSubprocessEnv();
-  for (const key of DOCKER_ENV_NAMES) {
-    const value = process.env[key];
-    if (value !== undefined) env[key] = value;
-  }
-  for (const key of Object.keys(env)) {
-    if (
-      key === "KUBECONFIG" ||
-      key === "SSH_AUTH_SOCK" ||
-      key === "RUST_LOG" ||
-      key === "RUST_BACKTRACE" ||
-      key.startsWith("OPENSHELL_") ||
-      key.startsWith("GRPC_")
-    ) {
-      delete env[key];
-    }
-  }
-  return env;
 }
 
 export function resolveSandboxPrebuildEnabled(
@@ -268,14 +236,26 @@ export async function prebuildSandboxImageIfEligible(
   log(`  Building sandbox image with ${builderName} (skips the slower in-gateway builder)...`);
 
   let status: number | null;
+  let preparedDockerEnvironment: PreparedDockerBuildEnvironment | null = null;
   try {
+    preparedDockerEnvironment = portable
+      ? null
+      : prepareDockerBuildEnvironment({
+          env,
+          credentialHelperResponds: input.credentialHelperResponds,
+          dockerContextIsDefault: input.dockerContextIsDefault,
+          isWslHost: input.isWslHost,
+        });
+    const buildEnv = preparedDockerEnvironment?.env ?? dockerBuildSubprocessEnv(env);
+    if (preparedDockerEnvironment?.isolatedCredentialConfig) {
+      log(
+        "  Docker Desktop credential helper is unavailable in this WSL session; using an isolated credential-free config for the generated sandbox image build.",
+      );
+    }
     status = await buildImage(
       ["build", "-t", imageRef, "-f", trustedContext.dockerfile, trustedContext.buildCtx],
       {
-        env: {
-          ...dockerBuildSubprocessEnv(),
-          ...(portable ? {} : { DOCKER_BUILDKIT: "1" }),
-        },
+        env: buildEnv,
         stdio: "inherit",
       },
     );
@@ -288,6 +268,13 @@ export async function prebuildSandboxImageIfEligible(
       `  Local ${builderName} build could not start (${detail}); using the gateway builder instead.`,
     );
     return { createArgs, imageRef: null, imageId: null };
+  } finally {
+    if (preparedDockerEnvironment) {
+      warnIfDockerBuildEnvironmentCleanupFailed(
+        preparedDockerEnvironment.cleanup(),
+        `generated sandbox image '${imageRef}'`,
+      );
+    }
   }
 
   if (status !== 0) {
@@ -303,11 +290,11 @@ export async function prebuildSandboxImageIfEligible(
     const publishImage = input.publishImage ?? buildImage;
     log("  Publishing sandbox image to the managed local registry...");
     let publishStatus: number | null;
-    const credentialFreeDockerConfig = createCredentialFreeDockerConfig();
+    const credentialFreeDockerConfig = createCredentialFreeDockerConfig("portable");
     try {
       publishStatus = await publishImage(["push", imageRef], {
         env: {
-          ...dockerBuildSubprocessEnv(),
+          ...dockerBuildSubprocessEnv(env),
           DOCKER_CONFIG: credentialFreeDockerConfig,
           REGISTRY_AUTH_FILE: path.join(credentialFreeDockerConfig, "config.json"),
         },

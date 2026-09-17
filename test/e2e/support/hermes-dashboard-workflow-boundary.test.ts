@@ -20,19 +20,31 @@ describe("Hermes dashboard workflow boundary", () => {
     canonicalJob.steps!.find((step) => step.name === "Run Hermes live Vitest test")!.run =
       "echo skipped";
     workflow.jobs["hermes-dashboard"] = structuredClone(canonicalJob);
-    workflow.jobs["hermes-discord"].env!.NEMOCLAW_E2E_HERMES_DASHBOARD = "1";
+    workflow.jobs["messaging-providers"].env!.NEMOCLAW_E2E_HERMES_DASHBOARD = "1";
     workflow.jobs["report-to-pr"].needs = ["hermes-dashboard"];
 
     expect(validateHermesDashboardWorkflow(workflow)).toEqual(
       expect.arrayContaining([
         "hermes-dashboard must remain consolidated into hermes-e2e",
-        "only hermes-e2e may enable Hermes dashboard E2E coverage (found on hermes-discord)",
+        "only hermes-e2e may enable Hermes dashboard E2E coverage (found on messaging-providers)",
         "hermes-e2e must enable Hermes dashboard coverage",
         "hermes-e2e must preserve manual inference-mode selection",
         "hermes-e2e must publish its canonical selector",
         "hermes-e2e must run the live Vitest project",
         "report-to-pr must wait for hermes-e2e",
         "report-to-pr must not wait for retired hermes-dashboard",
+      ]),
+    );
+  });
+
+  it("requires the admitted dashboard, TUI and allocated API configuration (#11433)", () => {
+    const workflow = readHermesDashboardWorkflow();
+    workflow.jobs["hermes-e2e"].env!.NEMOCLAW_HERMES_API_PORT = "8642";
+    workflow.jobs["hermes-e2e"].env!.NEMOCLAW_HERMES_DASHBOARD_TUI = "0";
+    expect(validateHermesDashboardWorkflow(workflow)).toEqual(
+      expect.arrayContaining([
+        "hermes-e2e must qualify NEMOCLAW_HERMES_API_PORT=8643",
+        "hermes-e2e must qualify NEMOCLAW_HERMES_DASHBOARD_TUI=1",
       ]),
     );
   });

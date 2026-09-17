@@ -8,6 +8,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { resolveOpenShellSiblingComponents } from "../../helpers/openshell-components.ts";
 import { createOpenShellDriverConfigTestWrapper } from "../live/openshell-driver-config-test-wrapper.ts";
 import {
   EXACT_MAIN_DRIVER_CONFIG_JSON,
@@ -26,8 +27,37 @@ afterEach(() => {
   restoreProofEnv();
 });
 
-describe("exact-main selected-driver config proof boundary", () => {
-  it("does not inject driver config outside the explicit candidate-main lane", async () => {
+describe("OpenShell driver configuration for main-branch E2E", () => {
+  it("resolves one canonical executable set for CLI, gateway, and sandbox (#11547)", () => {
+    const rootDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openshell-components-"));
+    const installDirectory = path.join(rootDirectory, "install");
+    const pathDirectory = path.join(rootDirectory, "path");
+    try {
+      fs.mkdirSync(installDirectory);
+      fs.mkdirSync(pathDirectory);
+      fs.writeFileSync(path.join(installDirectory, "openshell"), "#!/bin/sh\n", { mode: 0o700 });
+      fs.writeFileSync(path.join(installDirectory, "openshell-gateway"), "#!/bin/sh\n", {
+        mode: 0o700,
+      });
+      fs.writeFileSync(path.join(installDirectory, "openshell-sandbox"), "#!/bin/sh\n", {
+        mode: 0o700,
+      });
+      fs.symlinkSync(
+        path.join(installDirectory, "openshell"),
+        path.join(pathDirectory, "openshell"),
+      );
+
+      expect(resolveOpenShellSiblingComponents(path.join(pathDirectory, "openshell"))).toEqual({
+        cli: path.join(installDirectory, "openshell"),
+        gateway: path.join(installDirectory, "openshell-gateway"),
+        sandbox: path.join(installDirectory, "openshell-sandbox"),
+      });
+    } finally {
+      fs.rmSync(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("does nothing when the driver configuration check is disabled", async () => {
     delete process.env[EXACT_MAIN_DRIVER_CONFIG_PROOF_ENV];
     const add = vi.fn();
 
@@ -38,7 +68,7 @@ describe("exact-main selected-driver config proof boundary", () => {
     expect(add).not.toHaveBeenCalled();
   });
 
-  it("injects only the reviewed structured tmpfs config on sandbox create", () => {
+  it("adds the tmpfs driver configuration only to sandbox create", () => {
     const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-exact-main-driver-wrapper-"));
     const delegate = path.join(fixture, "openshell-real");
     fs.writeFileSync(delegate, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", {
@@ -97,7 +127,7 @@ describe("exact-main selected-driver config proof boundary", () => {
     }
   });
 
-  it("preserves production driver config when the wrapper only delegates capabilities", () => {
+  it("passes through an existing driver configuration unchanged", () => {
     const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-exact-main-pass-through-"));
     const delegate = path.join(fixture, "openshell-real");
     fs.writeFileSync(delegate, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n", {
@@ -128,7 +158,7 @@ describe("exact-main selected-driver config proof boundary", () => {
     }
   });
 
-  it("expects graceful gateway recovery to remount tmpfs while retaining durable state", () => {
+  it("expects gateway restart to empty tmpfs and preserve persistent files", () => {
     const source = fs.readFileSync(
       path.join("test", "e2e", "live", "openshell-exact-main-driver-config.ts"),
       "utf8",

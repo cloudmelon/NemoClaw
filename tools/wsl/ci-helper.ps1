@@ -302,15 +302,17 @@ function Install-WslUbuntuDependencies {
 function Get-WslNodeInstallScript {
     return @'
 set -euo pipefail
-node_version="22.23.1"
+node_version="24.18.1"
+npm_version="12.0.2"
+expected_npm_integrity="sha512-uIXokLlBj6FpNUTQX1PmT5pz7BlIN9QlixX+zdaSNHsd0qUXsbDLr50xzY6Sw7cJVr0uzHKDOle0swmPW/p5Qw=="
 case "$(uname -m)" in
   x86_64)
     node_arch="x64"
-    node_sha256="9749e988f437343b7fa832c69ded82a312e41a03116d766797ac14f6f9eee578"
+    node_sha256="d6c664df3f3f61458e8c277585571328522d705166723a7c7823a9253a4d15a0"
     ;;
   aarch64 | arm64)
     node_arch="arm64"
-    node_sha256="0294e8b915ab75f92c7513d2fcb830ae06e10684e6c603e99a87dbf8835389c1"
+    node_sha256="7201e3a09dc825bac57867c81913e2b8f0ef87d04cb9082af4cda82f6ff3d88c"
     ;;
   *)
     echo "Unsupported Node.js architecture: $(uname -m)" >&2
@@ -332,6 +334,29 @@ printf '%s  %s\n' "$node_sha256" "$archive" | sha256sum --check --status || {
 }
 tar --extract --xz --file "$archive" --directory /usr/local --strip-components=1
 test "$(node --version)" = "v${node_version}"
+env -u NODE_AUTH_TOKEN -u NPM_TOKEN -u NPM_CONFIG__AUTH_TOKEN \
+  npm pack "npm@${npm_version}" \
+  --pack-destination "$temp_dir" \
+  --userconfig /dev/null \
+  --registry https://registry.npmjs.org/ \
+  --ignore-scripts --no-audit --no-fund >/dev/null
+npm_archive="$temp_dir/npm-${npm_version}.tgz"
+actual_npm_integrity="sha512-$(
+  node -e '
+    const fs = require("node:fs");
+    const crypto = require("node:crypto");
+    process.stdout.write(crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));
+  ' "$npm_archive"
+)"
+test "$actual_npm_integrity" = "$expected_npm_integrity" || {
+  echo "npm@${npm_version} archive integrity verification failed" >&2
+  exit 1
+}
+env -u NODE_AUTH_TOKEN -u NPM_TOKEN -u NPM_CONFIG__AUTH_TOKEN \
+  npm install --global "$npm_archive" \
+  --userconfig /dev/null \
+  --ignore-scripts --no-audit --no-fund --offline
+test "$(npm --version)" = "$npm_version"
 node --version
 npm --version
 '@
@@ -366,7 +391,7 @@ function Get-WslCheckoutSyncScript {
 
     $normalizedCheckout = $Checkout.TrimEnd('/')
     $normalizedWorkdir = $Workdir.TrimEnd('/')
-    $dedicatedWorkdirPattern = '^/tmp/nemoclaw-wsl-(?:workdir|vitest)/[1-9][0-9]*-[1-9][0-9]*$'
+    $dedicatedWorkdirPattern = '^/(?:tmp/nemoclaw-wsl-(?:workdir|vitest)|home/nemoclaw-ci/nemoclaw-wsl-vitest)/[1-9][0-9]*-[1-9][0-9]*$'
     $workdirUsesDedicatedRoot = $normalizedWorkdir -cmatch $dedicatedWorkdirPattern
     $unsafePathSegment = '(^|/)\.{1,2}(/|$)'
     $pathsOverlap = $normalizedCheckout -eq $normalizedWorkdir -or
@@ -386,7 +411,7 @@ function Get-WslCheckoutSyncScript {
         $normalizedWorkdir -match $unsafePathSegment -or
         $pathsOverlap
     ) {
-        throw "WSL sync workdir must use /tmp/nemoclaw-wsl-workdir or /tmp/nemoclaw-wsl-vitest with one <positive-run-id>-<positive-run-attempt> child. It must not overlap the checkout or contain traversal: '$Workdir'."
+        throw "WSL sync workdir must use a supported dedicated root with one <positive-run-id>-<positive-run-attempt> child. It must not overlap the checkout or contain traversal: '$Workdir'."
     }
 
     $workdirRoot = $normalizedWorkdir.Substring(0, $normalizedWorkdir.LastIndexOf('/'))
@@ -424,6 +449,9 @@ function Get-WslCheckoutSyncScript {
         "git -C $workdirLiteral reset --hard HEAD"
         "git -C $workdirLiteral clean -ffdx"
         $ownerCommand
+        "chmod -R go-w -- $workdirLiteral"
+        "chmod 0711 $workdirRootLiteral"
+        "chmod 0700 $workdirLiteral"
         "git -C $workdirLiteral status --short"
         "echo 'WSL ext4 workspace is ready'"
     ) -join "`n"

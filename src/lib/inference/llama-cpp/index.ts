@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { createBearerAuthConfig } from "../../adapters/http/auth-config";
+import { MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW } from "../ollama-runtime-context";
 import {
   type CurlProbeOptions,
   type CurlProbeResult,
@@ -42,7 +43,7 @@ export type LlamaCppAttachmentFailureReason =
   | "conflicting-fingerprint";
 
 export type LlamaCppAttachmentResult =
-  | { ok: true; model: string }
+  | { ok: true; model: string; contextWindow?: number }
   | {
       ok: false;
       reason: LlamaCppAttachmentFailureReason;
@@ -122,7 +123,8 @@ function hasHealthyNativeResponse(result: CurlProbeResult): boolean {
 function hasMatchingNativeProps(result: CurlProbeResult, model: string): boolean {
   if (!result.ok) return false;
   const body = parseJsonObject(result.body);
-  if (!body || body.model_alias !== model || typeof body.model_path !== "string") return false;
+  if (!body || typeof body.model_path !== "string") return false;
+  if (body.model_alias !== undefined && body.model_alias !== model) return false;
   if (typeof body.total_slots !== "number" || body.total_slots <= 0) return false;
   const defaults = body.default_generation_settings;
   return (
@@ -159,6 +161,36 @@ function probeArgs(authArgs: readonly string[], url: string): string[] {
     ...authArgs,
     url,
   ];
+}
+
+function probeModelEndpoint(
+  probe: (argv: string[], options?: CurlProbeOptions) => CurlProbeResult,
+  authArgs: readonly string[],
+  baseUrl: string,
+  path: "/props" | "/metrics",
+  model: string,
+  allowUnscopedFallback: boolean,
+  options: CurlProbeOptions,
+): CurlProbeResult {
+  const scoped = probe(
+    probeArgs(authArgs, `${baseUrl}${path}?model=${encodeURIComponent(model)}`),
+    options,
+  );
+  const body = parseJsonObject(scoped.body);
+  const error = body?.error;
+  if (
+    !allowUnscopedFallback ||
+    scoped.curlStatus !== 0 ||
+    scoped.httpStatus !== 404 ||
+    error === null ||
+    typeof error !== "object" ||
+    Array.isArray(error) ||
+    (error as Record<string, unknown>).code !== "route_not_available" ||
+    (error as Record<string, unknown>).type !== "invalid_request_error"
+  ) {
+    return scoped;
+  }
+  return probe(probeArgs(authArgs, `${baseUrl}${path}`), options);
 }
 
 function boundedProbeFailure(result: CurlProbeResult): LlamaCppAttachmentResult | null {
@@ -336,29 +368,59 @@ export function probeLlamaCppAttachment(
       );
     }
     const health = probe(probeArgs(auth.args, `${baseUrl}/health`), probeOptions);
-    const props = probe(
-      probeArgs(auth.args, `${baseUrl}/props?model=${encodeURIComponent(model)}`),
+    const allowUnscopedFallback = modelEntries.length === 1;
+    const props = probeModelEndpoint(
+      probe,
+      auth.args,
+      baseUrl,
+      "/props",
+      model,
+      allowUnscopedFallback,
       probeOptions,
     );
-    const metrics = probe(
-      probeArgs(auth.args, `${baseUrl}/metrics?model=${encodeURIComponent(model)}`),
+    const metrics = probeModelEndpoint(
+      probe,
+      auth.args,
+      baseUrl,
+      "/metrics",
+      model,
+      allowUnscopedFallback,
       probeOptions,
     );
     for (const result of [health, props, metrics]) {
       const boundFailure = boundedProbeFailure(result);
       if (boundFailure) return boundFailure;
     }
-    if (
-      !hasHealthyNativeResponse(health) ||
-      !hasMatchingNativeProps(props, model) ||
-      !hasNativeMetricsResponse(metrics)
-    ) {
+    if (!hasHealthyNativeResponse(health)) {
       return failure(
         "conflicting-fingerprint",
-        "The server returned conflicting or incomplete native llama.cpp evidence.",
+        "The llama.cpp health endpoint did not report the native status ok.",
       );
     }
-    return { ok: true, model };
+    if (!hasMatchingNativeProps(props, model)) {
+      return failure(
+        "conflicting-fingerprint",
+        "The llama.cpp properties endpoint did not return complete native evidence for the selected served model.",
+      );
+    }
+    if (!hasNativeMetricsResponse(metrics)) {
+      return failure(
+        "conflicting-fingerprint",
+        "The llama.cpp metrics endpoint returned neither llama.cpp metrics nor the native metrics-not-supported response.",
+      );
+    }
+    const meta = modelEntry.meta as Record<string, unknown> | undefined;
+    const contextWindow = meta?.n_ctx;
+    return {
+      ok: true,
+      model,
+      ...(typeof contextWindow === "number" &&
+      Number.isSafeInteger(contextWindow) &&
+      contextWindow > 0 &&
+      contextWindow <= MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW
+        ? { contextWindow }
+        : {}),
+    };
   } finally {
     auth.cleanup();
   }

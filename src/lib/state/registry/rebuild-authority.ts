@@ -5,9 +5,9 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { cloneAndDeepFreeze } from "../../core/immutable";
 import {
-  isShippedManagedImageAgent,
+  isManagedImageAgent,
   MANAGED_IMAGE_REPOSITORIES,
-  type ShippedManagedImageAgent,
+  type ManagedImageAgent,
 } from "../../onboard/managed-image/contract";
 import { withLock } from "./lock";
 import { load, save } from "./persistence";
@@ -17,6 +17,23 @@ import { cloneSandboxWorkloadReceipt } from "./workload";
 type ManagedWorkloadReceipt = Extract<SandboxWorkloadReceipt, { readonly kind: "managed-image" }>;
 
 const MAX_AUTHORITY_BYTES = 4096;
+
+/**
+ * The DGX Station qualification projection was introduced in v0.0.97. A Hermes
+ * sandbox stamped by an earlier managed release may be rebuilt once without
+ * reapplying that later admission rule. Version-shaped text is not authority.
+ */
+export function hasLegacyDgxStationQualificationAuthority(
+  sandbox: Pick<SandboxEntry, "agent" | "fromDockerfile" | "nemoclawVersion">,
+): boolean {
+  if (sandbox.agent !== "hermes" || sandbox.fromDockerfile != null) return false;
+  const match = /^(?:v)?0\.0\.(0|[1-9]\d*)(?:-[1-9]\d*-g[0-9a-f]{7,40})?$/i.exec(
+    sandbox.nemoclawVersion ?? "",
+  );
+  if (!match) return false;
+  const patch = Number(match[1]);
+  return Number.isSafeInteger(patch) && patch < 97;
+}
 
 export interface SandboxRebuildAuthority {
   readonly schemaVersion: 1;
@@ -76,10 +93,10 @@ function requireReceiptAgent(
   agent: SandboxEntry["agent"],
   workload: ManagedWorkloadReceipt,
   label: string,
-): ShippedManagedImageAgent {
+): ManagedImageAgent {
   if (
     typeof agent !== "string" ||
-    !isShippedManagedImageAgent(agent) ||
+    !isManagedImageAgent(agent) ||
     !workload.reference.startsWith(`${MANAGED_IMAGE_REPOSITORIES[agent]}@sha256:`)
   ) {
     throw new SandboxRebuildAuthorityError(

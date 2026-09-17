@@ -48,6 +48,7 @@ function assertRuntimeVersion(version: string): () => void {
 
 describe("MCP bridge dev runtime compatibility", () => {
   it("selects the full lifecycle for the reviewed OpenShell runtime (#6426)", () => {
+    expect(MCP_CREDENTIAL_BOUNDARY_OPENSHELL_VERSION).toBe("0.0.116");
     expect(
       classifyMcpBridgeRuntimeCompatibility(
         assertRuntimeVersion(MCP_CREDENTIAL_BOUNDARY_OPENSHELL_VERSION),
@@ -58,6 +59,17 @@ describe("MCP bridge dev runtime compatibility", () => {
       mode: "full-lifecycle",
     });
   });
+
+  it.each(["", "0.0.117"])(
+    "does not accept an injected unvalidated runtime version %j",
+    (actualVersion) => {
+      expect(classifyMcpBridgeRuntimeCompatibility(() => actualVersion)).toEqual({
+        actualVersion,
+        expectedVersion: MCP_CREDENTIAL_BOUNDARY_OPENSHELL_VERSION,
+        mode: "expected-version-mismatch",
+      });
+    },
+  );
 
   it("labels aligned evidence as preflight-only until the lifecycle runs (#6426)", () => {
     const result = classifyMcpBridgeRuntimeCompatibility(
@@ -183,38 +195,43 @@ describe("MCP bridge dev runtime compatibility", () => {
     );
   });
 
-  it("keeps every result except an exact version mismatch fatal (#6426)", () => {
-    const fatalAssertions = [
-      () => assertMcpCredentialBoundaryRuntimeVersion({ resolveOpenshell: () => null }),
-      () =>
-        assertMcpCredentialBoundaryRuntimeVersion({
-          resolveOpenshell: () => "/test/openshell",
-          runVersionCommand: () => ({
-            error: Object.assign(new Error("probe failed"), { code: "EACCES" }),
-            status: null,
-            stdout: "",
-            stderr: "",
+  it.each(
+    Array.from(
+      [
+        () => assertMcpCredentialBoundaryRuntimeVersion({ resolveOpenshell: () => null }),
+        () =>
+          assertMcpCredentialBoundaryRuntimeVersion({
+            resolveOpenshell: () => "/test/openshell",
+            runVersionCommand: () => ({
+              error: Object.assign(new Error("probe failed"), { code: "EACCES" }),
+              status: null,
+              stdout: "",
+              stderr: "",
+            }),
           }),
-        }),
-      () =>
-        assertMcpCredentialBoundaryRuntimeVersion({
-          resolveOpenshell: () => "/test/openshell",
-          runVersionCommand: () => ({ status: 23, stdout: "", stderr: "" }),
-        }),
-      () =>
-        assertMcpCredentialBoundaryRuntimeVersion({
-          resolveOpenshell: () => "/test/openshell",
-          runVersionCommand: () => ({ status: 0, stdout: "not-a-version", stderr: "" }),
-        }),
-      () => {
-        throw new McpBridgeError("unrelated MCP bridge failure");
-      },
-      () => {
-        throw new Error("generic failure");
-      },
-    ];
-    for (const assertRuntimeVersion of fatalAssertions) {
+        () =>
+          assertMcpCredentialBoundaryRuntimeVersion({
+            resolveOpenshell: () => "/test/openshell",
+            runVersionCommand: () => ({ status: 23, stdout: "", stderr: "" }),
+          }),
+        () =>
+          assertMcpCredentialBoundaryRuntimeVersion({
+            resolveOpenshell: () => "/test/openshell",
+            runVersionCommand: () => ({ status: 0, stdout: "not-a-version", stderr: "" }),
+          }),
+        () => {
+          throw new McpBridgeError("unrelated MCP bridge failure");
+        },
+        () => {
+          throw new Error("generic failure");
+        },
+      ],
+      (value) => [value],
+    ),
+  )(
+    "keeps every result except an exact version mismatch fatal [case %#] (#6426)",
+    (assertRuntimeVersion) => {
       expect(() => classifyMcpBridgeRuntimeCompatibility(assertRuntimeVersion)).toThrow();
-    }
-  });
+    },
+  );
 });

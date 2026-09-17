@@ -3,7 +3,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 
-import { createSession, type Session, type SessionUpdates } from "../../../state/onboard-session";
+import { createSession, type SessionUpdates } from "../../../state/onboard-session";
 import { handleAgentSetupState, type AgentSetupStateOptions } from "./agent-setup";
 
 type Agent = { name: string; displayName: string };
@@ -19,12 +19,12 @@ function createDeps(overrides: Partial<AgentSetupStateOptions<Agent>["deps"]> = 
       session.steps[stepName].status = "skipped";
       return session;
     }),
-    openclawReady: vi.fn(() => false),
+    openclawReady: vi.fn(async () => false),
     skippedMessage: vi.fn(),
     recordSkip: vi.fn(async () => createSession()),
     startStep: vi.fn(async () => undefined),
     setupOpenclaw: vi.fn(async () => undefined),
-    syncConfig: vi.fn(),
+    configureOpenclaw: vi.fn(async () => undefined),
     complete: vi.fn(async (stepName: string, updates: SessionUpdates = {}) => {
       session.steps[stepName].status = "complete";
       Object.assign(session, updates);
@@ -44,7 +44,7 @@ function createDeps(overrides: Partial<AgentSetupStateOptions<Agent>["deps"]> = 
       recordStateSkipped: calls.recordSkip,
       startRecordedStep: calls.startStep,
       setupOpenclaw: calls.setupOpenclaw,
-      syncNemoClawConfigInSandbox: calls.syncConfig,
+      configureOpenclawSandbox: calls.configureOpenclaw,
       recordStepComplete: calls.complete,
       toSessionUpdates: (updates: Record<string, unknown>) => updates as SessionUpdates,
       ...overrides,
@@ -61,6 +61,7 @@ function baseOptions(
     sandboxName: "my-assistant",
     model: "model",
     provider: "provider",
+    webSearchConfig: null,
     resume: false,
     session: createSession(),
     hermesAuthMethod: null,
@@ -125,7 +126,7 @@ describe("handleAgentSetupState", () => {
   });
 
   it("skips OpenClaw setup on resume when OpenClaw is ready", async () => {
-    const { deps, calls } = createDeps({ isOpenclawReady: vi.fn(() => true) });
+    const { deps, calls } = createDeps({ isOpenclawReady: vi.fn(async () => true) });
 
     const result = await handleAgentSetupState({ ...baseOptions(deps), resume: true });
 
@@ -136,7 +137,13 @@ describe("handleAgentSetupState", () => {
     });
     expect(calls.startStep).not.toHaveBeenCalled();
     expect(calls.setupOpenclaw).not.toHaveBeenCalled();
-    expect(calls.syncConfig).toHaveBeenCalledWith("my-assistant", "provider", "model");
+    expect(calls.configureOpenclaw).toHaveBeenCalledWith(
+      "my-assistant",
+      "model",
+      "provider",
+      null,
+      undefined,
+    );
     expect(calls.complete).toHaveBeenCalledWith(
       "openclaw",
       expect.objectContaining({
@@ -145,6 +152,8 @@ describe("handleAgentSetupState", () => {
         model: "model",
       }),
     );
+    expect(calls.ensureDashboard).toHaveBeenCalledWith("my-assistant", null);
+    expect(calls.persistDashboardPort).toHaveBeenCalledWith("my-assistant", 18789);
     expect(calls.skipped).toHaveBeenCalledWith("agent_setup");
     expect(result.stateResult).toEqual({
       type: "transition",
@@ -161,6 +170,105 @@ describe("handleAgentSetupState", () => {
     });
   });
 
+  it("waits for resumed OpenClaw readiness before choosing setup", async () => {
+    let resolveReadiness!: (ready: boolean) => void;
+    const readiness = new Promise<boolean>((resolve) => {
+      resolveReadiness = resolve;
+    });
+    const isOpenclawReady = vi.fn(() => readiness);
+    const { deps, calls } = createDeps({ isOpenclawReady });
+
+    const pending = handleAgentSetupState({ ...baseOptions(deps), resume: true });
+    await vi.waitFor(() => expect(isOpenclawReady).toHaveBeenCalledWith("my-assistant"));
+
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.startStep).not.toHaveBeenCalled();
+    expect(calls.setupOpenclaw).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+
+    resolveReadiness(false);
+    await pending;
+
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.startStep).toHaveBeenCalledWith("openclaw", {
+      sandboxName: "my-assistant",
+      provider: "provider",
+      model: "model",
+    });
+    expect(calls.setupOpenclaw).toHaveBeenCalledOnce();
+    expect(calls.complete).toHaveBeenCalledOnce();
+  });
+
+  it("delegates shared OpenClaw configuration before ready-resume completion", async () => {
+    const { deps, calls } = createDeps({ isOpenclawReady: vi.fn(async () => true) });
+    const revalidateSandboxIdentity = vi.fn();
+
+    await handleAgentSetupState({
+      ...baseOptions(deps),
+      resume: true,
+      webSearchConfig: { fetchEnabled: false },
+      revalidateSandboxIdentity,
+    });
+
+    expect(calls.configureOpenclaw).toHaveBeenCalledExactlyOnceWith(
+      "my-assistant",
+      "model",
+      "provider",
+      { fetchEnabled: false },
+      revalidateSandboxIdentity,
+    );
+    expect(calls.configureOpenclaw.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.recordSkip.mock.invocationCallOrder[0],
+    );
+    expect(calls.configureOpenclaw.mock.invocationCallOrder[0]).toBeLessThan(
+      calls.complete.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("does not complete ready resume when config-sync authority revalidation fails", async () => {
+    const configExec = vi.fn();
+    const configureOpenclawSandbox = vi.fn(
+      (
+        sandboxName: string,
+        _model: string,
+        _provider: string,
+        _webSearchConfig: { fetchEnabled?: boolean } | null,
+        revalidate?: (operation: string) => void,
+      ): Promise<void> => {
+        revalidate?.(`synchronize OpenClaw config in sandbox '${sandboxName}'`);
+        configExec();
+        return Promise.resolve();
+      },
+    );
+    const { deps, calls } = createDeps({
+      isOpenclawReady: vi.fn(async () => true),
+      configureOpenclawSandbox,
+    });
+    const revalidationSteps = new Map([
+      [
+        "synchronize OpenClaw config in sandbox 'my-assistant'",
+        () => {
+          throw new Error("sandbox identity changed");
+        },
+      ],
+    ]);
+    const revalidateSandboxIdentity = vi.fn((operation: string) =>
+      revalidationSteps.get(operation)?.(),
+    );
+
+    await expect(
+      handleAgentSetupState({
+        ...baseOptions(deps),
+        resume: true,
+        revalidateSandboxIdentity,
+      }),
+    ).rejects.toThrow("sandbox identity changed");
+
+    expect(configExec).not.toHaveBeenCalled();
+    expect(calls.recordSkip).not.toHaveBeenCalled();
+    expect(calls.complete).not.toHaveBeenCalled();
+  });
+
   it("runs OpenClaw setup and skips agent_setup for the default agent", async () => {
     const { deps, calls } = createDeps();
 
@@ -175,8 +283,14 @@ describe("handleAgentSetupState", () => {
       provider: "provider",
       model: "model",
     });
-    expect(calls.setupOpenclaw).toHaveBeenCalledWith("my-assistant", "model", "provider");
-    expect(calls.syncConfig).not.toHaveBeenCalled();
+    expect(calls.setupOpenclaw).toHaveBeenCalledWith(
+      "my-assistant",
+      "model",
+      "provider",
+      null,
+      undefined,
+    );
+    expect(calls.configureOpenclaw).not.toHaveBeenCalled();
     expect(calls.complete).toHaveBeenCalledWith(
       "openclaw",
       expect.objectContaining({

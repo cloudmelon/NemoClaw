@@ -136,7 +136,85 @@ function dcodeInput(
   };
 }
 
+function piInput(
+  overrides: Partial<ManagedStartupOnboardProfileInput> = {},
+): ManagedStartupOnboardProfileInput {
+  return {
+    agentName: "pi",
+    inference: {
+      routeProvider: "inference",
+      upstreamProvider: "nvidia",
+      model: "nvidia/nemotron-3-super-120b-a12b",
+      routedBaseUrl: "https://inference.local/v1",
+      upstreamEndpointUrl: null,
+      api: "openai-completions",
+      primaryModelRef: null,
+      compatibility: null,
+    },
+    chatUiUrl: "",
+    effectiveDashboardPort: 0,
+    manageDashboard: false,
+    dashboardBindAddress: undefined,
+    wslExposure: false,
+    hermesDashboardState: { config: null, enabled: false },
+    webSearch: null,
+    toolDisclosure: "progressive",
+    hermesToolGateways: [],
+    messagingPlan: null,
+    dcodeAutoApprovalMode: "disabled",
+    observabilityEnabled: false,
+    environment: EMPTY_ENVIRONMENT,
+    corporateCa: null,
+    ...overrides,
+  };
+}
+
 describe("buildManagedStartupOnboardProfile", () => {
+  it("builds Pi without requiring state another agent owns (#7930)", () => {
+    const built = buildManagedStartupOnboardProfile(
+      piInput({
+        environment: {
+          NEMOCLAW_CONTEXT_WINDOW: "262144",
+          NEMOCLAW_MAX_TOKENS: "32000",
+          NEMOCLAW_REASONING: "true",
+        },
+      }),
+    );
+
+    expect(built.profile).toMatchObject({
+      agent: "pi",
+      agentConfig: { agent: "pi" },
+      dashboard: { agent: "pi", mode: "disabled" },
+      messaging: { plan: null },
+      tuning: {
+        contextWindow: 262_144,
+        maxTokens: 32_000,
+        reasoning: true,
+        reasoningEffort: null,
+      },
+    });
+  });
+
+  it("rejects Pi web-search intent instead of carrying it into the profile (#7930)", () => {
+    expect(
+      buildManagedStartupOnboardProfile(
+        piInput({ webSearch: { fetchEnabled: true, provider: "tavily" } }),
+      ).profile.agentConfig,
+    ).toEqual({ agent: "pi" });
+  });
+
+  it("rejects Pi messaging intent instead of silently discarding it (#7930)", () => {
+    expect(() =>
+      buildManagedStartupOnboardProfile(piInput({ messagingPlan: messagingPlan("openclaw") })),
+    ).toThrow(/pi does not support messaging/);
+  });
+
+  it("rejects a Pi dashboard request (#7930)", () => {
+    expect(() => buildManagedStartupOnboardProfile(piInput({ manageDashboard: true }))).toThrow(
+      /Pi must not enable a dashboard/,
+    );
+  });
+
   it("maps a remote OpenClaw dashboard and its complete agent-owned state", () => {
     const plan = messagingPlan("openclaw");
     const built = buildManagedStartupOnboardProfile(
@@ -169,7 +247,7 @@ describe("buildManagedStartupOnboardProfile", () => {
       tools: { disclosure: "direct", enabledGateways: [] },
     });
     expect(built.profile.messaging.plan).not.toBeNull();
-    expect(built.profile.inference.upstreamEndpointUrl).toBeNull();
+    expect(built.profile.inference!.upstreamEndpointUrl).toBeNull();
   });
 
   it("keeps bracketed IPv6 loopback OpenClaw dashboards in loopback mode", () => {
@@ -243,7 +321,7 @@ describe("buildManagedStartupOnboardProfile", () => {
     const plan = messagingPlan("hermes");
     const built = buildManagedStartupOnboardProfile(
       hermesInput({
-        chatUiUrl: "http://127.0.0.1:19189",
+        chatUiUrl: "https://hermes.example.test:19189",
         effectiveDashboardPort: 19_189,
         hermesDashboardState: {
           config: {
@@ -268,6 +346,7 @@ describe("buildManagedStartupOnboardProfile", () => {
       agent: "hermes",
       mode: "loopback-forwarded",
       url: "http://127.0.0.1:19189",
+      browserUrl: "https://hermes.example.test:19189",
       publicPort: 19_189,
       internalPort: 29_189,
       tuiEnabled: true,
@@ -319,13 +398,16 @@ describe("buildManagedStartupOnboardProfile", () => {
   it.each([
     ["hermes", hermesInput, "text,image"],
     ["langchain-deepagents-code", dcodeInput, "text"],
-  ] as const)("rejects OpenClaw input modalities for %s before filtering ambient input", (agent, input, modalities) => {
-    expect(() =>
-      buildManagedStartupOnboardProfile(
-        input({ environment: { NEMOCLAW_INFERENCE_INPUTS: modalities } }),
-      ),
-    ).toThrow(new RegExp(`NEMOCLAW_INFERENCE_INPUTS is not supported by ${agent}`, "u"));
-  });
+  ] as const)(
+    "rejects OpenClaw input modalities for %s before filtering ambient input",
+    (agent, input, modalities) => {
+      expect(() =>
+        buildManagedStartupOnboardProfile(
+          input({ environment: { NEMOCLAW_INFERENCE_INPUTS: modalities } }),
+        ),
+      ).toThrow(new RegExp(`NEMOCLAW_INFERENCE_INPUTS is not supported by ${agent}`, "u"));
+    },
+  );
 
   it("rejects DCode messaging intent instead of silently discarding it", () => {
     expect(() =>
@@ -371,23 +453,23 @@ describe("buildManagedStartupOnboardProfile", () => {
     expect(
       buildManagedStartupOnboardProfile(
         openClawInput({
-          inference: { ...openClawInput().inference, routedBaseUrl: route },
+          inference: { ...openClawInput().inference!, routedBaseUrl: route },
         }),
-      ).profile.inference.routedBaseUrl,
+      ).profile.inference!.routedBaseUrl,
     ).toBe(route);
     expect(
       buildManagedStartupOnboardProfile(
         hermesInput({
-          inference: { ...hermesInput().inference, routedBaseUrl: route },
+          inference: { ...hermesInput().inference!, routedBaseUrl: route },
         }),
-      ).profile.inference.routedBaseUrl,
+      ).profile.inference!.routedBaseUrl,
     ).toBe(route);
     expect(
       buildManagedStartupOnboardProfile(
         dcodeInput({
-          inference: { ...dcodeInput().inference, routedBaseUrl: route },
+          inference: { ...dcodeInput().inference!, routedBaseUrl: route },
         }),
-      ).profile.inference.routedBaseUrl,
+      ).profile.inference!.routedBaseUrl,
     ).toBe(route);
   });
 
@@ -451,7 +533,7 @@ describe("buildManagedStartupOnboardProfile", () => {
       model: "gpt-5.4",
       api: "openai-responses",
     });
-    expect(decodeManagedStartupProfile(built.encodedProfile).inference.model).toBe("gpt-5.4");
+    expect(decodeManagedStartupProfile(built.encodedProfile).inference!.model).toBe("gpt-5.4");
     expect(built.profile.tools.disclosure).toBe("direct");
     expect(built.profile.agentConfig).toMatchObject({
       agent: "openclaw",

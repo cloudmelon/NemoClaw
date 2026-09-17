@@ -74,6 +74,13 @@ type ReportEntry = { result?: string; jobUrl?: string; wallClockRange?: WallCloc
 
 const TERMINAL_CONCLUSIONS = ["success", "failure", "cancelled", "skipped"];
 const PASSING_JOB_CONCLUSIONS = ["success", "skipped", "neutral"];
+const CATALOGUE_CREDENTIAL_BOUNDARIES = {
+  "catalogue-standard": "no provider credential",
+  "catalogue-nvidia-api": "NVIDIA API key",
+  "catalogue-nvidia-inference": "NVIDIA inference API key",
+  "catalogue-github-read": "GitHub read token",
+  "catalogue-brave-nvidia-inference": "Brave and NVIDIA inference API keys",
+} as const;
 
 export async function resolveReportPr(input: {
   github: ReportGithub;
@@ -260,10 +267,10 @@ export function renderE2eReport(input: {
     const jobName = job.name || "";
     const match = /^Shared E2E \(([A-Za-z0-9_-]+)\)$/.exec(jobName);
     const aggregateJobName = aggregateJobNames.find((name) => jobName.startsWith(`${name} (`));
-    const reportEntryName =
-      match?.[1] ??
-      aggregateJobName ??
-      (/^OpenShell gateway upgrade \(.+\)$/.test(jobName) ? "openshell-gateway-upgrade" : jobName);
+    const catalogueJobName = Object.entries(CATALOGUE_CREDENTIAL_BOUNDARIES).find(
+      ([name, boundary]) => needs[name] && jobName.endsWith(` / ${boundary}`),
+    )?.[0];
+    const reportEntryName = match?.[1] ?? aggregateJobName ?? catalogueJobName ?? jobName;
     recordWallClockRange(reportEntryName, job);
     recordJobLink(reportEntryName, job);
     if (!match || !selectedTestIds.has(match[1])) continue;
@@ -330,19 +337,20 @@ export function renderE2eReport(input: {
   const missingRequestedTestIds = selectorValidationPassed
     ? requestedTestIds.filter((testId) => !allEntries.some(([name]) => name === testId))
     : [];
+  const isSelectiveReportEntry = ([name, { result }]: [string, ReportEntry]) =>
+    result !== "skipped" &&
+    (name !== "generate-matrix" || result === "failure" || result === "cancelled");
   const selectedEntries =
     requestedTestIds.length > 0
       ? allEntries.filter(([name]) => requestedTestIdSet.has(name))
       : selectiveDispatch
-        ? allEntries.filter(
-            ([name, { result }]) => result !== "skipped" && name !== "generate-matrix",
-          )
+        ? allEntries.filter(isSelectiveReportEntry)
         : allEntries;
   const reportedEntries =
     selectedEntries.length > 0
       ? selectedEntries
       : selectiveDispatch
-        ? allEntries.filter(([, { result }]) => result !== "skipped")
+        ? allEntries.filter(isSelectiveReportEntry)
         : allEntries;
   const rows = reportedEntries.map(([name, { jobUrl, result, wallClockRange }]) => {
     const label = result === "failure" ? `[${name}](${jobUrl ?? runUrl})` : name;
@@ -360,6 +368,14 @@ export function renderE2eReport(input: {
   const unknown = ran.filter(([, v]) => v.result === "unknown");
   const sharedJobAggregateFailed = sharedJobAggregateResult === "failure";
   const sharedJobAggregateCancelled = sharedJobAggregateResult === "cancelled";
+  const noResultEntries = reportedEntries.length === 0 && missingRequestedTestIds.length === 0;
+  const resultsUnavailable = !apiJobsLoaded && noResultEntries;
+  const noResultsReported = apiJobsLoaded && noResultEntries;
+  if (noResultsReported) {
+    warnings.push(
+      "No E2E target reported a result. The check remains successful but provides no affirmative E2E qualification evidence.",
+    );
+  }
   const passingStatus =
     requestedTestIds.length > 0
       ? "✅ All requested tests passed"
@@ -375,9 +391,13 @@ export function renderE2eReport(input: {
           ? "⚠️ Some tests cancelled — partial pass"
           : unknown.length > 0
             ? "⚠️ Per-test results incomplete"
-            : skipped.length > 0 && passed.length === 0
-              ? "⚠️ No selected tests ran"
-              : passingStatus;
+            : resultsUnavailable
+              ? "⚠️ E2E results unavailable"
+              : noResultsReported
+                ? "⚠️ No E2E results reported"
+                : skipped.length > 0 && passed.length === 0
+                  ? "⚠️ No selected tests ran"
+                  : passingStatus;
 
   const lines = [
     `### E2E Target Results — ${status}`,

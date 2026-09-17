@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { getSandboxInferenceConfig } from "../inference/config";
+import { getSandboxInferenceConfig, isSafeModelId } from "../inference/config";
 import { MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW } from "../inference/ollama-runtime-context";
 import {
   isWebSearchEnabled,
@@ -32,11 +32,13 @@ import {
   encodeCorporateCaArg,
   resolveCorporateCa,
 } from "./corporate-ca";
+import { warnCorporateCa } from "./corporate-ca-policy";
 import {
   DCODE_AUTO_APPROVAL_BUILD_ARG,
   type DcodeAutoApprovalMode,
   isDcodeAutoApprovalMode,
 } from "./dcode-auto-approval";
+import { isValidDcodeUpstreamProvider } from "./managed-startup/dcode-upstream-provider";
 import * as remoteDashboardBindContract from "./dockerfile-remote-dashboard-bind-contract";
 import {
   type DockerfileInstruction,
@@ -55,14 +57,87 @@ const NODE_RUNTIME_REFRESH_INSTRUCTION =
 const PROXY_HOST_RE = /^[A-Za-z0-9._-]+$/;
 const POSITIVE_INT_RE = /^[1-9][0-9]*$/;
 
-type LooseObject = Record<string, unknown>;
-
 export function encodeDockerJsonArg(value: unknown): string {
   return Buffer.from(JSON.stringify(value ?? {}), "utf8").toString("base64");
 }
 
 function sanitizeDockerArg(value: unknown): string {
   return String(value ?? "").replace(/[\r\n]/g, "");
+}
+
+export interface HermesPortableDockerfileBuildSettings {
+  readonly model: string;
+  readonly provider: string | null;
+  readonly preferredInferenceApi: string | null;
+  readonly toolDisclosure: ToolDisclosure;
+}
+
+function replaceExactHermesPortableDockerArg(source: string, name: string, value: string): string {
+  const sanitized = sanitizeDockerArg(value);
+  if (sanitized !== value || /[\p{Cc}\p{Cf}]/u.test(value)) {
+    throw new Error(`Hermes portable ${name} build setting is invalid.`);
+  }
+  const pattern = new RegExp(`^ARG ${name}=.*$`, "gmu");
+  if ((source.match(pattern) ?? []).length !== 1) {
+    throw new Error(`Hermes Dockerfile must declare exactly one ${name} build argument.`);
+  }
+  return source.replace(pattern, `ARG ${name}=${sanitized}`);
+}
+
+function pinHermesPortableTargetArchitecture(source: string): string {
+  const firstStage = source.search(/^FROM\s/gmu);
+  if (firstStage < 0) {
+    throw new Error("Hermes Dockerfile must declare at least one build stage.");
+  }
+  const globalArguments = source.slice(0, firstStage);
+  const targetArchitecture = /^ARG TARGETARCH$/gmu;
+  if ((globalArguments.match(targetArchitecture) ?? []).length !== 1) {
+    throw new Error("Hermes Dockerfile must declare one unpinned global TARGETARCH argument.");
+  }
+  return `${globalArguments.replace(targetArchitecture, "ARG TARGETARCH=amd64")}${source.slice(firstStage)}`;
+}
+
+/** Render the reviewed non-secret schema-5 Hermes image settings from the shared route owner. */
+export function renderHermesPortableDockerfileBuildSettings(
+  source: string,
+  input: HermesPortableDockerfileBuildSettings,
+): string {
+  if (!input.model || input.model.length > 4096 || !isSafeModelId(input.model)) {
+    throw new Error("Hermes portable model build setting is invalid.");
+  }
+  if (input.provider !== null && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(input.provider)) {
+    throw new Error("Hermes portable provider build setting is invalid.");
+  }
+  if (
+    input.preferredInferenceApi !== null &&
+    !["anthropic-messages", "openai-completions", "openai-responses"].includes(
+      input.preferredInferenceApi,
+    )
+  ) {
+    throw new Error("Hermes portable inference API build setting is invalid.");
+  }
+  const toolDisclosure = normalizeToolDisclosure(input.toolDisclosure);
+  if (toolDisclosure !== input.toolDisclosure) {
+    throw new Error("Hermes portable tool disclosure build setting is invalid.");
+  }
+  const inference = getSandboxInferenceConfig(
+    input.model,
+    input.provider,
+    input.preferredInferenceApi,
+  );
+  const replacements = [
+    ["NEMOCLAW_MODEL", input.model],
+    ["NEMOCLAW_INFERENCE_PROVIDER_ID", inference.providerKey],
+    ["NEMOCLAW_UPSTREAM_PROVIDER", input.provider ?? inference.providerKey],
+    ["NEMOCLAW_INFERENCE_BASE_URL", inference.inferenceBaseUrl],
+    ["NEMOCLAW_INFERENCE_API", inference.inferenceApi],
+    ["NEMOCLAW_TOOL_DISCLOSURE", toolDisclosure],
+    ["CHAT_UI_URL", ""],
+  ] as const;
+  return replacements.reduce(
+    (rendered, [name, value]) => replaceExactHermesPortableDockerArg(rendered, name, value),
+    pinHermesPortableTargetArchitecture(source),
+  );
 }
 
 function encodeSanitizedDockerJsonArg(value: unknown): string {
@@ -109,7 +184,7 @@ export interface PatchStagedDockerfileOptions {
   rebuildPreservedEnv?: readonly PreservedEnvFile[];
 }
 
-function openClawRootStartupArg(dockerfile: string): DockerfileInstruction | null {
+function openClawRuntimeUserArg(dockerfile: string): DockerfileInstruction | null {
   const instructions = dockerfileInstructions(dockerfile);
   const finalFromIndex = instructions.reduce(
     (last, instruction, index) => (/^FROM(?:\s|$)/i.test(instruction.text) ? index : last),
@@ -144,7 +219,7 @@ function openClawRootStartupArg(dockerfile: string): DockerfileInstruction | nul
       entrypoint.length === 1 &&
       entrypoint[0] === "/usr/local/bin/nemoclaw-start";
   } catch {
-    // Root startup requires the trusted exec-form entrypoint.
+    // The managed startup contract requires the trusted exec-form entrypoint.
   }
   const runtimeUserControlsStartup =
     runtimeUserArgIndex < finalUserIndex &&
@@ -234,14 +309,19 @@ export function patchStagedDockerfile(
   options: PatchStagedDockerfileOptions = {},
 ): PatchedDockerfileMetadata {
   const sanitizedModel = sanitizeDockerArg(model);
+  const providerless =
+    model === "" && !provider && !preferredInferenceApi && !inferenceBaseUrlOverride;
   const sandboxInference = getSandboxInferenceConfig(
     sanitizedModel,
     provider,
     preferredInferenceApi,
   );
-  const { providerKey, primaryModelRef, inferenceApi, inferenceCompat } = sandboxInference;
-  const inferenceBaseUrl =
-    inferenceBaseUrlOverride && inferenceBaseUrlOverride.trim()
+  const { providerKey, primaryModelRef, inferenceApi, inferenceCompat } = providerless
+    ? { providerKey: "", primaryModelRef: "", inferenceApi: "", inferenceCompat: null }
+    : sandboxInference;
+  const inferenceBaseUrl = providerless
+    ? ""
+    : inferenceBaseUrlOverride && inferenceBaseUrlOverride.trim()
       ? inferenceBaseUrlOverride
       : sandboxInference.inferenceBaseUrl;
   const patchSnapshot = readDockerfilePatchSnapshot(dockerfilePath);
@@ -322,6 +402,14 @@ export function patchStagedDockerfile(
   // etc.) rather than the proxy-routing key. The replace is a silent no-op
   // when the staged Dockerfile predates this ARG (e.g. OpenClaw).
   const upstreamProvider = provider && provider.trim() ? provider : providerKey;
+  if (
+    options.agentName === "langchain-deepagents-code" &&
+    !isValidDcodeUpstreamProvider(upstreamProvider)
+  ) {
+    throw new Error(
+      "NEMOCLAW_UPSTREAM_PROVIDER must start with an ASCII letter or digit and contain 1-64 ASCII letters, digits, dots, underscores, or hyphens for DCode.",
+    );
+  }
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_UPSTREAM_PROVIDER=.*$/m,
     `ARG NEMOCLAW_UPSTREAM_PROVIDER=${sanitizeDockerArg(upstreamProvider)}`,
@@ -484,6 +572,11 @@ export function patchStagedDockerfile(
     /^ARG NEMOCLAW_WEB_SEARCH_PROVIDER=.*$/m,
     `ARG NEMOCLAW_WEB_SEARCH_PROVIDER=${sanitizeDockerArg(webSearchProviderForConfig(webSearchConfig))}`,
   );
+  // These four ARGs configure OpenClaw's own diagnostics exporter and are
+  // declared only by the OpenClaw Dockerfile. Another agent's staged Dockerfile
+  // is not missing them, so report the agent mismatch the way the managed
+  // startup path already does instead of an internal Dockerfile-authoring error.
+  const otelAgentName = options.agentName ?? "openclaw";
   for (const envKey of [
     "NEMOCLAW_OPENCLAW_OTEL",
     "NEMOCLAW_OPENCLAW_OTEL_ENDPOINT",
@@ -491,13 +584,16 @@ export function patchStagedDockerfile(
     "NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE",
   ]) {
     const rawValue = process.env[envKey];
-    if (rawValue !== undefined && rawValue.trim() !== "") {
-      const argPattern = new RegExp(`^ARG ${envKey}=.*$`, "m");
-      if (!argPattern.test(dockerfile)) {
-        throw new Error(`Dockerfile is missing ARG ${envKey}; cannot apply value ${rawValue}`);
-      }
-      dockerfile = dockerfile.replace(argPattern, `ARG ${envKey}=${sanitizeDockerArg(rawValue)}`);
+    if (rawValue === undefined || rawValue.trim() === "") continue;
+    const argPattern = new RegExp(`^ARG ${envKey}=.*$`, "m");
+    if (!argPattern.test(dockerfile)) {
+      throw new Error(
+        otelAgentName === "openclaw"
+          ? `Dockerfile is missing ARG ${envKey}; cannot apply value ${rawValue}`
+          : `${envKey} is not supported by ${otelAgentName}`,
+      );
     }
+    dockerfile = dockerfile.replace(argPattern, `ARG ${envKey}=${sanitizeDockerArg(rawValue)}`);
   }
   // Keep the managed pairing opt-out distinct from an operator's choice.
   dockerfile = remoteDashboardBindContract.patchManagedDeviceAuthOptOutContract(dockerfile);
@@ -526,14 +622,6 @@ export function patchStagedDockerfile(
   if (baseResolutionLabels) {
     dockerfile = `${dockerfile.trimEnd()}\n\n# NemoClaw sandbox-base warm-resolution metadata\n${baseResolutionLabels}\n`;
   }
-  // NEMOCLAW_EXTRA_AGENTS_JSON — bake secondary OpenClaw agents into
-  // agents.list[] alongside the canonical "main" entry. Pass the raw operator
-  // payload through to the build-time validator in
-  // scripts/generate-openclaw-config.mts. The host-side encode does not
-  // parse or shape-check the JSON: that would duplicate validation logic and
-  // could silently drop a malformed payload here while the docs/contract
-  // promise an image-build failure. Encoding the raw bytes makes the build
-  // the single source of truth for validation errors.
   const extraAgentsRaw = process.env.NEMOCLAW_EXTRA_AGENTS_JSON;
   if (extraAgentsRaw && extraAgentsRaw.trim()) {
     const encoded = sanitizeDockerArg(Buffer.from(extraAgentsRaw, "utf8").toString("base64"));
@@ -555,16 +643,17 @@ export function patchStagedDockerfile(
       );
     }
     const corporateCaArgPattern = /^ARG NEMOCLAW_CORPORATE_CA_B64=.*$/m;
-    const openClawRootStartup = options.agentName === "openclaw";
-    const runtimeUserArg = openClawRootStartup ? openClawRootStartupArg(dockerfile) : null;
+    const openClawManagedStartup = options.agentName === "openclaw";
+    const runtimeUserArg = openClawManagedStartup ? openClawRuntimeUserArg(dockerfile) : null;
     if (
       corporateCaArgPattern.test(dockerfile) &&
-      (!openClawRootStartup || runtimeUserArg !== null)
+      (!openClawManagedStartup || runtimeUserArg !== null)
     ) {
       if (runtimeUserArg) {
-        // Root startup creates the merged runtime trust bundle before the
-        // entrypoint starts the sandbox user's agent process (#8803).
-        dockerfile = `${dockerfile.slice(0, runtimeUserArg.start)}ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=root${dockerfile.slice(runtimeUserArg.end)}`;
+        // OpenShell 0.0.116 rejects a root OCI image user. Managed startup
+        // applies the root-owned runtime trust bundle before releasing this
+        // sandbox-user entrypoint.
+        dockerfile = `${dockerfile.slice(0, runtimeUserArg.start)}ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER=sandbox${dockerfile.slice(runtimeUserArg.end)}`;
       }
       dockerfile = dockerfile.replace(
         corporateCaArgPattern,
@@ -589,9 +678,21 @@ export function patchStagedDockerfile(
           'ENTRYPOINT ["/usr/local/bin/nemoclaw-start"]. ' +
           "NemoClaw cannot bake the corporate CA from NEMOCLAW_CORPORATE_CA_BUNDLE.",
       );
+    } else {
+      // A fallback source stays a no-op when a custom Dockerfile lacks either
+      // build argument required for the managed startup contract. Onboarding still
+      // exits 0 and the sandbox still reaches Ready, so report the dropped
+      // anchor here; otherwise the missing trust is invisible until external
+      // TLS through the corporate proxy fails at runtime (#8454).
+      const reason = corporateCaArgPattern.test(dockerfile)
+        ? "the Dockerfile does not declare a final-stage ARG NEMOCLAW_MANAGED_IMAGE_RUNTIME_USER that controls the image user before the NemoClaw entrypoint"
+        : "the Dockerfile is missing ARG NEMOCLAW_CORPORATE_CA_B64";
+      warnCorporateCa(
+        `corporate proxy CA from ${corporateCa.sourceEnv} (${corporateCa.sourcePath}) was not baked ` +
+          `into the sandbox image because ${reason}; the sandbox will start without a corporate ` +
+          "trust anchor and external TLS through the corporate proxy may fail",
+      );
     }
-    // An OpenClaw fallback source stays a no-op when a custom Dockerfile lacks
-    // either build argument required for root-owned runtime trust.
   }
 
   replaceDockerfilePatchSnapshot(dockerfilePath, patchSnapshot, dockerfile);

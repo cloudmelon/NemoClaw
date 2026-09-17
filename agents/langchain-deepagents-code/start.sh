@@ -34,9 +34,7 @@ unset NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGC NEMOCLAW_ENTRYPOINT_NORMALIZED_ARGV \
 unset -f nemoclaw_normalize_entrypoint_env_wrapper
 # managed-entrypoint-env-wrapper end
 
-# The published managed image uses uid 0 as its OCI entry user so it can accept
-# a future profile. Without one, drop immediately and execute the byte-for-byte
-# legacy sandbox-user path. Ordinary non-managed builds still start as sandbox.
+# Root entrypoints hand off agent work without reading personal shell files.
 if [ "$(id -u)" -eq 0 ]; then
   exec /usr/bin/setpriv --reuid=sandbox --regid=sandbox --init-groups -- \
     /usr/local/bin/nemoclaw-start "$@"
@@ -105,11 +103,11 @@ unset _NEMOCLAW_SANDBOX_RLIMITS
 # or when dcode no longer uses inference.local.
 readonly MANAGED_PROXY_HOST_FILE="/usr/local/share/nemoclaw/dcode-proxy-host"
 readonly MANAGED_PROXY_PORT_FILE="/usr/local/share/nemoclaw/dcode-proxy-port"
-if [ -e /run/nemoclaw/managed-startup-ca-bundle.pem ] \
-  || [ -L /run/nemoclaw/managed-startup-ca-bundle.pem ]; then
-  readonly MANAGED_FETCH_CA_BUNDLE_FILE="/run/nemoclaw/managed-startup-ca-bundle.pem"
-else
+if [ -e /etc/openshell-tls/ca-bundle.pem ] \
+  || [ -L /etc/openshell-tls/ca-bundle.pem ]; then
   readonly MANAGED_FETCH_CA_BUNDLE_FILE="/etc/openshell-tls/ca-bundle.pem"
+else
+  readonly MANAGED_FETCH_CA_BUNDLE_FILE="/run/nemoclaw/managed-startup-ca-bundle.pem"
 fi
 readonly MANAGED_PROXY_OWNER_UID=0
 
@@ -188,6 +186,12 @@ validate_managed_fetch_ca_bundle() {
 PROXY_HOST="$(read_managed_proxy_value "$MANAGED_PROXY_HOST_FILE" "host")"
 PROXY_PORT="$(read_managed_proxy_value "$MANAGED_PROXY_PORT_FILE" "port")"
 validate_managed_fetch_ca_bundle
+if [ -e "$MANAGED_FETCH_CA_BUNDLE_FILE" ]; then
+  : "${SSL_CERT_FILE:=$MANAGED_FETCH_CA_BUNDLE_FILE}"
+  : "${REQUESTS_CA_BUNDLE:=$MANAGED_FETCH_CA_BUNDLE_FILE}"
+  : "${NODE_EXTRA_CA_CERTS:=$MANAGED_FETCH_CA_BUNDLE_FILE}"
+  export SSL_CERT_FILE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS
+fi
 unset NEMOCLAW_PROXY_HOST NEMOCLAW_PROXY_PORT
 # Generic proxy fallbacks are outside the managed dcode contract and may carry
 # host credentials even after the scheme-specific proxy values are normalized.
@@ -222,7 +226,7 @@ fi
 
 _PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
 _NO_PROXY_VAL="localhost,127.0.0.1,::1,${PROXY_HOST}"
-# Deep Agents Code 0.1.34 intentionally ignores environment proxies in
+# Deep Agents Code 0.1.55 intentionally ignores environment proxies in
 # fetch_url so it can pin direct DNS results against rebinding. OpenShell's
 # sandbox instead requires all ordinary egress, including DNS resolution for a
 # destination, to stay behind its policy proxy. This explicit variable opts the

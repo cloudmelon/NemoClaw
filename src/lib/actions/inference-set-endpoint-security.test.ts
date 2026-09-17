@@ -7,18 +7,19 @@ import type { ConfigValue } from "../security/credential-filter";
 import { normalizeCustomEndpointUrl } from "./inference-set";
 
 describe("custom inference endpoint DNS pinning", () => {
-  it.each([
-    1024, 65535,
-  ])("allows the exact OpenShell bridge exemption at port %i without DNS rewriting", async (port) => {
-    const rewriteUrl = vi.fn(async () => {
-      throw new Error("bridge exemption unexpectedly reached DNS validation");
-    });
+  it.each([1024, 65535])(
+    "allows the exact OpenShell bridge exemption at port %i without DNS rewriting",
+    async (port) => {
+      const rewriteUrl = vi.fn(async () => {
+        throw new Error("bridge exemption unexpectedly reached DNS validation");
+      });
 
-    await expect(
-      normalizeCustomEndpointUrl(`http://host.openshell.internal:${port}/v1/`, rewriteUrl),
-    ).resolves.toBe(`http://host.openshell.internal:${port}/v1`);
-    expect(rewriteUrl).not.toHaveBeenCalled();
-  });
+      await expect(
+        normalizeCustomEndpointUrl(`http://host.openshell.internal:${port}/v1/`, rewriteUrl),
+      ).resolves.toBe(`http://host.openshell.internal:${port}/v1`);
+      expect(rewriteUrl).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     ["no explicit port", "http://host.openshell.internal/v1"],
@@ -38,6 +39,44 @@ describe("custom inference endpoint DNS pinning", () => {
     ).rejects.toThrow(/endpoint-url is not allowed:.*private\/internal address/i);
   });
 
+  it.each([
+    [
+      "shell metacharacters",
+      "http://public.example/v1$(id)",
+      /endpoint-url must contain only URL-safe ASCII characters\./,
+    ],
+    [
+      "percent-encoded control characters",
+      "http://public.example/v1%0ainjected",
+      /endpoint-url must not contain percent-encoded control characters\./,
+    ],
+    [
+      "a leading tab",
+      "\thttp://public.example/v1",
+      /endpoint-url must not contain control characters\./,
+    ],
+    [
+      "a trailing newline",
+      "http://public.example/v1\n",
+      /endpoint-url must not contain control characters\./,
+    ],
+    [
+      "a leading no-break space",
+      "\u00a0http://public.example/v1",
+      /endpoint-url must contain only URL-safe ASCII characters\./,
+    ],
+  ] as const)(
+    "rejects an endpoint URL with %s before DNS validation or any mutation (#9301)",
+    async (_label, endpointUrl, message) => {
+      const rewriteUrl = vi.fn(async () => {
+        throw new Error("unsafe endpoint unexpectedly reached DNS validation");
+      });
+
+      await expect(normalizeCustomEndpointUrl(endpointUrl, rewriteUrl)).rejects.toThrow(message);
+      expect(rewriteUrl).not.toHaveBeenCalled();
+    },
+  );
+
   it("pins validated public HTTP endpoints before they become durable metadata", async () => {
     const lookup = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);
 
@@ -53,16 +92,19 @@ describe("custom inference endpoint DNS pinning", () => {
     ["userinfo", "https://user:secret@public-endpoint.example/v1"],
     ["query", "https://public-endpoint.example/v1?api_key=secret"],
     ["fragment", "https://public-endpoint.example/v1#secret"],
-  ])("rejects a source endpoint with %s instead of silently stripping it", async (_kind, endpointUrl) => {
-    const rewriteUrl = vi.fn(async (value: ConfigValue) => value);
-    const ensureAdapter = vi.fn(async () => "http://host.openshell.internal:11438/route/test");
+  ])(
+    "rejects a source endpoint with %s instead of silently stripping it",
+    async (_kind, endpointUrl) => {
+      const rewriteUrl = vi.fn(async (value: ConfigValue) => value);
+      const ensureAdapter = vi.fn(async () => "http://host.openshell.internal:11438/route/test");
 
-    await expect(
-      normalizeCustomEndpointUrl(endpointUrl, rewriteUrl, ensureAdapter),
-    ).rejects.toThrow("without userinfo, query, or fragment components");
-    expect(rewriteUrl).not.toHaveBeenCalled();
-    expect(ensureAdapter).not.toHaveBeenCalled();
-  });
+      await expect(
+        normalizeCustomEndpointUrl(endpointUrl, rewriteUrl, ensureAdapter),
+      ).rejects.toThrow("without userinfo, query, or fragment components");
+      expect(rewriteUrl).not.toHaveBeenCalled();
+      expect(ensureAdapter).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails closed for DNS-backed HTTPS endpoints until runtime-aware pinning exists", async () => {
     const lookup = vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]);

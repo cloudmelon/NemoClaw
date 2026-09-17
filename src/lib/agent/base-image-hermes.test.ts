@@ -1,153 +1,151 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import fs from "node:fs";
-import path from "node:path";
-
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { makeAgent, withMockedDocker } from "../../../test/helpers/base-image-test-harness";
-import { dockerRunCommandBetween } from "../../../test/helpers/dockerfile-run-shell";
 
 describe("agent base image provisioning", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("probes resolved Hermes bases for the native MCP Streamable HTTP runtime", () => {
+  it("accepts a Hermes base only after its required MCP and ACP runtime probe succeeds", () => {
     withMockedDocker(({ ensureAgentBaseImage, dockerCaptureMock, resolveSandboxBaseImageMock }) => {
       ensureAgentBaseImage(makeAgent());
       const options = resolveSandboxBaseImageMock.mock.calls[0]?.[0] as {
         validateImage?: (imageRef: string) => boolean;
       };
 
+      dockerCaptureMock
+        .mockReturnValueOnce("nemoclaw-hermes-mcp-runtime-ok")
+        .mockReturnValueOnce("nemoclaw-security-inventory-ok");
       expect(options.validateImage?.("hermes-base:test")).toBe(true);
-      expect(dockerCaptureMock).toHaveBeenCalledWith(
-        [
-          "run",
-          "--rm",
-          "--entrypoint",
-          "/opt/hermes/.venv/bin/python",
+      const [probeArgs, probeOptions] = dockerCaptureMock.mock.calls[0] as [string[], object];
+      expect(probeArgs.slice(0, -1)).toEqual([
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--read-only",
+        "--user",
+        "sandbox",
+        "--entrypoint",
+        "/opt/hermes/.venv/bin/python",
+        "hermes-base:test",
+        "-I",
+        "-c",
+      ]);
+      expect(probeArgs.at(-1)).toContain("_MCP_HTTP_AVAILABLE");
+      expect(probeArgs.at(-1)).toContain('metadata.version("agent-client-protocol") == "0.9.0"');
+      expect(probeArgs.at(-1)).toContain("import acp");
+      expect(probeArgs.at(-1)).toContain("from acp_adapter.server import HermesACPAgent");
+      expect(probeArgs.at(-1)).toContain("or sys.exit(1)");
+      expect(probeArgs.at(-1)).not.toContain("assert ");
+      expect(probeArgs.at(-1)).toContain('print("nemoclaw-hermes-mcp-runtime-ok")');
+      expect(probeOptions).toEqual({ ignoreError: true, timeout: 20_000 });
+      expect(dockerCaptureMock.mock.calls[1]?.[0]).toEqual(
+        expect.arrayContaining([
+          "--network",
+          "none",
+          "--cap-drop",
+          "ALL",
+          "--read-only",
           "hermes-base:test",
-          "-c",
-          expect.stringContaining("_MCP_HTTP_AVAILABLE"),
-        ],
-        { ignoreError: true, timeout: 20_000 },
+          expect.stringContaining("nemoclaw-security-inventory-ok"),
+        ]),
       );
 
       dockerCaptureMock.mockReturnValue("");
       expect(options.validateImage?.("hermes-base:stale")).toBe(false);
+
+      dockerCaptureMock.mockReturnValue("nemoclaw-hermes-mcp-runtime-ok\nunexpected-output");
+      expect(options.validateImage?.("hermes-base:unexpected-output")).toBe(false);
     });
   });
 
-  // source-shape-contract: security -- Ordinary onboarding must use the pinned Hermes base image and check installed dependency versions after messaging package installation.
-  it("requires the pinned Hermes base image and checks installed dependency versions after messaging package installation (#8328)", () => {
-    const dockerfilePath = path.resolve(import.meta.dirname, "../../../agents/hermes/Dockerfile");
-    const dockerfile = fs.readFileSync(dockerfilePath, "utf8");
-    const trackedRef = dockerfile.match(
-      /^ARG BASE_IMAGE=(ghcr\.io\/nvidia\/nemoclaw\/hermes-sandbox-base@(sha256:[0-9a-f]{64}))$/m,
-    );
-    expect(trackedRef).not.toBeNull();
-    expect(trackedRef?.[1]).toBe(
-      "ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:3d54b928baef9df403227e846f73079d13ca8424a27cd5268ca97bac3f030b27",
-    );
+  it("rejects a Hermes base that passes its runtime probe but lacks the security inventory", () => {
+    withMockedDocker(({ ensureAgentBaseImage, dockerCaptureMock, resolveSandboxBaseImageMock }) => {
+      ensureAgentBaseImage(makeAgent());
+      const options = resolveSandboxBaseImageMock.mock.calls[0]?.[0] as {
+        validateImage?: (imageRef: string) => boolean;
+      };
+      dockerCaptureMock.mockReturnValueOnce("nemoclaw-hermes-mcp-runtime-ok").mockReturnValue("");
 
-    const messagingInstallIndex = dockerfile.indexOf("RUN unset SSL_CERT_FILE REQUESTS_CA_BUNDLE");
-    const managedInstallIndex = dockerfile.indexOf(
-      "RUN --network=none --mount=from=hermes-managed-teams-wheels",
-    );
-    const installLayer = dockerRunCommandBetween(
-      dockerfile,
-      "RUN --network=none --mount=from=hermes-managed-teams-wheels",
-      "WORKDIR /sandbox",
-    ).replace(/\s+/gu, " ");
-    const versionGuard =
-      "/opt/hermes/.venv/bin/python -I -c \"from importlib.metadata import version; expected = {'aiohttp': '3.14.3', 'cryptography': '50.0.0'}; actual = {name: version(name) for name in expected}; assert actual == expected, actual\"";
-    const versionGuardIndex = installLayer.indexOf(versionGuard);
-    const finalConditionalEnd = [...installLayer.matchAll(/\bfi\b/gu)].at(-1)?.index ?? -1;
+      expect(options.validateImage?.("hermes-base:stale-inventory")).toBe(false);
+      expect(dockerCaptureMock).toHaveBeenCalledTimes(2);
+    });
+  });
 
-    expect(messagingInstallIndex).toBeGreaterThanOrEqual(0);
-    expect(managedInstallIndex).toBeGreaterThan(messagingInstallIndex);
-    expect(versionGuardIndex).toBeGreaterThan(finalConditionalEnd);
-    expect(installLayer).not.toContain("'aiohttp': '3.14.1'");
-    expect(installLayer).not.toContain("'cryptography': '48.0.1'");
+  it("rejects the older security inventory without pinned resolver provenance (#10947)", () => {
+    withMockedDocker(({ ensureAgentBaseImage, dockerCaptureMock, resolveSandboxBaseImageMock }) => {
+      ensureAgentBaseImage(makeAgent());
+      const options = resolveSandboxBaseImageMock.mock.calls[0]?.[0] as {
+        validateImage?: (imageRef: string, context?: { source: string }) => boolean;
+      };
+      dockerCaptureMock
+        .mockReturnValueOnce("nemoclaw-hermes-mcp-runtime-ok")
+        .mockReturnValueOnce("")
+        .mockReturnValueOnce("nemoclaw-security-inventory-ok");
 
-    withMockedDocker(({ ensureAgentBaseImage, resolveSandboxBaseImageMock }) => {
-      resolveSandboxBaseImageMock.mockReturnValue({
-        ref: trackedRef?.[1],
-        digest: trackedRef?.[2],
-        source: "source-sha",
-        glibcVersion: "2.41",
-      });
+      expect(options.validateImage?.("hermes-base:cached-old", { source: "local" })).toBe(false);
+      expect(dockerCaptureMock).toHaveBeenCalledTimes(2);
+    });
+  });
 
-      expect(ensureAgentBaseImage(makeAgent({ dockerfilePath }))).toEqual({
-        imageTag: trackedRef?.[1],
-        built: false,
-      });
-      expect(resolveSandboxBaseImageMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          pinnedRemoteRef: trackedRef?.[1],
-          preferPinnedRemoteRef: true,
+  it("accepts the reviewed security inventory in the Dockerfile-pinned Hermes base", () => {
+    withMockedDocker(({ ensureAgentBaseImage, dockerCaptureMock, resolveSandboxBaseImageMock }) => {
+      ensureAgentBaseImage(makeAgent());
+      const options = resolveSandboxBaseImageMock.mock.calls[0]?.[0] as {
+        pinnedRemoteRef?: string;
+        validateImage?: (
+          imageRef: string,
+          context?: { source: string; pinnedRemoteRef?: string },
+        ) => boolean;
+      };
+      dockerCaptureMock
+        .mockReturnValueOnce("nemoclaw-hermes-mcp-runtime-ok")
+        .mockReturnValueOnce("")
+        .mockReturnValueOnce("nemoclaw-security-inventory-ok");
+
+      expect(options.pinnedRemoteRef).toMatch(
+        /^ghcr\.io\/nvidia\/nemoclaw\/hermes-sandbox-base@sha256:[0-9a-f]{64}$/,
+      );
+      expect(
+        options.validateImage?.(options.pinnedRemoteRef!, {
+          source: "pinned",
+          pinnedRemoteRef: options.pinnedRemoteRef,
         }),
+      ).toBe(true);
+      const inventoryProbe = dockerCaptureMock.mock.calls[2]?.[0] as string[];
+      expect(inventoryProbe).toEqual(
+        expect.arrayContaining([
+          options.pinnedRemoteRef,
+          expect.stringContaining("nemoclaw-python3.13-htmlparser-fix=3.13.5-2+deb13u4+nemoclaw1"),
+        ]),
       );
+    });
+  });
 
-      const platformDigest =
-        "sha256:c0c149ed03b3e8fcd3e395558b22e871cd27c9966ea6faf04c0d2b94d0a821b9";
-      const platformDigestRef = `ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@${platformDigest}`;
-      resolveSandboxBaseImageMock.mockReturnValue({
-        ref: platformDigestRef,
-        digest: platformDigest,
-        source: "pinned",
-        pinnedRemoteRef: trackedRef?.[1],
-        glibcVersion: "2.41",
-      });
-      expect(ensureAgentBaseImage(makeAgent({ dockerfilePath }))).toEqual({
-        imageTag: platformDigestRef,
-        built: false,
-      });
+  it("rejects a Hermes base that has MCP but lacks ACP", () => {
+    withMockedDocker(({ ensureAgentBaseImage, dockerCaptureMock, resolveSandboxBaseImageMock }) => {
+      ensureAgentBaseImage(makeAgent());
+      const options = resolveSandboxBaseImageMock.mock.calls[0]?.[0] as {
+        validateImage?: (imageRef: string) => boolean;
+      };
+      dockerCaptureMock.mockReturnValue("");
 
-      const wrongNamespaceRef = `ghcr.io/nvidia/nemoclaw/other-hermes-base@${platformDigest}`;
-      resolveSandboxBaseImageMock.mockReturnValue({
-        ref: wrongNamespaceRef,
-        digest: platformDigest,
-        source: "pinned",
-        pinnedRemoteRef: trackedRef?.[1],
-        glibcVersion: "2.41",
-      });
-      expect(() => ensureAgentBaseImage(makeAgent({ dockerfilePath }))).toThrow(
-        "Hermes final image does not accept base image ref",
-      );
-
-      resolveSandboxBaseImageMock.mockReturnValue({
-        ref: platformDigestRef,
-        digest: platformDigest,
-        source: "latest",
-        glibcVersion: "2.41",
-      });
-      expect(() => ensureAgentBaseImage(makeAgent({ dockerfilePath }))).toThrow(
-        "Hermes final image does not accept base image ref",
-      );
-
-      resolveSandboxBaseImageMock.mockReturnValue({
-        ref: platformDigestRef,
-        digest: platformDigest,
-        source: "pinned",
-        pinnedRemoteRef: `ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:${"2".repeat(64)}`,
-        glibcVersion: "2.41",
-      });
-      expect(() => ensureAgentBaseImage(makeAgent({ dockerfilePath }))).toThrow(
-        "Hermes final image does not accept base image ref",
-      );
-
-      const differentRef = `ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:${"0".repeat(64)}`;
-      resolveSandboxBaseImageMock.mockReturnValue({
-        ref: differentRef,
-        digest: `sha256:${"0".repeat(64)}`,
-        source: "source-sha",
-        glibcVersion: "2.41",
-      });
-      expect(() => ensureAgentBaseImage(makeAgent({ dockerfilePath }))).toThrow(
-        "Hermes final image does not accept base image ref",
+      expect(options.validateImage?.("hermes-base:mcp-only")).toBe(false);
+      expect(dockerCaptureMock).toHaveBeenLastCalledWith(
+        expect.arrayContaining([
+          "hermes-base:mcp-only",
+          expect.stringContaining("from acp_adapter.server import HermesACPAgent"),
+        ]),
+        { ignoreError: true, timeout: 20_000 },
       );
     });
   });
@@ -238,7 +236,7 @@ describe("agent base image provisioning", () => {
     }
   });
 
-  it("fails closed when no MCP-capable Hermes base image can be resolved", () => {
+  it("fails closed when no required-runtime-compatible Hermes base image can be resolved", () => {
     withMockedDocker(
       ({
         ensureAgentBaseImage,

@@ -9,11 +9,22 @@ import { CLI_NAME } from "../../cli/branding";
 import { GATEWAY_PORT } from "../../core/ports";
 import { resolveSandboxContainerOwner } from "../../domain/sandbox/container-owner";
 import { resolveGatewayPortFromName } from "../../onboard/gateway-binding";
+import type { PortablePodmanReadinessResult } from "../../onboard/experimental/portable-runtime-readiness";
+import type { RuntimeProviderSnapshotLifecycleState } from "../../onboard/runtime-provider/contract";
+import {
+  inspectPortableRuntimeReceiptReadiness,
+  type PortableRuntimeReceiptReadinessDeps,
+} from "../../onboard/experimental/portable-runtime-receipt-readiness";
 import * as registry from "../../state/registry";
 import { getSandboxTargetGatewayName } from "./gateway-target";
 
 const DOCKER_TIMEOUT_MS = 3000;
 const PORT_PROBE_TIMEOUT_MS = 2000;
+
+const portableRuntimeFailures = new Map<
+  string,
+  Extract<PortablePodmanReadinessResult, { ok: false }>
+>();
 
 export type GatewayFailureLayer =
   | "docker_unreachable"
@@ -105,6 +116,13 @@ export async function classifyGatewayFailure(
   opts?: { runners?: GatewayFailureRunners },
 ): Promise<GatewayFailureResult> {
   const runners = opts?.runners ?? defaultRunners;
+
+  if (!isDockerBackedSandbox(sandboxName, registry.getSandbox)) {
+    return {
+      layer: "gateway_unreachable",
+      detail: `The OpenShell gateway for sandbox '${sandboxName}' is unreachable.`,
+    };
+  }
 
   if (!runners.dockerInfo()) {
     return {
@@ -205,6 +223,25 @@ function isValidDashboardPort(port: number | null | undefined): port is number {
   return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535;
 }
 
+export async function classifyObservedSandboxContainerFailure(
+  sandboxName: string,
+  lifecycleState: RuntimeProviderSnapshotLifecycleState,
+  dashboardPort: number | null | undefined,
+  portProbe: (port: number) => Promise<boolean> = defaultPortProbe,
+): Promise<SandboxContainerFailureResult | null> {
+  if (lifecycleState !== "stopped") return null;
+  if (isValidDashboardPort(dashboardPort) && (await portProbe(dashboardPort))) {
+    return {
+      layer: "sandbox_dashboard_port_conflict",
+      detail: `Sandbox '${sandboxName}' is stopped and dashboard port ${dashboardPort} is held by another process.`,
+    };
+  }
+  return {
+    layer: "sandbox_container_stopped",
+    detail: `Sandbox '${sandboxName}' exists but is not running.`,
+  };
+}
+
 export async function classifySandboxContainerFailure(
   sandboxName: string,
   opts: {
@@ -241,20 +278,15 @@ export async function classifySandboxContainerFailure(
 
 type SandboxDriverLookup = (name: string) => { openshellDriver?: string | null } | null | undefined;
 
-// Drivers whose sandbox runtime does NOT live in the local Docker daemon. Only
-// `vm` qualifies: the NemoClaw gateway always runs as a local Docker
-// `openshell-cluster-<gateway>` container (see classifyGatewayFailure), so the
-// `docker` driver and the `kubernetes`/k3s driver (k3s-in-Docker, or Docker
-// Desktop's Kubernetes — selected by `isLinuxDockerDriverGatewayEnabled()` for
-// non-Linux/non-arm64 hosts) both depend on a reachable local Docker daemon. A
-// `vm` sandbox runs in a real VM with no local Docker daemon, so a failing
-// `docker info` is normal and must not trigger the outage preflight.
-const NON_DOCKER_DRIVERS = new Set(["vm"]);
+// Drivers whose sandbox runtime does not live in the local Docker daemon.
+// Kubernetes remains Docker-backed on the supported legacy deployment paths;
+// native Podman and VM sandboxes must never enter the Docker outage probe.
+const NON_DOCKER_DRIVERS = new Set(["podman", "vm"]);
 
 /**
- * Whether a sandbox's runtime depends on the local Docker daemon. Only the
- * explicit `vm` driver is excluded. The `docker` and `kubernetes` drivers are
- * Docker-backed, and legacy/recovered registry entries that predate
+ * Whether a sandbox's runtime depends on the local Docker daemon. Native
+ * Podman and VM drivers are excluded. The `docker` and `kubernetes` drivers
+ * are Docker-backed, and legacy/recovered registry entries that predate
  * `openshellDriver` metadata (field omitted/null) are also treated as
  * Docker-backed so the outage guard still protects the Linux/Docker sandboxes
  * #4428 targets — the historical default driver was Docker. The narrow cost is
@@ -264,7 +296,7 @@ const NON_DOCKER_DRIVERS = new Set(["vm"]);
  */
 function isDockerBackedSandbox(sandboxName: string, getSandbox: SandboxDriverLookup): boolean {
   const driver = getSandbox(sandboxName)?.openshellDriver;
-  return !(typeof driver === "string" && NON_DOCKER_DRIVERS.has(driver.toLowerCase()));
+  return !(typeof driver === "string" && NON_DOCKER_DRIVERS.has(driver.trim().toLowerCase()));
 }
 
 /**
@@ -272,17 +304,32 @@ function isDockerBackedSandbox(sandboxName: string, getSandbox: SandboxDriverLoo
  * `docker_unreachable` layer of {@link classifyGatewayFailure}). Sandbox
  * commands use this as a fast preflight so a transient Docker daemon outage is
  * classified as a host runtime problem rather than a stuck sandbox phase or a
- * connect timeout (#4428). Returns `false` for VM sandboxes so they are never
- * misclassified. `docker info` is a `spawnSync` call, so this stays synchronous
- * and can run from non-async call sites such as `logs` and `policy-list`.
+ * connect timeout (#4428). Returns `false` for native Podman and VM sandboxes
+ * so they are never misclassified. `docker info` is a `spawnSync` call, so this
+ * stays synchronous and can run from non-async call sites such as `logs` and
+ * `policy-list`.
  */
 export function isDockerRuntimeDown(
   sandboxName: string,
   opts?: {
     runners?: Pick<GatewayFailureRunners, "dockerInfo">;
     getSandbox?: SandboxDriverLookup;
+    portableLifecycle?: PortableRuntimeReceiptReadinessDeps;
   },
 ): boolean {
+  const portable = inspectPortableRuntimeReceiptReadiness(sandboxName, opts?.portableLifecycle);
+  if (portable) {
+    if (portable.ok) {
+      portableRuntimeFailures.delete(sandboxName);
+      console.log(
+        `  Portable Podman readiness: ${portable.timing.mode}; activation ${String(portable.timing.activationMs)} ms; API ${String(portable.timing.apiMs)} ms; total ${String(portable.timing.totalMs)} ms.`,
+      );
+      return false;
+    }
+    portableRuntimeFailures.set(sandboxName, portable);
+    return true;
+  }
+  portableRuntimeFailures.delete(sandboxName);
   const getSandbox = opts?.getSandbox ?? registry.getSandbox;
   if (!isDockerBackedSandbox(sandboxName, getSandbox)) return false;
   const probe = opts?.runners?.dockerInfo ?? defaultRunners.dockerInfo;
@@ -302,6 +349,38 @@ export function printDockerRuntimeDownGuidance(
 ): void {
   const writer = opts.writer ?? console.error;
   const retryCommand = opts.retryCommand ?? "status";
+  const portable = portableRuntimeFailures.get(sandboxName);
+  portableRuntimeFailures.delete(sandboxName);
+  if (portable) {
+    writer(`  Failure stage: ${portable.stage} — ${portable.detail}`);
+    if (portable.socketPath) writer(`  Recorded socket: ${portable.socketPath}`);
+    writer(
+      `  Portable Podman readiness (${portable.timing.mode}): activation ${String(portable.timing.activationMs)} ms; API ${String(portable.timing.apiMs)} ms; total ${String(portable.timing.totalMs)} ms.`,
+    );
+    writer(
+      `  The receipt-owned Podman endpoint for sandbox '${sandboxName}' is not ready; no Docker or named-connection fallback was used.`,
+    );
+    writer("  Recovery:");
+    if (!portable.socketPath) {
+      if (portable.recovery === "current-user-authority") {
+        writer(
+          "    1. Run NemoClaw as the user who created the portable state, or rerun portable onboarding as the current user.",
+        );
+      } else {
+        writer(
+          `    1. Rerun portable onboarding: ${CLI_NAME} onboard --experimental-profile portable`,
+        );
+      }
+      writer(`    2. Retry: ${CLI_NAME} ${sandboxName} ${retryCommand}`);
+      return;
+    }
+    writer(
+      "    1. Check the reported readiness stage and the current user's Podman socket service.",
+    );
+    writer("    2. Confirm the recorded endpoint returns a real Podman server version.");
+    writer(`    3. Retry: ${CLI_NAME} ${sandboxName} ${retryCommand}`);
+    return;
+  }
   writer(`  ${getLayerHeader("docker_unreachable")}`);
   writer(
     `  The Docker daemon is not reachable, so sandbox '${sandboxName}' cannot be verified or started.`,

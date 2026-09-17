@@ -3,21 +3,19 @@
 
 import Ajv2020, { type AnySchema } from "ajv/dist/2020.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import systemReadinessSchema from "../../../schemas/system-readiness.schema.json" with {
-  type: "json",
-};
+import systemReadinessSchema from "../../../schemas/system-readiness.schema.json" with { type: "json" };
 import type { SystemReadinessReport } from "../../lib/readiness/types";
 
 const mocks = vi.hoisted(() => ({
   createProductionGatewayReadinessDependencies: vi.fn(),
-  createPublicReadinessReport: vi.fn(),
+  createPublicHostProbeReadinessReport: vi.fn(),
   createSystemReadinessReport: vi.fn(),
   getBuildIdentity: vi.fn(),
   renderReadinessReport: vi.fn(),
 }));
 
 vi.mock("../../lib/readiness/index", () => ({
-  createPublicReadinessReport: mocks.createPublicReadinessReport,
+  createPublicHostProbeReadinessReport: mocks.createPublicHostProbeReadinessReport,
   createSystemReadinessReport: mocks.createSystemReadinessReport,
   renderReadinessReport: mocks.renderReadinessReport,
 }));
@@ -87,7 +85,7 @@ describe("host probe command (#7412)", () => {
     });
     mocks.createProductionGatewayReadinessDependencies.mockReturnValue(gatewayDependencies);
     mocks.createSystemReadinessReport.mockResolvedValue(report(READINESS_OUTCOMES[0]));
-    mocks.createPublicReadinessReport.mockImplementation((value) => value);
+    mocks.createPublicHostProbeReadinessReport.mockImplementation((value) => value);
     mocks.renderReadinessReport.mockReturnValue("System readiness: supported");
   });
 
@@ -131,7 +129,7 @@ describe("host probe command (#7412)", () => {
   it("uses one readiness report for human output (#7412)", async () => {
     const publicReport = report(READINESS_OUTCOMES[0]);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    mocks.createPublicReadinessReport.mockReturnValueOnce(publicReport);
+    mocks.createPublicHostProbeReadinessReport.mockReturnValueOnce(publicReport);
 
     await HostProbeCommand.run([], process.cwd());
 
@@ -143,7 +141,7 @@ describe("host probe command (#7412)", () => {
       { gateway: gatewayDependencies },
     );
     expect(mocks.createProductionGatewayReadinessDependencies).toHaveBeenCalledOnce();
-    expect(mocks.createPublicReadinessReport).toHaveBeenCalledWith(
+    expect(mocks.createPublicHostProbeReadinessReport).toHaveBeenCalledWith(
       await mocks.createSystemReadinessReport.mock.results[0]?.value,
     );
     expect(mocks.renderReadinessReport).toHaveBeenCalledWith(publicReport);
@@ -158,7 +156,7 @@ describe("host probe command (#7412)", () => {
 
     expect(mocks.createSystemReadinessReport).toHaveBeenCalledTimes(2);
     expect(mocks.createProductionGatewayReadinessDependencies).toHaveBeenCalledTimes(2);
-    expect(mocks.createPublicReadinessReport).toHaveBeenCalledTimes(2);
+    expect(mocks.createPublicHostProbeReadinessReport).toHaveBeenCalledTimes(2);
     expect(mocks.renderReadinessReport).toHaveBeenCalledTimes(1);
   });
 });

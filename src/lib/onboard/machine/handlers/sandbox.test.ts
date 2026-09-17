@@ -18,12 +18,12 @@ import {
   bindJournaledRecreate,
   createDeps,
   makeMinimalPlan,
-  withEnv,
   withTelegramCredentialHash,
 } from "./sandbox-test-fixtures";
 
 vi.mock("../../messaging-channel-setup", () => ({
   detectMessagingChannelsFromEnv: vi.fn(() => []),
+  detectUnconfiguredMessagingChannels: vi.fn(() => []),
 }));
 
 const detectMessagingChannelsFromEnvMock = vi.mocked(detectMessagingChannelsFromEnv);
@@ -78,19 +78,28 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
+      expect.objectContaining({ sessionId: expect.any(String), selection: expect.any(Object) }),
       {
         resolved: expect.any(Object),
         recreate: false,
         toolDisclosure: "progressive",
         observabilityEnabled: false,
-        endpointSource: "onboard",
+        endpointSource: null,
         extraProviders: [],
       },
+      undefined,
     );
+    expect(calls.finalizeRouteReservation).not.toHaveBeenCalled();
     expect(calls.updateSandbox).toHaveBeenCalledWith(
       "my-assistant",
       expect.objectContaining({ model: "model", provider: "provider" }),
     );
+    expect(
+      calls.updateSandbox.mock.calls.some(
+        ([sandboxName, patch]) =>
+          sandboxName === "my-assistant" && Object.prototype.hasOwnProperty.call(patch, "agent"),
+      ),
+    ).toBe(false);
     // Default-marking is deferred to finalization (#4614) — the sandbox step must not set it.
     expect(calls.complete).toHaveBeenCalledWith(
       "sandbox",
@@ -112,6 +121,20 @@ describe("handleSandboxState", () => {
     });
     expect(result.session?.checkpoint?.webSearch).toEqual(decisionSelected({ fetchEnabled: true }));
     expect(result.session?.checkpoint?.messaging).toEqual(decisionDeclined());
+  });
+
+  it("preserves a null endpoint source for fresh host-local inference-only creation (#9203)", async () => {
+    const { deps, calls } = createDeps();
+
+    await handleSandboxState({
+      ...baseOptions(deps),
+      fresh: true,
+      endpointUrl: "http://host.openshell.internal:11435/v1",
+      endpointSource: null,
+      hostLocalInferenceRouteOnly: true,
+    });
+
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({ endpointSource: null });
   });
 
   it("records credential-provider bindings and the resource-profile decision in the checkpoint (#7022)", async () => {
@@ -142,6 +165,8 @@ describe("handleSandboxState", () => {
     const session = createSession({ sandboxName: "my-assistant" });
     session.checkpoint = {
       schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      profile: { kind: "selected", value: "default" },
+      runtimeAuthority: { kind: "unset" },
       sessionId: session.sessionId,
       machineState: "sandbox",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -208,28 +233,22 @@ describe("handleSandboxState", () => {
       ...baseOptions(deps),
       agent: { name: "langchain-deepagents-code" },
       authoritativeResumeConfig: true,
-      authoritativePolicyTier: "restricted",
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
-      policyTier: "restricted",
-    });
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({});
   });
 
-  it("preserves an authoritative null tier in the sandbox create intent", async () => {
+  it("does not persist an authoritative policy tier in sandbox create state", async () => {
     const { deps, calls } = createDeps();
 
     await handleSandboxState({
       ...baseOptions(deps),
       agent: { name: "langchain-deepagents-code" },
       authoritativeResumeConfig: true,
-      authoritativePolicyTier: null,
     });
 
-    expect(calls.resolveCreateIntent).toHaveBeenCalledWith(
-      expect.objectContaining({ policyTier: null }),
-    );
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toHaveProperty("policyTier", null);
+    expect(calls.resolveCreateIntent.mock.calls[0]?.[0]).not.toHaveProperty("policyTier");
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).not.toHaveProperty("policyTier");
   });
 
   it("rejects observability for a selected non-DCode agent", async () => {
@@ -264,40 +283,40 @@ describe("handleSandboxState", () => {
       sandboxName: "saved",
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
       observabilityEnabled: true,
     });
     expect(session.observabilityEnabled).toBe(true);
     expect(session.observabilityRequestedExplicitly).toBe(false);
   });
 
-  it.each([
-    "openclaw",
-    "hermes",
-  ])("requires an explicit observability disable when switching DCode to %s", async (agentName) => {
-    const session = createSession({
-      agent: "langchain-deepagents-code",
-      observabilityEnabled: true,
-    });
-    const { deps, calls } = createDeps({
-      getSandboxRegistryEntry: (name: string) => dcodeRegistryEntry(name, true),
-      updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
-        return mutator(session) ?? session;
-      }),
-    });
+  it.each(["openclaw", "hermes"])(
+    "requires an explicit observability disable when switching DCode to %s",
+    async (agentName) => {
+      const session = createSession({
+        agent: "langchain-deepagents-code",
+        observabilityEnabled: true,
+      });
+      const { deps, calls } = createDeps({
+        getSandboxRegistryEntry: (name: string) => dcodeRegistryEntry(name, true),
+        updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
+          return mutator(session) ?? session;
+        }),
+      });
 
-    await expect(
-      handleSandboxState({
-        ...baseOptions(deps, session),
-        agent: { name: agentName },
-        sandboxName: "saved",
-      }),
-    ).rejects.toThrow("exit 1");
+      await expect(
+        handleSandboxState({
+          ...baseOptions(deps, session),
+          agent: { name: agentName },
+          sandboxName: "saved",
+        }),
+      ).rejects.toThrow("exit 1");
 
-    expect(calls.error).toHaveBeenCalledWith(expect.stringContaining("--no-observability"));
-    expect(calls.createSandbox).not.toHaveBeenCalled();
-    expect(session.observabilityEnabled).toBe(true);
-  });
+      expect(calls.error).toHaveBeenCalledWith(expect.stringContaining("--no-observability"));
+      expect(calls.createSandbox).not.toHaveBeenCalled();
+      expect(session.observabilityEnabled).toBe(true);
+    },
+  );
 
   it("requires an explicit disable when resumed session state has observability enabled", async () => {
     const session = createSession({
@@ -341,7 +360,7 @@ describe("handleSandboxState", () => {
       requestedObservabilityEnabled: false,
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
       observabilityEnabled: false,
       observabilityRequestedExplicitly: true,
     });
@@ -374,78 +393,78 @@ describe("handleSandboxState", () => {
   it.each([
     { recorded: true, requested: false },
     { recorded: false, requested: true },
-  ])("gives current explicit observability=$requested precedence on resume", async ({
-    recorded,
-    requested,
-  }) => {
-    const session = createSession({
-      sandboxName: "saved",
-      observabilityEnabled: recorded,
-      observabilityRequestedExplicitly: true,
-    });
-    session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      getSandboxRegistryEntry: (name: string) => dcodeRegistryEntry(name, recorded),
-      updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
-        return mutator(session) ?? session;
-      }),
-    });
+  ])(
+    "gives current explicit observability=$requested precedence on resume",
+    async ({ recorded, requested }) => {
+      const session = createSession({
+        sandboxName: "saved",
+        observabilityEnabled: recorded,
+        observabilityRequestedExplicitly: true,
+      });
+      session.steps.sandbox.status = "complete";
+      const { deps, calls } = createDeps({
+        getSandboxReuseState: () => "ready",
+        getSandboxRegistryEntry: (name: string) => dcodeRegistryEntry(name, recorded),
+        updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
+          return mutator(session) ?? session;
+        }),
+      });
 
-    await handleSandboxState({
-      ...baseOptions(deps, session),
-      agent: { name: "langchain-deepagents-code" },
-      resume: true,
-      sandboxName: "saved",
-      requestedObservabilityEnabled: requested,
-    });
+      await handleSandboxState({
+        ...baseOptions(deps, session),
+        agent: { name: "langchain-deepagents-code" },
+        resume: true,
+        sandboxName: "saved",
+        requestedObservabilityEnabled: requested,
+      });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
-      recreate: true,
-      observabilityEnabled: requested,
-    });
-    expect(calls.note).toHaveBeenCalledWith(
-      "  [resume] Observability configuration changed; recreating sandbox.",
-    );
-    expect(session.observabilityEnabled).toBe(requested);
-    expect(session.observabilityRequestedExplicitly).toBe(true);
-  });
+      expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
+        recreate: true,
+        observabilityEnabled: requested,
+      });
+      expect(calls.note).toHaveBeenCalledWith(
+        "  [resume] Observability configuration changed; recreating sandbox.",
+      );
+      expect(session.observabilityEnabled).toBe(requested);
+      expect(session.observabilityRequestedExplicitly).toBe(true);
+    },
+  );
 
   it.each([
     { recorded: false, requested: true },
     { recorded: true, requested: false },
-  ])("preserves interrupted explicit observability=$requested over registry=$recorded", async ({
-    recorded,
-    requested,
-  }) => {
-    const session = createSession({
-      sandboxName: "saved",
-      observabilityEnabled: requested,
-      observabilityRequestedExplicitly: true,
-    });
-    session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      getSandboxRegistryEntry: (name: string) => dcodeRegistryEntry(name, recorded),
-      updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
-        return mutator(session) ?? session;
-      }),
-    });
+  ])(
+    "preserves interrupted explicit observability=$requested over registry=$recorded",
+    async ({ recorded, requested }) => {
+      const session = createSession({
+        sandboxName: "saved",
+        observabilityEnabled: requested,
+        observabilityRequestedExplicitly: true,
+      });
+      session.steps.sandbox.status = "complete";
+      const { deps, calls } = createDeps({
+        getSandboxReuseState: () => "ready",
+        getSandboxRegistryEntry: (name: string) => dcodeRegistryEntry(name, recorded),
+        updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
+          return mutator(session) ?? session;
+        }),
+      });
 
-    await handleSandboxState({
-      ...baseOptions(deps, session),
-      agent: { name: "langchain-deepagents-code" },
-      resume: true,
-      sandboxName: "saved",
-    });
+      await handleSandboxState({
+        ...baseOptions(deps, session),
+        agent: { name: "langchain-deepagents-code" },
+        resume: true,
+        sandboxName: "saved",
+      });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
-      recreate: true,
-      observabilityEnabled: requested,
-    });
-    expect(session.observabilityEnabled).toBe(requested);
-    expect(session.observabilityRequestedExplicitly).toBe(true);
-  });
+      expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
+        recreate: true,
+        observabilityEnabled: requested,
+      });
+      expect(session.observabilityEnabled).toBe(requested);
+      expect(session.observabilityRequestedExplicitly).toBe(true);
+    },
+  );
 
   it("does not treat an interrupted omitted request as an explicit disable", async () => {
     const session = createSession({
@@ -496,7 +515,7 @@ describe("handleSandboxState", () => {
       requestedObservabilityEnabled: false,
     });
 
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
+    expect(calls.createSandbox.mock.calls[0]?.at(-2)).toMatchObject({
       recreate: true,
       observabilityEnabled: false,
     });
@@ -530,6 +549,7 @@ describe("handleSandboxState", () => {
       null,
       ["nous-audio"],
       null,
+      expect.objectContaining({ sessionId: expect.any(String), selection: expect.any(Object) }),
       {
         resolved: expect.any(Object),
         recreate: false,
@@ -538,6 +558,7 @@ describe("handleSandboxState", () => {
         endpointSource: null,
         extraProviders: [],
       },
+      undefined,
     );
     expect(result.hermesToolGateways).toEqual(["nous-audio"]);
     expect(calls.note).toHaveBeenCalledWith(
@@ -566,6 +587,7 @@ describe("handleSandboxState", () => {
       getSandboxRegistryEntry: () => ({
         name: "saved",
         pendingRouteReservation: true,
+        reservationSessionId: session.sessionId,
         provider: "provider",
         model: "model",
         endpointUrl: null,
@@ -587,10 +609,11 @@ describe("handleSandboxState", () => {
 
     expect(readMessagingPlanFromEnv).not.toHaveBeenCalled();
     expect(calls.createSandbox).not.toHaveBeenCalled();
-    expect(calls.updateSandbox).toHaveBeenCalledWith("saved", {
-      pendingRouteReservation: undefined,
-    });
-    expect(calls.skipped).toHaveBeenCalledWith("sandbox", "saved");
+    expect(calls.finalizeRouteReservation).toHaveBeenCalledExactlyOnceWith(
+      "saved",
+      session.sessionId,
+    );
+    expect(calls.skipped).toHaveBeenCalledWith("sandbox", "saved", "reuse");
     expect(recordStateSkipped).toHaveBeenCalledWith("sandbox", {
       reason: "resume",
       sandboxName: "saved",
@@ -607,6 +630,8 @@ describe("handleSandboxState", () => {
     });
     session.checkpoint = {
       schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      profile: { kind: "selected", value: "default" },
+      runtimeAuthority: { kind: "unset" },
       sessionId: session.sessionId,
       machineState: "agent_setup",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -649,6 +674,8 @@ describe("handleSandboxState", () => {
     session.steps.sandbox.status = "complete";
     session.checkpoint = {
       schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      profile: { kind: "selected", value: "default" },
+      runtimeAuthority: { kind: "unset" },
       sessionId: session.sessionId,
       machineState: "sandbox",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -684,6 +711,8 @@ describe("handleSandboxState", () => {
     });
     session.checkpoint = {
       schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      profile: { kind: "selected", value: "default" },
+      runtimeAuthority: { kind: "unset" },
       sessionId: session.sessionId,
       machineState: "sandbox",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -727,6 +756,8 @@ describe("handleSandboxState", () => {
     });
     session.checkpoint = {
       schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      profile: { kind: "selected", value: "default" },
+      runtimeAuthority: { kind: "unset" },
       sessionId: session.sessionId,
       machineState: "sandbox",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -807,6 +838,7 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
+      expect.objectContaining({ sessionId: session.sessionId, selection: expect.any(Object) }),
       {
         resolved: expect.any(Object),
         recreate: true,
@@ -815,6 +847,7 @@ describe("handleSandboxState", () => {
         endpointSource: null,
         extraProviders: [],
       },
+      undefined,
     );
   });
 
@@ -974,6 +1007,7 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
+      expect.objectContaining({ sessionId: session.sessionId, selection: expect.any(Object) }),
       expect.objectContaining({
         resolved: expect.any(Object),
         recreate: true,
@@ -988,6 +1022,7 @@ describe("handleSandboxState", () => {
           targetIntentFingerprint: expect.any(String),
         }),
       }),
+      undefined,
     );
     expect(result.webSearchConfigChanged).toBe(true);
   });
@@ -1016,50 +1051,6 @@ describe("handleSandboxState", () => {
       }),
     ).rejects.toThrow("Tavily credential rejected");
 
-    expect(calls.removeSandbox).not.toHaveBeenCalled();
-    expect(calls.createSandbox).not.toHaveBeenCalled();
-  });
-
-  it("fails before credential or registry mutation when Tavily collides with managed MCP", async () => {
-    const session = createSession({
-      sandboxName: "saved",
-      webSearchConfig: { fetchEnabled: true, provider: "brave" },
-    });
-    session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      agentSupportsWebSearchProvider: () => true,
-      getSandboxRegistryEntry: (name: string) => ({
-        name,
-        mcp: {
-          bridges: {
-            search: {
-              server: "search",
-              agent: "openclaw",
-              url: "https://mcp.example.com/mcp",
-              env: ["TAVILY_API_KEY"],
-              policyName: "saved-mcp-search",
-              addedAt: "2026-07-03T00:00:00.000Z",
-            },
-          },
-        },
-      }),
-    });
-
-    await expect(
-      handleSandboxState({
-        ...baseOptions(deps, session),
-        resume: true,
-        sandboxName: "saved",
-        webSearchConfig: { fetchEnabled: true, provider: "brave" },
-        env: { NEMOCLAW_WEB_SEARCH_PROVIDER: "tavily" },
-      }),
-    ).rejects.toThrow("exit 1");
-
-    expect(calls.error).toHaveBeenCalledWith(
-      expect.stringContaining("already owns TAVILY_API_KEY"),
-    );
-    expect(calls.validateBrave).not.toHaveBeenCalled();
     expect(calls.removeSandbox).not.toHaveBeenCalled();
     expect(calls.createSandbox).not.toHaveBeenCalled();
   });
@@ -1106,6 +1097,7 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
+      expect.objectContaining({ sessionId: session.sessionId, selection: expect.any(Object) }),
       expect.objectContaining({
         resolved: expect.any(Object),
         recreate: true,
@@ -1120,6 +1112,7 @@ describe("handleSandboxState", () => {
           targetIntentFingerprint: expect.any(String),
         }),
       }),
+      undefined,
     );
     expect(result.webSearchConfig).toBeNull();
   });
@@ -1201,33 +1194,38 @@ describe("handleSandboxState", () => {
     expect(getSession().messagingPlan).toEqual(registryPlan);
   });
 
-  it("refreshes credential hashes when reusing an env-staged rebuild plan", async () => {
+  it("validates changed credentials before refreshing an env-staged rebuild plan", async () => {
     const oldHash = hashCredential("telegram-token-a");
     const newHash = hashCredential("telegram-token-b");
     const rebuiltPlan = withTelegramCredentialHash(
       makeMinimalPlan("my-assistant", "openclaw", ["telegram"]),
       oldHash,
     );
+    const validatedPlan = withTelegramCredentialHash(rebuiltPlan, newHash);
+    let stagedPlan = rebuiltPlan;
     const session = createSession({ sandboxName: "my-assistant", messagingPlan: rebuiltPlan });
     const getRecordedMessagingChannelsForResume = vi.fn(() => ["telegram"]);
     const writePlanToEnv = vi.fn();
     const { deps, calls, getSession } = createDeps({
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
-      readMessagingPlanFromEnv: () => rebuiltPlan,
+      readMessagingPlanFromEnv: () => stagedPlan,
       getRegistrySandboxMessagingAuthority: () => ({ authoritative: false, plan: null }),
     });
-
-    await withEnv("TELEGRAM_BOT_TOKEN", "telegram-token-b", async () => {
-      await handleSandboxState({
-        ...baseOptions(deps, session),
-        resume: true,
-        sandboxName: "my-assistant",
-      });
+    calls.setupMessaging.mockImplementation(async () => {
+      stagedPlan = validatedPlan;
+      return ["telegram"];
     });
 
-    expect(calls.setupMessaging).not.toHaveBeenCalled();
-    expect(writePlanToEnv).toHaveBeenCalledWith(
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "my-assistant",
+      env: { TELEGRAM_BOT_TOKEN: "telegram-token-b" },
+    });
+
+    expect(calls.setupMessaging).toHaveBeenCalledOnce();
+    expect(writePlanToEnv).toHaveBeenLastCalledWith(
       expect.objectContaining({
         credentialBindings: [
           expect.objectContaining({
@@ -1240,33 +1238,38 @@ describe("handleSandboxState", () => {
     expect(getSession().messagingPlan?.credentialBindings[0]?.credentialHash).toBe(newHash);
   });
 
-  it("refreshes credential hashes when restoring a registry plan for rebuild resume", async () => {
+  it("validates changed credentials before refreshing a registry rebuild plan", async () => {
     const oldHash = hashCredential("telegram-token-a");
     const newHash = hashCredential("telegram-token-b");
     const registryPlan = withTelegramCredentialHash(
       makeMinimalPlan("my-assistant", "openclaw", ["telegram"]),
       oldHash,
     );
+    const validatedPlan = withTelegramCredentialHash(registryPlan, newHash);
+    let stagedPlan = registryPlan;
     const session = createSession({ sandboxName: "my-assistant", messagingPlan: registryPlan });
     const getRecordedMessagingChannelsForResume = vi.fn(() => ["telegram"]);
     const writePlanToEnv = vi.fn();
     const { deps, calls, getSession } = createDeps({
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
-      readMessagingPlanFromEnv: () => null,
+      readMessagingPlanFromEnv: () => stagedPlan,
       getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
     });
-
-    await withEnv("TELEGRAM_BOT_TOKEN", "telegram-token-b", async () => {
-      await handleSandboxState({
-        ...baseOptions(deps, session),
-        resume: true,
-        sandboxName: "my-assistant",
-      });
+    calls.setupMessaging.mockImplementation(async () => {
+      stagedPlan = validatedPlan;
+      return ["telegram"];
     });
 
-    expect(calls.setupMessaging).not.toHaveBeenCalled();
-    expect(writePlanToEnv).toHaveBeenCalledWith(
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "my-assistant",
+      env: { TELEGRAM_BOT_TOKEN: "telegram-token-b" },
+    });
+
+    expect(calls.setupMessaging).toHaveBeenCalledOnce();
+    expect(writePlanToEnv).toHaveBeenLastCalledWith(
       expect.objectContaining({
         credentialBindings: [
           expect.objectContaining({

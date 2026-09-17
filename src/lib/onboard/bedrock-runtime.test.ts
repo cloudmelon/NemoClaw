@@ -62,7 +62,7 @@ function createBedrockSetupHarness(
     credentialEnv: "COMPATIBLE_ANTHROPIC_API_KEY",
     isNonInteractive: () => false,
     runOpenshell: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
-    upsertProvider: vi.fn(() => ({ ok: true })),
+    upsertProvider: vi.fn(async () => ({ ok: true })),
     verifyInferenceRoute: vi.fn(),
     verifyOnboardInferenceSmoke,
     ensureAdapter: vi.fn(async () => ({
@@ -145,6 +145,8 @@ describe("Bedrock Runtime onboarding helper", () => {
       "COMPATIBLE_ANTHROPIC_API_KEY",
       "Other Anthropic-compatible endpoint API key",
       null,
+      null,
+      undefined,
     );
     expect(result).toEqual({
       action: "selected",
@@ -178,6 +180,8 @@ describe("Bedrock Runtime onboarding helper", () => {
       "COMPATIBLE_ANTHROPIC_API_KEY",
       "Other Anthropic-compatible endpoint API key",
       null,
+      null,
+      undefined,
     );
     expect(promptInputModel).not.toHaveBeenCalled();
     expect(result).toEqual({ action: "retry-selection" });

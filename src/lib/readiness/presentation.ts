@@ -4,6 +4,7 @@
 import { validateBuildIdentity } from "../core/version.js";
 import { redactForLog } from "../security/redact.js";
 import { sanitizeReadinessText } from "./sanitize.js";
+import { hasRemediableStorageConflict } from "./storage-remediation.js";
 import type {
   EvidenceScalar,
   ReadinessCapability,
@@ -34,10 +35,7 @@ const ENVIRONMENT_DETAIL_KEYS = new Set([
 ]);
 
 function bounded(value: string, maxLength: number): string {
-  return sanitizeReadinessText(
-    String(redactForLog(value)).replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1<REDACTED>@"),
-    maxLength,
-  );
+  return sanitizeReadinessText(String(redactForLog(value)), maxLength);
 }
 
 function scalar(value: EvidenceScalar): EvidenceScalar {
@@ -276,6 +274,23 @@ export function createPublicReadinessReport(
     qualifications: selectedQualifications.map(qualification),
     findings: selectedFindings.map(finding),
     evidence: selectedEvidence.map(evidence),
+  };
+}
+
+/** Apply the read-only host probe policy after the shared report is sanitized. */
+export function createPublicHostProbeReadinessReport(
+  report: Readonly<SystemReadinessReport>,
+): SystemReadinessReport {
+  const publicReport = createPublicReadinessReport(report);
+  if (!hasRemediableStorageConflict(publicReport)) return publicReport;
+
+  return {
+    ...publicReport,
+    status: "supported",
+    exitCode: 0,
+    findings: publicReport.findings.map((entry) =>
+      entry.id === "host.docker.storage_incompatible" ? { ...entry, severity: "warning" } : entry,
+    ),
   };
 }
 

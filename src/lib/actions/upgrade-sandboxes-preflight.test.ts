@@ -13,8 +13,6 @@ const mocks = vi.hoisted(() => ({
   getLatestBackup: vi.fn(),
   getVersion: vi.fn(),
   listSandboxes: vi.fn(),
-  parseLiveSandboxEntries: vi.fn(),
-  parseReadySandboxNames: vi.fn(),
   prompt: vi.fn(),
   shouldSkipUpgradeConfirmation: vi.fn(),
   splitRebuildableSandboxes: vi.fn(),
@@ -36,14 +34,10 @@ vi.mock("../openshell-sandbox-list", () => ({
   captureNamedGatewaySandboxListReadOnly: mocks.captureNamedGatewaySandboxListReadOnly,
   captureSandboxListWithGatewayPreflightOrExit: mocks.captureSandboxListWithGatewayPreflightOrExit,
 }));
-vi.mock("../runtime-recovery", () => ({
-  parseLiveSandboxEntries: mocks.parseLiveSandboxEntries,
-  parseReadySandboxNames: mocks.parseReadySandboxNames,
-}));
 vi.mock("../sandbox/version", () => ({ checkAgentVersion: mocks.checkAgentVersion }));
 vi.mock("../state/registry", () => ({
-  isRouteOnlySandboxReservation: (entry: { pendingRouteReservation?: true; createdAt?: string }) =>
-    entry.pendingRouteReservation === true && entry.createdAt === undefined,
+  isPublishedSandboxRegistration: (entry: { pendingRouteReservation?: true }) =>
+    entry.pendingRouteReservation !== true,
   listSandboxes: mocks.listSandboxes,
 }));
 vi.mock("../state/sandbox", () => ({ getLatestBackup: mocks.getLatestBackup }));
@@ -56,20 +50,15 @@ describe("upgrade-sandboxes gateway preflight adapter (#6237)", () => {
     vi.stubEnv("NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE", "");
     vi.spyOn(upgradeSandboxesDependencies, "getGatewayPort").mockReturnValue(8080);
     vi.spyOn(upgradeSandboxesDependencies, "rebuildSandbox").mockResolvedValue(undefined);
-    mocks.captureSandboxListWithGatewayPreflightOrExit.mockResolvedValue({
-      status: 0,
-      output: "alpha Ready",
-    });
-    mocks.captureNamedGatewaySandboxListReadOnly.mockReturnValue({
-      status: 0,
-      output: "alpha Ready",
-    });
+    const inventory = {
+      sandboxes: [{ name: "alpha", phase: null, readiness: "ready" as const }],
+    };
+    mocks.captureSandboxListWithGatewayPreflightOrExit.mockResolvedValue(inventory);
+    mocks.captureNamedGatewaySandboxListReadOnly.mockResolvedValue(inventory);
     mocks.getVersion.mockReturnValue("0.0.74");
     mocks.listSandboxes.mockReturnValue({
       sandboxes: [{ name: "alpha", provider: "nvidia-prod", model: "nemotron" }],
     });
-    mocks.parseLiveSandboxEntries.mockReturnValue([{ name: "alpha", phase: "Ready" }]);
-    mocks.parseReadySandboxNames.mockReturnValue(new Set(["alpha"]));
     mocks.classifyUpgradeableSandboxes.mockReturnValue({ stale: [], unknown: [] });
     mocks.shouldSkipUpgradeConfirmation.mockReturnValue(true);
     mocks.splitRebuildableSandboxes.mockReturnValue({ rebuildable: [], stopped: [] });
@@ -148,9 +137,7 @@ describe("upgrade-sandboxes gateway preflight adapter (#6237)", () => {
     await expect(upgradeSandboxes({ auto: true })).rejects.toThrow("process.exit(1)");
 
     const output = errorSpy.mock.calls.flat().join("\n");
-    for (const name of incompatibleNames) {
-      expect(output).toContain(JSON.stringify(name));
-    }
+    expect(incompatibleNames.every((name) => output.includes(JSON.stringify(name)))).toBe(true);
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(mocks.captureNamedGatewaySandboxListReadOnly).not.toHaveBeenCalled();
     expect(mocks.captureSandboxListWithGatewayPreflightOrExit).not.toHaveBeenCalled();

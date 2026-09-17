@@ -177,9 +177,7 @@ describe("plugin registration", () => {
 
     const bannerLines = output.split("\n").filter((line) => line.length > 0);
     expect(bannerLines.length).toBeGreaterThan(0);
-    for (const line of bannerLines) {
-      expect(line.startsWith("[gateway] ")).toBe(true);
-    }
+    expect(bannerLines.every((line) => line.startsWith("[gateway] "))).toBe(true);
   });
 
   it("falls back to onboard config when openclaw.json has no primary model", () => {
@@ -251,6 +249,20 @@ describe("before_tool_call secret scanner hook (#1233)", () => {
     });
     expect(result).toMatchObject({ block: true });
     expect((result as { blockReason: string }).blockReason).toContain("NVIDIA API key");
+  });
+
+  it("blocks write to an absolute named workspace containing an NVIDIA API key", () => {
+    const api = createMockApi();
+    const handler = getHookHandler(api);
+    const fakeKey = "nvapi-" + "abcdefghijklmnopqrstuvwxyz";
+    const result = handler({
+      toolName: "write",
+      params: {
+        file_path: "/sandbox/.openclaw/workspace-main/memory/2026-05-29.md",
+        content: `api key: ${fakeKey}`,
+      },
+    });
+    expect(result).toMatchObject({ block: true });
   });
 
   it("blocks edit to memory path containing secrets", () => {
@@ -392,28 +404,25 @@ describe("before_tool_call secret scanner hook (#1233)", () => {
     expect(result).toMatchObject({ block: true });
   });
 
-  it("blocks normalized relative memory paths when the host resolver is unavailable", () => {
+  it.each([
+    "./memory/2026-05-29.md",
+    "foo/../memory/2026-05-29.md",
+    "workspace-main/memory/2026-05-29.md",
+  ])("blocks normalized relative memory path %s when the host resolver is unavailable", (path) => {
     const api = createMockApi();
     (api.resolvePath as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
       undefined as unknown as string,
     );
     const handler = getHookHandler(api);
     const fakeKey = "nvapi-" + "abcdefghijklmnopqrstuvwxyz";
-
-    for (const path of [
-      "./memory/2026-05-29.md",
-      "foo/../memory/2026-05-29.md",
-      "workspace-main/memory/2026-05-29.md",
-    ]) {
-      const result = handler({
-        toolName: "write",
-        params: {
-          path,
-          content: `api key: ${fakeKey}`,
-        },
-      });
-      expect(result).toMatchObject({ block: true });
-    }
+    const result = handler({
+      toolName: "write",
+      params: {
+        path,
+        content: `api key: ${fakeKey}`,
+      },
+    });
+    expect(result).toMatchObject({ block: true });
   });
 });
 

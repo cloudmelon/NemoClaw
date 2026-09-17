@@ -11,6 +11,7 @@ import { addDarwinFcntlSealConstants } from "./darwin-fcntl-seal-fixture";
 export const agentDir = path.join(process.cwd(), "agents", "langchain-deepagents-code");
 export const patcher = path.join(agentDir, "patch-managed-deepagents-code.py");
 const packageFixtureDirs = new Set<string>();
+let cachedPatchedFixture: string | undefined;
 
 export function managedAutoApprovalPath(root: string): string {
   return path.join(root, "managed-auto-approval");
@@ -25,6 +26,10 @@ export function writeManagedAutoApproval(root: string, content: string, mode = 0
 
 export function managedReasoningEffortPath(root: string): string {
   return path.join(root, "managed-reasoning-effort");
+}
+
+export function managedUpstreamProviderPath(root: string): string {
+  return path.join(root, "managed-upstream-provider");
 }
 
 export function writeManagedReasoningEffort(root: string, content: string, mode = 0o444): string {
@@ -49,11 +54,24 @@ export function writeFixtureFile(root: string, relativePath: string, content: st
   fs.writeFileSync(target, `${content.trim()}\n`, "utf8");
 }
 
-export function createPackageFixture(version = "0.1.34"): string {
+export function createPackageFixture(version = "0.1.55"): string {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dcode-patch-"));
   packageFixtureDirs.add(tempDir);
   const packageDir = path.join(tempDir, "deepagents_code");
   writeFixtureFile(packageDir, "__init__.py", '"""Test package."""');
+  writeFixtureFile(
+    packageDir,
+    "approval_mode.py",
+    `
+from enum import Enum
+
+
+class ApprovalMode(str, Enum):
+    MANUAL = "manual"
+    AUTO = "auto"
+    YOLO = "yolo"
+`,
+  );
   writeFixtureFile(
     tempDir,
     "httpx/__init__.py",
@@ -111,6 +129,16 @@ class CloseError(NetworkError):
 
 
 class ProxyError(TransportError):
+    pass
+`,
+  );
+  writeFixtureFile(tempDir, "langgraph/__init__.py", '"""Test package."""');
+  writeFixtureFile(tempDir, "langgraph/pregel/__init__.py", '"""Test package."""');
+  writeFixtureFile(
+    tempDir,
+    "langgraph/pregel/remote.py",
+    `
+class RemoteException(Exception):
     pass
 `,
   );
@@ -211,6 +239,9 @@ class Parser:
             ),
             interpreter=(True if "--interpreter" in argv else None),
             auto_approve=any(arg in {"-y", "--auto-approve"} for arg in argv),
+            yolo="--yolo" in argv,
+            startup_mode="auto",
+            approval_mode="auto",
             acp="--acp" in argv,
             startup_cmd=("touch /tmp/unsafe" if any(arg.startswith("--startup") for arg in argv) else None),
             sandbox="docker",
@@ -272,7 +303,11 @@ def cli_main():
             )
         )
         raise SystemExit(exit_code)
-    print(f"managed-posture-ok auto_approve={args.auto_approve}")
+    print(
+        f"managed-posture-ok auto_approve={args.auto_approve} "
+        f"yolo={getattr(args, 'yolo', False)} "
+        f"startup_mode={args.startup_mode} approval_mode={args.approval_mode}"
+    )
 `,
   );
   writeFixtureFile(
@@ -294,18 +329,27 @@ def should_run_onboarding(state_dir=None):
     )
     .replace(
       "class DeepAgentsApp:\n",
-      `class _StatusBar:
+      `from deepagents_code.approval_mode import ApprovalMode
+
+
+class _StatusBar:
     def __init__(self):
         self.auto_approve = True
+        self.approval_mode = "yolo"
 
     def set_auto_approve(self, *, enabled):
         self.auto_approve = enabled
+
+    def set_approval_mode(self, mode):
+        self.approval_mode = mode
+        self.auto_approve = mode == "yolo"
 
 
 class _SessionState:
     def __init__(self):
         self.thread_id = "thread-1"
         self.auto_approve = True
+        self.approval_mode = ApprovalMode.YOLO
         self.approval_mode_key = "approval/thread-1"
 
 
@@ -314,7 +358,8 @@ class DeepAgentsApp:
     )
     .replace(
       "        self._auto_approve = True\n        self._status_bar = None\n        self._session_state = None\n",
-      `        self._auto_approve = True
+      `        self._approval_mode = ApprovalMode.YOLO
+        self._auto_approve = True
         self._status_bar = _StatusBar()
         self._session_state = _SessionState()
         self._agent = object()
@@ -329,15 +374,24 @@ class DeepAgentsApp:
     )
     .replace(
       "    async def _on_auto_approve_enabled(self):\n        self._auto_approve = True\n\n    async def action_toggle_auto_approve(self):\n        self._auto_approve = not self._auto_approve\n",
-      `    async def _on_auto_approve_enabled(self):
-        self._auto_approve = True
-        self._status_bar.set_auto_approve(enabled=True)
-        self._session_state.auto_approve = True
+      `    async def _set_approval_mode(self, target):
+        self._approval_mode = target
+        self._auto_approve = target is ApprovalMode.YOLO
+        self._status_bar.set_approval_mode(target.value)
+        self._session_state.approval_mode = target
+        self._session_state.auto_approve = self._auto_approve
+        return True
+
+    async def _on_auto_approve_enabled(self):
+        return await self._set_approval_mode(ApprovalMode.AUTO)
 
     async def action_toggle_auto_approve(self):
-        self._auto_approve = not self._auto_approve
-        self._status_bar.set_auto_approve(enabled=self._auto_approve)
-        self._session_state.auto_approve = self._auto_approve
+        target = (
+            ApprovalMode.AUTO
+            if self._approval_mode is ApprovalMode.MANUAL
+            else ApprovalMode.MANUAL
+        )
+        await self._set_approval_mode(target)
 
     async def _resume_thread(self, thread_id):
         if self.resume_should_fail:
@@ -460,6 +514,10 @@ def _fetch_with_redirects(url, *, timeout):
     `
 from __future__ import annotations
 
+from pathlib import Path
+
+DEFAULT_CONFIG_DIR = Path("/tmp")
+
 
 class ModelConfigError(RuntimeError):
     pass
@@ -574,10 +632,21 @@ def _normalize_path(raw_path, project_context, label):
   );
   writeFixtureFile(
     packageDir,
-    "hooks.py",
+    "hooks/__init__.py",
+    `
+from deepagents_code.hooks.legacy import dispatch_hook, _load_hooks, _run_single_hook
+
+__all__ = ["dispatch_hook", "_load_hooks", "_run_single_hook"]
+`,
+  );
+  writeFixtureFile(
+    packageDir,
+    "hooks/legacy.py",
     `
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 from typing import Any
 
@@ -585,12 +654,54 @@ _hooks_config = None
 
 
 def _load_hooks():
-    return [{"command": ["touch", "/tmp/unsafe-hook"]}]
+    global _hooks_config
+    if _hooks_config is None:
+        from deepagents_code.model_config import DEFAULT_CONFIG_DIR
+
+        path = DEFAULT_CONFIG_DIR / "hooks.json"
+        _hooks_config = json.loads(path.read_text()).get("hooks", []) if path.is_file() else []
+    return _hooks_config
 
 
 def _run_single_hook(command, event, payload_bytes):
     del event, payload_bytes
     subprocess.run(command, check=False)
+
+
+async def dispatch_hook(event, payload):
+    payload_bytes = json.dumps({"event": event, **payload}).encode()
+    for hook in _load_hooks():
+        if not hook.get("events") or event in hook["events"]:
+            await asyncio.to_thread(_run_single_hook, hook["command"], event, payload_bytes)
+`,
+  );
+  writeFixtureFile(
+    packageDir,
+    "hooks/manager.py",
+    `
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+
+class HooksManager:
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    @classmethod
+    def create(cls, *args, **kwargs):
+        del args, kwargs
+        return cls(True)
+
+    @classmethod
+    def inert(cls):
+        return cls(False)
+
+    def dispatch(self):
+        marker = os.environ.get("DCODE_FIXTURE_HOOK_MARKER")
+        if self.enabled and marker:
+            Path(marker).touch()
 `,
   );
   writeFixtureFile(
@@ -629,6 +740,9 @@ def _write_newline():
 
 async def _run_non_interactive_impl(*args, **kwargs):
     del args
+    from deepagents_code.hooks.manager import HooksManager
+
+    HooksManager.create().dispatch()
     if kwargs.get("message") == "fixture-json-task":
         return 0
     return kwargs
@@ -869,11 +983,21 @@ from types import SimpleNamespace
 
 class ApprovalMenu:
     def __init__(self):
+        self._is_auto_fallback = False
+        self._show_auto_option = True
+        self._options = self._build_options()
         self.decisions = []
         self.notifications = []
         self.app = SimpleNamespace(
             notify=lambda *args, **kwargs: self.notifications.append((args, kwargs))
         )
+
+    def _build_options(self):
+        return [
+            ("Approve (y)", "approve"),
+            ("Enable Auto for this thread (a)", "auto_approve_all"),
+            ("Reject (n)", "reject"),
+        ]
 
     def _handle_selection(self, option, *, reject_message=None):
         decision_map = {0: "approve", 1: "auto_approve_all", 2: "reject"}
@@ -926,6 +1050,9 @@ Version: ${version}
   const managedBaseUrlFile = path.join(tempDir, "managed-inference-base-url");
   fs.writeFileSync(managedBaseUrlFile, "https://inference.local/v1\n", "utf8");
   fs.chmodSync(managedBaseUrlFile, 0o444);
+  const managedUpstreamProviderFile = managedUpstreamProviderPath(tempDir);
+  fs.writeFileSync(managedUpstreamProviderFile, "nvidia-prod\n", "utf8");
+  fs.chmodSync(managedUpstreamProviderFile, 0o444);
   return tempDir;
 }
 
@@ -936,7 +1063,12 @@ export function cleanupPackageFixtures(): void {
   packageFixtureDirs.clear();
 }
 
-export function patchFixture(tempDir: string): void {
+export function cleanupCachedPatchedFixture(): void {
+  if (cachedPatchedFixture) fs.rmSync(cachedPatchedFixture, { recursive: true, force: true });
+  cachedPatchedFixture = undefined;
+}
+
+function runPatcher(tempDir: string): void {
   execFileSync("python3", [patcher], {
     env: { PATH: process.env.PATH, PYTHONPATH: tempDir },
   });
@@ -955,6 +1087,33 @@ export function patchFixture(tempDir: string): void {
       '"/usr/local/share/nemoclaw/dcode-reasoning-effort"',
       JSON.stringify(managedReasoningEffortPath(tempDir)),
     )
+    .replace(
+      '"/usr/local/share/nemoclaw/dcode-upstream-provider"',
+      JSON.stringify(managedUpstreamProviderPath(tempDir)),
+    )
     .replace("_MANAGED_FILE_OWNER_UID = 0", `_MANAGED_FILE_OWNER_UID = ${process.getuid?.() ?? 0}`);
   fs.writeFileSync(helperPath, helper, "utf8");
+}
+
+export function createPatchedPackageFixture(): string {
+  if (!cachedPatchedFixture) {
+    cachedPatchedFixture = createPackageFixture();
+    packageFixtureDirs.delete(cachedPatchedFixture);
+    runPatcher(cachedPatchedFixture);
+  }
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dcode-patched-"));
+  packageFixtureDirs.add(tempDir);
+  for (const name of fs.readdirSync(cachedPatchedFixture)) {
+    const target = path.join(tempDir, name);
+    fs.rmSync(target, { force: true, recursive: true });
+    fs.cpSync(path.join(cachedPatchedFixture, name), target, { recursive: true });
+  }
+  const helperPath = path.join(tempDir, "deepagents_code", "_nemoclaw_managed.py");
+  const helper = fs.readFileSync(helperPath, "utf8").replaceAll(cachedPatchedFixture, tempDir);
+  fs.writeFileSync(helperPath, helper, "utf8");
+  return tempDir;
+}
+
+export function patchFixture(tempDir: string): void {
+  runPatcher(tempDir);
 }

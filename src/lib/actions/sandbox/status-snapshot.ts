@@ -2,26 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { setTimeout as sleep } from "node:timers/promises";
+
 import {
   detectOpenShellStateRpcResultIssue,
   type OpenShellStateRpcIssue,
 } from "../../adapters/openshell/gateway-drift";
 import { captureOpenshellForStatus, isCommandTimeout } from "../../adapters/openshell/runtime";
 import { type AgentDefinition, getAgentRuntimeKind, loadAgent } from "../../agent/defs";
+import { retryUntilAsync } from "../../core/retry";
+
 import { withStdoutRedirectedToStderr } from "../../cli/stdout-guard";
-import type { CuaAppliedPolicyIdentity } from "../../cua/contract";
 import {
-  type CuaStateValidationDeps,
-  getObservedValidatedCuaState,
-  isCuaPublicStateEnabled,
-  type ObservedCuaInferenceRoute,
-} from "../../cua/state";
-import {
+  buildGatewayInferenceGetArgs,
+  getLlamaCppRouteDetails,
   type GatewayInference,
+  type LlamaCppRouteDetails,
   parseGatewayInference,
   planInferenceRouteReconcile,
   type RecordedInferenceRoute,
 } from "../../inference/config";
+import { inspectManagedLlamaCppOwnership } from "../../inference/llama-cpp/managed-state";
 import {
   type ProviderHealthProbeOptions,
   type ProviderHealthStatus,
@@ -33,24 +33,27 @@ import {
   normalizeDcodeAutoApprovalMode,
 } from "../../onboard/dcode-auto-approval";
 import { resolveSandboxGatewayName } from "../../onboard/gateway-binding";
-import { getBaselineExclusionRuntimeStatus } from "../../policy";
-import type { BaselineExclusionRuntimeStatus } from "../../policy/baseline-exclusion";
+import { getGatewayPresets } from "../../policy";
 import { redact } from "../../security/redact";
-import { parseSandboxPhase } from "../../state/gateway";
 import * as registry from "../../state/registry";
-import {
-  buildGatewayInferenceGetArgs,
-  canSandboxGatewayRouteRealign,
-} from "./connect-inference-gateway";
-import { classifyInferenceRouteFailureLabel } from "./connect-inference-route-probe";
+import { canSandboxGatewayRouteRealign } from "./connect-inference-gateway";
 import { getSandboxDockerRuntime } from "./docker-health";
 import type { SandboxGatewayState } from "./gateway-state";
 import { getReconciledSandboxGatewayState, getSandboxGatewayStateForStatus } from "./gateway-state";
-import { probeSandboxInferenceGatewayHealth } from "./inference-route-health";
+import {
+  buildSandboxInferenceRouteHealth,
+  isTransientInferenceInvocationFailure,
+  type ProbeSandboxInferenceInvocation,
+  probeSandboxInferenceGatewayHealth,
+  runSandboxInferenceInvocationProbe,
+} from "./inference-route-health";
 import {
   getSandboxStatusPreflight,
+  hasLegacyStatusRuntimeObservation,
+  resolveSandboxStatusPhase,
   type SandboxStatusFailureLayer,
   type SandboxStatusPreflightResult,
+  usesManagedProviderGateway,
   withoutTerminalPhasePreflight,
 } from "./status-preflight";
 import {
@@ -62,11 +65,13 @@ type ProbeProviderHealth = (
   provider: string,
   options?: ProviderHealthProbeOptions,
 ) => ProviderHealthStatus | null;
-type ProbeSandboxInferenceGatewayHealth = typeof probeSandboxInferenceGatewayHealth;
+type ProbeSandboxInferenceGatewayHealth = (
+  ...args: Parameters<typeof probeSandboxInferenceGatewayHealth>
+) => ReturnType<typeof probeSandboxInferenceGatewayHealth>;
 type DelayInferenceRecoveryProbe = (delayMs: number) => Promise<void>;
 
-const RECOVERED_INFERENCE_PROBE_ATTEMPTS = 3;
-const RECOVERED_INFERENCE_PROBE_DELAY_MS = 2_000;
+const INFERENCE_PROBE_ATTEMPTS = 3;
+const INFERENCE_PROBE_RETRY_DELAY_MS = 2_000;
 
 /**
  * Honest serving-process state while the self-report response and probe
@@ -110,15 +115,6 @@ export function maybeGetSandboxStatusInferenceHealth(
   );
 }
 
-function providerHealthDiagnostics(
-  providerHealth: ProviderHealthStatus | null,
-): ProviderHealthStatus[] {
-  if (!providerHealth) return [];
-  const { subprobes = [], ...primary } = providerHealth;
-  const labeledPrimary = primary.probeLabel ? primary : { ...primary, probeLabel: "upstream" };
-  return [labeledPrimary, ...subprobes];
-}
-
 /** True when the authoritative inference route must make status exit nonzero. */
 export function isInferenceHealthFailing(inferenceHealth: ProviderHealthStatus | null): boolean {
   return Boolean(inferenceHealth && (!inferenceHealth.probed || !inferenceHealth.ok));
@@ -155,35 +151,6 @@ export function normalizeSandboxStatusHostMounts(value: unknown): registry.Sandb
   });
 }
 
-function buildSandboxInferenceRouteHealth(
-  gateway: Awaited<ReturnType<ProbeSandboxInferenceGatewayHealth>>,
-  providerHealth: ProviderHealthStatus | null,
-): ProviderHealthStatus {
-  const endpoint = gateway?.endpoint ?? "https://inference.local/v1/models";
-  const diagnostics = providerHealthDiagnostics(providerHealth);
-  const routeHealth: ProviderHealthStatus = gateway
-    ? {
-        ok: gateway.ok,
-        probed: true,
-        providerLabel: "Inference route",
-        endpoint,
-        detail: gateway.detail,
-        ...(gateway.ok
-          ? { okLabel: "reachable" }
-          : {
-              failureLabel: classifyInferenceRouteFailureLabel(gateway.httpStatus),
-            }),
-      }
-    : {
-        ok: false,
-        probed: false,
-        providerLabel: "Inference route",
-        endpoint,
-        detail: `Could not probe ${endpoint} from inside the sandbox.`,
-      };
-  return diagnostics.length > 0 ? { ...routeHealth, subprobes: diagnostics } : routeHealth;
-}
-
 export interface SandboxStatusReport {
   schemaVersion: 1;
   name: string;
@@ -196,10 +163,13 @@ export interface SandboxStatusReport {
   model: string;
   provider: string;
   servingProfileProvenance: ServingProfileProvenance | null;
+  llamaCpp?: LlamaCppRouteDetails | null;
   recordedRoute: RecordedInferenceRoute | null;
   liveRoute: GatewayInference | null;
   routeDrift: SandboxStatusRouteDrift | null;
   phase: string | null;
+  /** Receipt-owned Hermes portable lifecycle phase when schema-5 authority is present. */
+  portableLifecyclePhase?: "pending" | "configuring" | "active";
   gatewayState: string;
   inferenceHealth: ProviderHealthStatus | null;
   rpcIssue: { kind: "image_drift" | "host_process_drift" | "protobuf_mismatch" } | null;
@@ -214,17 +184,8 @@ export interface SandboxStatusReport {
   openshellDriver: string;
   openshellVersion: string;
   policies: string[];
-  /** Current, validated, credential-free CUA candidate runtime readiness. */
-  cuaRuntime?: registry.SandboxEntry["cuaRuntimeReadiness"] | null;
-  /** Baseline network policy keys the operator has excluded, replayed on rebuild. */
-  baselineExclusions: string[];
-  /** Observed enforcement state for each recorded baseline exclusion. */
-  baselineExclusionStates: Array<{ key: string; status: BaselineExclusionRuntimeStatus }>;
-  /** Interrupted cross-system policy mutation that must be reconciled before rebuild. */
-  baselineExclusionTransition: {
-    operation: registry.BaselineExclusionTransitionOperation;
-    key: string;
-  } | null;
+  /** False when the live OpenShell policy could not be read or parsed. */
+  policiesAvailable: boolean;
   failureLayer: SandboxStatusFailureLayer | null;
   terminalRuntimeHealth: TerminalRuntimeOomProbeResult | null;
   /**
@@ -257,6 +218,7 @@ export interface SandboxStatusSnapshot {
   recordedRoute: RecordedInferenceRoute | null;
   liveRoute: GatewayInference | null;
   routeDrift: SandboxStatusRouteDrift | null;
+  llamaCpp: LlamaCppRouteDetails | null;
   inferenceHealth: ProviderHealthStatus | null;
   terminalRuntimeHealth: TerminalRuntimeOomProbeResult | null;
   servingProcessHealth: ServingProcessHealth | null;
@@ -306,15 +268,17 @@ export function resolveSandboxStatusAgent(agentName = "openclaw"): SandboxStatus
 
 type ReconcileSandboxGatewayState = (sandboxName: string) => Promise<SandboxGatewayState>;
 type ProbeTerminalRuntimeHealth = (sandboxName: string) => TerminalRuntimeOomProbeResult;
-type RecoverSandboxProcesses =
-  typeof import("./status/process-recovery")["checkAndRecoverSandboxProcesses"];
-type SandboxProcessRecoveryResult = ReturnType<RecoverSandboxProcesses>;
+type ProductionRecoverSandboxProcesses =
+  (typeof import("./status/process-recovery"))["checkAndRecoverSandboxProcesses"];
+type SandboxProcessRecoveryResult = Awaited<ReturnType<ProductionRecoverSandboxProcesses>>;
+type RecoverSandboxProcesses = (
+  ...args: Parameters<ProductionRecoverSandboxProcesses>
+) => Promise<SandboxProcessRecoveryResult>;
 
 type SandboxProcessRecoveryFailure = {
   layer:
     | "inspection"
     | "secret-boundary"
-    | "mcp-reconciliation"
     | "gateway-recovery"
     | "forward-recovery"
     | "recovery-error";
@@ -331,20 +295,21 @@ function loadRecoverSandboxProcesses(): RecoverSandboxProcesses {
 
 interface CollectSandboxStatusSnapshotDeps {
   getSandbox?: typeof registry.getSandbox;
-  observeCuaLiveInference?: (entry: registry.SandboxEntry) => ObservedCuaInferenceRoute;
-  observeCuaLiveAppliedPolicy?: (entry: registry.SandboxEntry) => CuaAppliedPolicyIdentity;
-  validateCuaRuntimeReadiness?: CuaStateValidationDeps["validateRuntimeReadiness"];
+  updateSandbox?: typeof registry.updateSandbox;
   listSandboxes?: typeof registry.listSandboxes;
   captureOpenshellForStatusImpl?: typeof captureOpenshellForStatus;
   probeProviderHealthImpl?: ProbeProviderHealth;
   probeSandboxInferenceGatewayHealthImpl?: ProbeSandboxInferenceGatewayHealth;
+  probeSandboxInferenceInvocationImpl?: ProbeSandboxInferenceInvocation;
   delayInferenceRecoveryProbe?: DelayInferenceRecoveryProbe;
   reportInferenceProbeError?: (message: string) => void;
+  reportInferenceProbeRetry?: (message: string) => void;
   probeTerminalRuntimeHealth?: ProbeTerminalRuntimeHealth;
   recoverSandboxProcesses?: RecoverSandboxProcesses;
   reconcile?: ReconcileSandboxGatewayState;
   getSandboxStatusPreflightImpl?: typeof getSandboxStatusPreflight;
-  getBaselineExclusionRuntimeStatus?: typeof getBaselineExclusionRuntimeStatus;
+  getGatewayPresets?: typeof getGatewayPresets;
+  inspectManagedLlamaCppOwnership?: typeof inspectManagedLlamaCppOwnership;
 }
 
 function sanitizedStatusDetail(error: unknown): string {
@@ -372,16 +337,6 @@ function processRecoveryFailure(
         "secretBoundaryReason" in result
           ? result.secretBoundaryReason
           : "the agent secret boundary refused recovery",
-      ),
-    };
-  }
-  if ("mcpReconciliationRefused" in result && result.mcpReconciliationRefused) {
-    return {
-      layer: "mcp-reconciliation",
-      detail: sanitizedStatusDetail(
-        "mcpReconciliationReason" in result
-          ? result.mcpReconciliationReason
-          : "MCP reconciliation refused recovery",
       ),
     };
   }
@@ -439,6 +394,33 @@ function reportInferenceProbeError(error: unknown, writer: (message: string) => 
   );
 }
 
+function reportInferenceProbeRetry(
+  gatewayChain: Awaited<ReturnType<ProbeSandboxInferenceGatewayHealth>>,
+  invocation: Awaited<ReturnType<typeof runSandboxInferenceInvocationProbe>> | null,
+  delayMs: number,
+  attempt: number,
+  writer: (message: string) => void,
+): void {
+  let reason = "route probe did not pass";
+  if (gatewayChain?.ok) {
+    reason = "request probe did not pass";
+    if (
+      invocation &&
+      !invocation.ok &&
+      invocation.httpStatus !== null &&
+      (invocation.httpStatus < 200 || invocation.httpStatus >= 300)
+    ) {
+      reason = `request returned HTTP ${invocation.httpStatus}`;
+    }
+  } else if (gatewayChain && gatewayChain.httpStatus > 0) {
+    reason = `route probe returned HTTP ${gatewayChain.httpStatus}`;
+  }
+  writer(
+    `  Inference ${reason}; retrying route and request in ${delayMs / 1_000}s ` +
+      `(attempt ${attempt + 1}/${INFERENCE_PROBE_ATTEMPTS})...`,
+  );
+}
+
 export async function collectSandboxStatusSnapshot(
   sandboxName: string,
   opts: {
@@ -447,14 +429,27 @@ export async function collectSandboxStatusSnapshot(
     deps?: CollectSandboxStatusSnapshotDeps;
   } = {},
 ): Promise<SandboxStatusSnapshot> {
+  const getSandbox =
+    opts.deps?.getSandbox ??
+    ((name: string) => {
+      const entry = registry.getSandbox(name);
+      return entry && registry.isPublishedSandboxRegistration(entry) ? entry : null;
+    });
+  const sb = getSandbox(sandboxName);
+  const initialPreflight =
+    opts.preflight ??
+    (sb?.stopped
+      ? await (opts.deps?.getSandboxStatusPreflightImpl ?? getSandboxStatusPreflight)(sb)
+      : undefined);
   const reconcile =
     opts.deps?.reconcile ??
     ((name: string) =>
       getReconciledSandboxGatewayState(name, {
         getState: getSandboxGatewayStateForStatus,
+        ...(initialPreflight?.intentionalStopConfirmed
+          ? { gatewayRecovery: "observe" as const }
+          : {}),
       }));
-  const getSandbox = opts.deps?.getSandbox ?? registry.getSandbox;
-  const sb = getSandbox(sandboxName);
   let lookup: SandboxGatewayState;
   try {
     lookup = await reconcile(sandboxName);
@@ -465,13 +460,33 @@ export async function collectSandboxStatusSnapshot(
       output: `  Could not probe live gateway state: ${message}`,
     };
   }
+  if (
+    sb?.stopped === true &&
+    lookup.state === "present" &&
+    (lookup.phase === "Ready" || lookup.phase === "Running") &&
+    !initialPreflight?.failure &&
+    !initialPreflight?.intentionalStopConfirmed &&
+    !registry.recordSandboxStopIntent(
+      sandboxName,
+      false,
+      opts.deps?.updateSandbox ?? registry.updateSandbox,
+    )
+  ) {
+    lookup = {
+      ...lookup,
+      state: "stop_intent_update_failed",
+      output: `  Sandbox '${sandboxName}' is running, but NemoClaw could not clear its stale intentional-stop record.`,
+    };
+  }
   const dockerRecovered = lookup.recoveredSandbox === true;
   const managedOpenClawDeliveryMustBeProven =
     lookup.state === "present" &&
-    sb?.openshellDriver === "docker" &&
+    sb !== null &&
+    usesManagedProviderGateway(sb) &&
     (sb.agent ?? "openclaw") === "openclaw" &&
-    parseSandboxPhase(lookup.output || "") === "Ready" &&
-    !opts.preflight?.failure;
+    lookup.phase === "Ready" &&
+    !initialPreflight?.failure &&
+    !initialPreflight?.intentionalStopConfirmed;
   let recoveredManagedGateway = false;
   if (
     lookup.state === "present" &&
@@ -482,7 +497,7 @@ export async function collectSandboxStatusSnapshot(
       // The managed gateway service can restart a Docker sandbox before status
       // runs. OpenShell then reports Ready without a recoveredSandbox marker,
       // while the OpenClaw gateway and host forward can still be absent.
-      const recovery = (opts.deps?.recoverSandboxProcesses ?? loadRecoverSandboxProcesses())(
+      const recovery = await (opts.deps?.recoverSandboxProcesses ?? loadRecoverSandboxProcesses())(
         sandboxName,
         {
           quiet: true,
@@ -508,15 +523,15 @@ export async function collectSandboxStatusSnapshot(
     }
   }
   const postRecoveryPreflight =
-    dockerRecovered && opts.preflight
+    dockerRecovered && initialPreflight
       ? await refreshPreflightAfterDockerRecovery(
           sb,
-          opts.preflight,
+          initialPreflight,
           opts.deps?.getSandboxStatusPreflightImpl ?? getSandboxStatusPreflight,
         )
       : undefined;
   const suppressInferenceProbe =
-    (postRecoveryPreflight ?? opts.preflight)?.suppressInferenceProbe ??
+    (postRecoveryPreflight ?? initialPreflight)?.suppressInferenceProbe ??
     opts.suppressInferenceProbe === true;
   let liveResult: Awaited<ReturnType<typeof captureOpenshellForStatus>> | null = null;
   let gatewayName: string | null = null;
@@ -532,7 +547,7 @@ export async function collectSandboxStatusSnapshot(
       liveResult = null;
     }
   }
-  const rpcIssue = liveResult ? detectOpenShellStateRpcResultIssue(liveResult) : null;
+  const rpcIssue = liveResult ? await detectOpenShellStateRpcResultIssue(liveResult) : null;
   if (rpcIssue) {
     return {
       sb,
@@ -543,6 +558,7 @@ export async function collectSandboxStatusSnapshot(
       recordedRoute: sb?.provider && sb.model ? { provider: sb.provider, model: sb.model } : null,
       liveRoute: null,
       routeDrift: null,
+      llamaCpp: null,
       inferenceHealth: null,
       terminalRuntimeHealth: null,
       servingProcessHealth: null,
@@ -550,7 +566,13 @@ export async function collectSandboxStatusSnapshot(
     };
   }
   const live =
-    liveResult && !isCommandTimeout(liveResult) ? parseGatewayInference(liveResult.output) : null;
+    liveResult &&
+    liveResult.status === 0 &&
+    !liveResult.error &&
+    !liveResult.signal &&
+    !isCommandTimeout(liveResult)
+      ? parseGatewayInference(liveResult.output)
+      : null;
   const recordedRoute =
     sb?.provider && sb.model ? { provider: sb.provider, model: sb.model } : null;
   const liveRoute = live ? { provider: live.provider, model: live.model } : null;
@@ -570,13 +592,13 @@ export async function collectSandboxStatusSnapshot(
           recorded: routeDriftPlan.recorded,
           canConnect: Boolean(
             sb &&
-              gatewayName &&
-              canSandboxGatewayRouteRealign(
-                sandboxName,
-                sb,
-                gatewayName,
-                (opts.deps?.listSandboxes ?? registry.listSandboxes)().sandboxes,
-              ),
+            gatewayName &&
+            canSandboxGatewayRouteRealign(
+              sandboxName,
+              sb,
+              gatewayName,
+              (opts.deps?.listSandboxes ?? registry.listSandboxes)().sandboxes,
+            ),
           ),
         }
       : null;
@@ -611,26 +633,110 @@ export async function collectSandboxStatusSnapshot(
   // providers without a registered host-side health probe (#6192).
   if (!suppressInferenceProbe && lookup.state === "present") {
     let gatewayChain: Awaited<ReturnType<ProbeSandboxInferenceGatewayHealth>> = null;
+    // Take the provider and model as one pair. Falling back per field can pair
+    // a live model with a recorded provider and request a route neither one
+    // describes.
+    const invocationRoute =
+      live?.provider && live.model
+        ? {
+            provider: live.provider,
+            model: live.model,
+            // The live gateway RPC does not expose a stored API family. The
+            // recorded API family describes the recorded provider, so it keeps
+            // describing the live route while that provider is unchanged,
+            // including when only the model drifted. Drop it only when the
+            // provider itself changed, so one provider's API family cannot be
+            // carried onto another that has no such endpoint (#9302).
+            preferredInferenceApi:
+              live.provider === sb?.provider ? (sb?.preferredInferenceApi ?? null) : null,
+          }
+        : {
+            provider: currentProvider,
+            model: currentModel,
+            preferredInferenceApi: sb?.preferredInferenceApi ?? null,
+          };
+    const invocationModel = (invocationRoute.model || "").trim();
+    const invocationProvider = (invocationRoute.provider || "").trim();
+    const canProbeInvocation = Boolean(invocationModel && invocationProvider);
+    let invocation: Awaited<ReturnType<typeof runSandboxInferenceInvocationProbe>> | null = null;
     try {
       const probe =
         opts.deps?.probeSandboxInferenceGatewayHealthImpl ?? probeSandboxInferenceGatewayHealth;
-      const attempts = recoveredManagedGateway ? RECOVERED_INFERENCE_PROBE_ATTEMPTS : 1;
-      for (let attempt = 1; attempt <= attempts; attempt += 1) {
-        gatewayChain = await probe(sandboxName);
-        if (gatewayChain?.ok || attempt === attempts) break;
-        await (opts.deps?.delayInferenceRecoveryProbe ?? sleep)(RECOVERED_INFERENCE_PROBE_DELAY_MS);
-      }
+      await retryUntilAsync(
+        async () => {
+          gatewayChain = gatewayName ? await probe(sandboxName, { gatewayName }) : null;
+          invocation =
+            gatewayChain?.ok && canProbeInvocation
+              ? await runSandboxInferenceInvocationProbe(
+                  {
+                    sandboxName,
+                    gatewayName: gatewayName ?? undefined,
+                    ...(sb?.agent === "langchain-deepagents-code" ? { agentName: sb.agent } : {}),
+                    provider: invocationProvider,
+                    model: invocationModel,
+                    preferredInferenceApi: invocationRoute.preferredInferenceApi,
+                  },
+                  opts.deps?.probeSandboxInferenceInvocationImpl,
+                  (error) =>
+                    reportInferenceProbeError(
+                      error,
+                      opts.deps?.reportInferenceProbeError ?? console.error,
+                    ),
+                )
+              : null;
+          return { gatewayChain, invocation };
+        },
+        {
+          accept: ({ gatewayChain: chain, invocation: result }) => {
+            if (chain?.ok && (!canProbeInvocation || result?.ok)) return true;
+            // After this run recovered a managed gateway, keep waiting for the
+            // restarted chain to settle whatever the failure shape (#8572).
+            if (recoveredManagedGateway) return false;
+            // Otherwise retry only a transient gateway or availability status on
+            // the inference request. Every other request failure, and every
+            // route probe failure, is final on the first attempt (#10709).
+            return !isTransientInferenceInvocationFailure(result);
+          },
+          retryDelaysMs: Array.from(
+            { length: INFERENCE_PROBE_ATTEMPTS - 1 },
+            () => INFERENCE_PROBE_RETRY_DELAY_MS,
+          ),
+          onRetry: ({ gatewayChain: chain, invocation: result }, delayMs, attempt) =>
+            reportInferenceProbeRetry(
+              chain,
+              result,
+              delayMs,
+              attempt,
+              opts.deps?.reportInferenceProbeRetry ?? console.error,
+            ),
+          sleep: opts.deps?.delayInferenceRecoveryProbe ?? sleep,
+        },
+      );
     } catch (error) {
       // This is a permanent fail-closed runtime boundary, but unexpected
       // OpenShell/transport exceptions must remain observable for diagnosis.
       reportInferenceProbeError(error, opts.deps?.reportInferenceProbeError ?? console.error);
       gatewayChain = null;
+      invocation = null;
     }
-    inferenceHealth = buildSandboxInferenceRouteHealth(gatewayChain, providerHealth);
+    inferenceHealth = buildSandboxInferenceRouteHealth(gatewayChain, providerHealth, invocation, {
+      agentName: sb?.agent ?? null,
+      provider: invocationRoute.provider ?? null,
+    });
   }
+  // Classify once per snapshot so every renderer observes the same receipt state.
+  // A complete matching live route is required because the shared gateway route
+  // may belong to another sandbox or provider entirely (#10256).
+  const llamaCpp =
+    routeDriftPlan?.kind === "aligned"
+      ? getLlamaCppRouteDetails(
+          sb,
+          opts.deps?.inspectManagedLlamaCppOwnership ?? inspectManagedLlamaCppOwnership,
+        )
+      : null;
   const statusAgent = resolveSandboxStatusAgent(sb?.agent || "openclaw");
   const terminalRuntimeHealth =
-    lookup.state === "present" && statusAgent.agentRuntime === "terminal"
+    lookup.state === "present" && !suppressInferenceProbe && statusAgent.agentRuntime === "terminal"
       ? (opts.deps?.probeTerminalRuntimeHealth ?? probeTerminalRuntimeCgroupOom)(sandboxName)
       : null;
   // The serving-process leg is only meaningful when the gateway is up. A
@@ -649,6 +755,7 @@ export async function collectSandboxStatusSnapshot(
     recordedRoute,
     liveRoute,
     routeDrift,
+    llamaCpp,
     inferenceHealth,
     terminalRuntimeHealth,
     servingProcessHealth,
@@ -672,7 +779,12 @@ async function buildSandboxStatusReport(
   sandboxName: string,
   deps: CollectSandboxStatusSnapshotDeps,
 ): Promise<SandboxStatusReport> {
-  const getSandbox = deps.getSandbox ?? registry.getSandbox;
+  const getSandbox =
+    deps.getSandbox ??
+    ((name: string) => {
+      const entry = registry.getSandbox(name);
+      return entry && registry.isPublishedSandboxRegistration(entry) ? entry : null;
+    });
   const preflight = await (deps.getSandboxStatusPreflightImpl ?? getSandboxStatusPreflight)(
     getSandbox(sandboxName),
   );
@@ -689,44 +801,27 @@ async function buildSandboxStatusReport(
     recordedRoute,
     liveRoute,
     routeDrift,
+    llamaCpp,
     inferenceHealth,
     terminalRuntimeHealth,
   } = snapshot;
-  const dockerRuntime = lookup.state === "present" ? getSandboxDockerRuntime(sandboxName) : null;
-  const phase = lookup.state === "present" ? parseSandboxPhase(lookup.output || "") : null;
+  const dockerRuntime =
+    lookup.state === "present" && hasLegacyStatusRuntimeObservation(sb)
+      ? getSandboxDockerRuntime(sandboxName)
+      : null;
+  const observedPhase = lookup.state === "present" ? (lookup.phase ?? null) : null;
+  const phase = resolveSandboxStatusPhase(
+    observedPhase,
+    snapshot.postRecoveryPreflight ?? preflight,
+  );
   const effectivePreflight = withoutTerminalPhasePreflight(
     snapshot.postRecoveryPreflight ?? preflight,
     phase,
   );
   const sandboxGpuEnabled = sb ? (sb.sandboxGpuEnabled ?? sb.gpuEnabled === true) : false;
   const hostMounts = normalizeSandboxStatusHostMounts(sb?.hostMounts);
-  const policies =
-    sb && Array.isArray(sb.policies)
-      ? sb.policies.filter((policy): policy is string => typeof policy === "string")
-      : [];
-  const baselineExclusions = sb?.baselineExclusions?.map((exclusion) => exclusion.key) ?? [];
-  const baselineExclusionStates =
-    sb?.baselineExclusions?.map((exclusion) => ({
-      key: exclusion.key,
-      status: (deps.getBaselineExclusionRuntimeStatus ?? getBaselineExclusionRuntimeStatus)(
-        sandboxName,
-        exclusion,
-      ),
-    })) ?? [];
-  const baselineExclusionTransition = sb?.baselineExclusionTransition
-    ? {
-        operation: sb.baselineExclusionTransition.operation,
-        key: sb.baselineExclusionTransition.exclusion.key,
-      }
-    : null;
+  const livePolicies = sb ? await (deps.getGatewayPresets ?? getGatewayPresets)(sandboxName) : [];
   const agent = resolveSandboxStatusAgent(sb?.agent || "openclaw");
-  const cua = getObservedValidatedCuaState(sb, process.env, {
-    observeLiveInference: deps.observeCuaLiveInference,
-    observeLiveAppliedPolicy: deps.observeCuaLiveAppliedPolicy,
-    ...(deps.validateCuaRuntimeReadiness
-      ? { validation: { validateRuntimeReadiness: deps.validateCuaRuntimeReadiness } }
-      : {}),
-  });
   return {
     schemaVersion: 1,
     name: sandboxName,
@@ -742,6 +837,7 @@ async function buildSandboxStatusReport(
     model: liveRoute?.model ?? currentModel,
     provider: liveRoute?.provider ?? currentProvider,
     servingProfileProvenance: sb?.servingProfileProvenance ?? null,
+    llamaCpp,
     recordedRoute,
     liveRoute,
     routeDrift,
@@ -758,11 +854,8 @@ async function buildSandboxStatusReport(
     hostMounts,
     openshellDriver: (sb && sb.openshellDriver) || "unknown",
     openshellVersion: (sb && sb.openshellVersion) || "unknown",
-    policies,
-    ...(isCuaPublicStateEnabled() ? { cuaRuntime: cua.readiness } : {}),
-    baselineExclusions,
-    baselineExclusionStates,
-    baselineExclusionTransition,
+    policies: livePolicies ?? [],
+    policiesAvailable: livePolicies !== null,
     failureLayer: effectivePreflight.failureLayer,
     terminalRuntimeHealth,
     dockerPaused: !!dockerRuntime?.paused,

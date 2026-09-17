@@ -1,10 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
+import { execFile, spawnSync } from "node:child_process";
+import { addAbortListener } from "node:events";
 import path from "node:path";
+import type { TestContext } from "vitest";
+import { ownChildProcess } from "./child-process-lifecycle";
+import {
+  createHostProcessWorkspace,
+  type HostProcessWorkspace,
+  trailingJsonPayload,
+} from "./host-process-harness";
 
 /**
  * Child-process setup mechanics for onboarding suites that spawn the CLI or a
@@ -19,20 +25,7 @@ import path from "node:path";
 export const testRepoRoot = path.join(import.meta.dirname, "..", "..");
 
 /** A disposable workspace holding the spawned process's home and fake bin. */
-export interface OnboardProcessWorkspace {
-  /** The mkdtemp root; also the default HOME. */
-  root: string;
-  /** The directory HOME points at; equals root unless separateHome is set. */
-  homeDir: string;
-  /** The created bin directory for stub executables. */
-  binDir: string;
-  /** Writes an executable stub into binDir and returns its path. */
-  writeExecutable: (name: string, contents: string) => string;
-  /** Resolves a path under the workspace root. */
-  path: (...segments: string[]) => string;
-  /** Removes the whole workspace. */
-  remove: () => void;
-}
+export type OnboardProcessWorkspace = HostProcessWorkspace;
 
 /** Creation options for createOnboardProcessWorkspace. */
 export interface OnboardProcessWorkspaceOptions {
@@ -45,25 +38,7 @@ export function createOnboardProcessWorkspace(
   prefix: string,
   options?: OnboardProcessWorkspaceOptions,
 ): OnboardProcessWorkspace {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  const binDir = path.join(root, "bin");
-  fs.mkdirSync(binDir, { recursive: true });
-  const homeDir = options?.separateHome ? path.join(root, "home") : root;
-  fs.mkdirSync(homeDir, { recursive: true });
-  return {
-    root,
-    homeDir,
-    binDir,
-    writeExecutable: (name, contents) => {
-      const target = path.join(binDir, name);
-      fs.writeFileSync(target, contents, { mode: 0o755 });
-      return target;
-    },
-    path: (...segments) => path.join(root, ...segments),
-    remove: () => {
-      fs.rmSync(root, { recursive: true, force: true });
-    },
-  };
+  return createHostProcessWorkspace(prefix, options);
 }
 
 /**
@@ -74,12 +49,7 @@ export function workspaceEnv(
   workspace: OnboardProcessWorkspace,
   overrides?: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    HOME: workspace.homeDir,
-    PATH: `${workspace.binDir}:${process.env.PATH || ""}`,
-    ...overrides,
-  };
+  return workspace.environment(overrides);
 }
 
 /**
@@ -106,6 +76,10 @@ export interface RunOnboardProcessOptions {
   cwd?: string;
   /** Kill the child after this many milliseconds. */
   timeoutMs?: number;
+  /** Signal used when the timeout expires. */
+  killSignal?: NodeJS.Signals;
+  /** Optional stdin for interactive process fixtures. */
+  input?: string;
 }
 
 /** The decoded outcome of one spawned process run. */
@@ -129,6 +103,8 @@ export function runOnboardProcess(
     encoding: "utf-8",
     env: options.env,
     ...(options.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
+    ...(options.killSignal === undefined ? {} : { killSignal: options.killSignal }),
+    ...(options.input === undefined ? {} : { input: options.input }),
   });
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
@@ -142,17 +118,74 @@ export function runOnboardProcess(
   };
 }
 
+/** Runs a Node fixture asynchronously and waits for its pipes to close. */
+export function runOnboardProcessAsync(
+  argv: readonly string[],
+  options: Pick<RunOnboardProcessOptions, "env" | "cwd" | "input"> & {
+    timeoutMs: number;
+    context: Pick<TestContext, "signal" | "onTestFinished">;
+  },
+): Promise<OnboardProcessResult> {
+  return new Promise((resolve) => {
+    options.context.signal.throwIfAborted();
+    const child = execFile(
+      process.execPath,
+      [...argv],
+      {
+        cwd: options.cwd ?? testRepoRoot,
+        env: options.env,
+        encoding: "utf8",
+        timeout: options.timeoutMs,
+        killSignal: "SIGKILL",
+      },
+      (error, stdout, stderr) => {
+        // Launch errors can invoke this callback before the child closes.
+        void owner.closed.then(() =>
+          resolve({
+            status: error ? (typeof error.code === "number" ? error.code : null) : 0,
+            signal: child.signalCode,
+            error: error && typeof error.code !== "number" ? error : undefined,
+            stdout,
+            stderr,
+            output: `${stdout}\n${stderr}`,
+          }),
+        );
+      },
+    );
+    const owner = ownChildProcess(child);
+    options.context.onTestFinished(owner.terminate);
+    const abort = addAbortListener(options.context.signal, () => child.kill("SIGKILL"));
+    child.once("close", () => abort[Symbol.dispose]());
+    child.stdin?.end(options.input);
+  });
+}
+
+/** Runs a generated onboarding script with a bounded hard-kill timeout. */
+export function runBoundedOnboardScript(
+  scriptPath: string,
+  options: Omit<RunOnboardProcessOptions, "killSignal" | "timeoutMs">,
+): OnboardProcessResult {
+  return runOnboardProcess([scriptPath], { ...options, timeoutMs: 45_000, killSignal: "SIGKILL" });
+}
+
+/** Runs a generated onboarding script asynchronously with a bounded hard-kill timeout. */
+export function runBoundedOnboardScriptAsync(
+  scriptPath: string,
+  options: Omit<RunOnboardProcessOptions, "killSignal" | "timeoutMs"> & {
+    context: Pick<TestContext, "signal" | "onTestFinished">;
+  },
+): Promise<OnboardProcessResult> {
+  const { context, ...processOptions } = options;
+  return runOnboardProcessAsync([scriptPath], {
+    ...processOptions,
+    timeoutMs: 45_000,
+    context,
+  });
+}
+
 /**
  * Parses the last stdout line that is a JSON object; scenario scripts print
  * their result payload after any incidental logging. Throws with the full
  * stdout when no payload line exists.
  */
-export function trailingJsonPayload<T>(stdout: string): T {
-  const line = stdout
-    .trim()
-    .split(/\r?\n/)
-    .reverse()
-    .find((candidate) => candidate.startsWith("{") && candidate.endsWith("}"));
-  if (!line) throw new Error(`expected JSON payload in stdout:\n${stdout}`);
-  return JSON.parse(line) as T;
-}
+export { trailingJsonPayload };

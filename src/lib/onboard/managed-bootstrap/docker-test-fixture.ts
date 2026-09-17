@@ -7,6 +7,7 @@ import { expect, vi } from "vitest";
 
 import { managedStartupE2eProfile } from "../../../../scripts/checks/generate-managed-startup-profile-fixture.mts";
 import type { DockerContainerInspect } from "../docker-gpu-patch-types";
+import { openshellMainProcessSpecEnvValue } from "../docker-startup-command-env";
 import { encodeManagedStartupProfile, type ManagedStartupAgent } from "../managed-startup/profile";
 import { createManagedStartupRootApplyRequest } from "../managed-startup/root-apply";
 import {
@@ -62,6 +63,8 @@ export type DockerFixtureAcknowledgement =
   | "journal:create"
   | "journal:cutover"
   | "journal:completion"
+  | "journal:bootstrap-complete"
+  | "journal:openshell-handoff-complete"
   | "journal:owner-cleanup-required"
   | "journal:remove"
   | "journal:rollback-authorized"
@@ -82,9 +85,12 @@ export type DockerFixtureOptions = {
   >;
   readonly lostAcknowledgements?: readonly DockerFixtureAcknowledgement[];
   readonly ownerId?: string;
+  readonly completionUnavailablePolls?: number;
+  readonly beforeSharedStateCommit?: () => void;
   readonly replacementEnvironment?: (environment: readonly string[]) => readonly string[];
   readonly sharedState?: "committed" | "none" | "pending";
   readonly sharedStateCommitResult?: FixtureCommandResult;
+  readonly sharedStateRollbackResult?: FixtureCommandResult;
   readonly sharedReceiptClearFailures?: readonly Error[];
 };
 
@@ -129,7 +135,7 @@ function originalInspect(inputs = agentInputs()): DockerContainerInspect {
       Env: [
         "A=1",
         `${MANAGED_BOOTSTRAP_IDENTITY_ENV}=${IDENTITY}`,
-        "OPENSHELL_SANDBOX_COMMAND=sleep infinity",
+        `OPENSHELL_MAIN_PROCESS_SPEC=${openshellMainProcessSpecEnvValue(inputs.heldArgv, false)}`,
         "OPENSHELL_OCI_IMAGE_USER=root",
         "OPENSHELL_SANDBOX_UID=",
         "OPENSHELL_SANDBOX_GID=",
@@ -170,6 +176,7 @@ export function authority(agent: ManagedStartupAgent = "hermes") {
     image: { repository: REPOSITORY, manifestDigest: MANIFEST },
     profile: { agent, fingerprint: inputs.request.profileFingerprint },
     agentIdentity: { uid: 1000, gid: 1000, workdir: "/sandbox" },
+    managedStateRoots: [],
     intendedWorkloadArgv: ["env", "A=1", "/usr/local/bin/nemoclaw-start"],
     expectedSupervisorArgv: SUPERVISOR,
     metadata: inputs.metadata,
@@ -231,6 +238,7 @@ export function fixture(options: DockerFixtureOptions = {}) {
   let journal: DockerManagedBootstrapJournal | null = null;
   let finalization: DockerManagedBootstrapFinalizationRecord | null = null;
   let sharedState: "committed" | "none" | "pending" = options.sharedState ?? "none";
+  let completionUnavailablePolls = Math.max(0, options.completionUnavailablePolls ?? 0);
   const events: string[] = [];
   const dockerRemoveFailures = [...(options.dockerRemoveFailures ?? [])];
   const dockerRemoveResults = [...(options.dockerRemoveResults ?? [])];
@@ -353,10 +361,11 @@ export function fixture(options: DockerFixtureOptions = {}) {
     (args: readonly string[], commandOptions?: Record<string, unknown>) => {
       switch (args[0]) {
         case "create": {
+          const name = String(args[args.indexOf("--name") + 1] ?? "");
+          if (name.startsWith("nemoclaw-managed-startup-receipt-seed-")) return ok();
           events.push("create:replacement");
           const source =
             original ?? failFixture("original disappeared before replacement creation");
-          const name = String(args[args.indexOf("--name") + 1] ?? "");
           const entrypoint = String(args[args.indexOf("--entrypoint") + 1] ?? "");
           const imageIndex = args.indexOf(IMAGE);
           const dockerOptions = args.slice(0, imageIndex);
@@ -395,6 +404,10 @@ export function fixture(options: DockerFixtureOptions = {}) {
         }
         case "ps":
           return ok(original ? OLD_ID : "");
+        case "volume":
+          return ok();
+        case "rm":
+          return ok();
         case "inspect": {
           const id = String(args[3] ?? "");
           if (dockerInspectUnknownIds.has(id)) {
@@ -412,6 +425,9 @@ export function fixture(options: DockerFixtureOptions = {}) {
           const source = String(args[sourceIndex] ?? "");
           const destination = String(args[sourceIndex + 1] ?? "");
           const copyIntoContainer = () => {
+            if (args[1] === "-a" && destination.includes("nemoclaw-managed-startup-receipt-seed")) {
+              return ok();
+            }
             events.push("stage:envelope");
             expect(args).toEqual(["cp", "-", `${NEW_ID}:/`]);
             expect(commandOptions?.stdio).toEqual(["pipe", "pipe", "pipe"]);
@@ -425,6 +441,13 @@ export function fixture(options: DockerFixtureOptions = {}) {
           };
           const copyFromContainer = () => {
             if (source === `${NEW_ID}:${MANAGED_BOOTSTRAP_COMPLETION_FILE}`) {
+              if (completionUnavailablePolls > 0) {
+                completionUnavailablePolls -= 1;
+                return {
+                  status: 1,
+                  stderr: `Error response from daemon: Could not find the file ${MANAGED_BOOTSTRAP_COMPLETION_FILE} in container ${NEW_ID}`,
+                };
+              }
               fs.writeFileSync(
                 destination,
                 serializeManagedBootstrapImageCompletion({
@@ -456,15 +479,18 @@ export function fixture(options: DockerFixtureOptions = {}) {
           switch (true) {
             case args.includes("--shared-state-transaction-status"):
               return ok(`${sharedState}\n`);
-            case args.includes("--rollback-shared-state-transaction"):
-              sharedState = "none";
+            case args.includes("--rollback-shared-state-transaction"): {
+              const result = options.sharedStateRollbackResult ?? ok();
+              if (result.status === 0) sharedState = "none";
               events.push("shared:rollback");
-              return ok();
+              return result;
+            }
           }
           break;
         case "exec":
           switch (true) {
             case args.includes("--commit-shared-state-transaction"): {
+              options.beforeSharedStateCommit?.();
               const result = options.sharedStateCommitResult ?? ok();
               sharedState = result.status === 0 ? "committed" : sharedState;
               events.push("shared:commit");
@@ -488,13 +514,14 @@ export function fixture(options: DockerFixtureOptions = {}) {
     journalStore: store,
     dockerCapture,
     dockerRun,
+    dockerLogs: vi.fn(() => ""),
     dockerStop: vi.fn((id) => {
       events.push(`stop:${id}`);
       const target = id === OLD_ID ? original : replacement;
       [target]
         .filter((value): value is DockerContainerInspect => value?.State !== undefined)
         .forEach((value) => {
-          value.State = { ...value.State, Running: false };
+          value.State = { ...value.State, Running: false, Restarting: false };
         });
       return losesAcknowledgement("container:stop")
         ? { status: 1, stderr: "lost stop acknowledgement" }
@@ -553,7 +580,11 @@ export function fixture(options: DockerFixtureOptions = {}) {
         ? { status: 1, stderr: "lost rm acknowledgement" }
         : result;
     }),
-    runCaptureOpenshell: vi.fn(() => `Name: alpha\nID: ${options.ownerId ?? "sandbox-alpha"}\n`),
+    runCaptureOpenshell: vi.fn((args) =>
+      args[1] === "list"
+        ? "alpha  Ready\n"
+        : `Name: alpha\nID: ${options.ownerId ?? "sandbox-alpha"}\n`,
+    ),
     runOpenshell: vi.fn(() => ok()),
     now: () => new Date("2026-07-31T12:30:00.000Z"),
   };

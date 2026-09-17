@@ -26,6 +26,8 @@ import {
 } from "./podman-bootstrap-replacement";
 import {
   PODMAN_MANAGED_LABEL,
+  PODMAN_OPENSHELL_MANAGED_BY_LABEL,
+  PODMAN_OPENSHELL_MANAGED_BY_VALUE,
   PODMAN_SANDBOX_CONTAINER_PREFIX,
   PODMAN_SANDBOX_ID_LABEL,
   PODMAN_SANDBOX_NAME_LABEL,
@@ -65,6 +67,10 @@ const LABELS = Object.freeze({
   [PODMAN_SANDBOX_NAME_LABEL]: SANDBOX_NAME,
   [PODMAN_SANDBOX_NAMESPACE_LABEL]: "",
   [PODMAN_SANDBOX_WORKSPACE_LABEL]: PODMAN_SANDBOX_WORKSPACE,
+});
+const REPLACEMENT_LABELS = Object.freeze({
+  ...LABELS,
+  [PODMAN_OPENSHELL_MANAGED_BY_LABEL]: PODMAN_OPENSHELL_MANAGED_BY_VALUE,
 });
 const STATE_VOLUME_LABELS = Object.freeze({
   [PODMAN_BOOTSTRAP_IDENTITY_LABEL]: BOOTSTRAP_IDENTITY,
@@ -132,6 +138,7 @@ class PodmanHarness {
     mounts: [],
     running: true,
   };
+  public originalExists = true;
   public replacement: ContainerState | null = null;
   public stateVolume: StateVolume | null = null;
   public extraStagingIds: string[] = [];
@@ -139,6 +146,7 @@ class PodmanHarness {
   public replacementStartsOnCreate = false;
   public failReplacementInspectOnce = false;
   public replacementEnvironment: readonly string[] = ENVIRONMENT;
+  public replacementImageLabels: Readonly<Record<string, string>> = {};
   public stateVolumeMountMode = "z";
   public capturedEnvironmentFile: string | null = null;
   public capturedEnvironmentContents: string | null = null;
@@ -222,14 +230,25 @@ class PodmanHarness {
         return this.result(this.original.id);
       case "container:start":
         expect(args[2]).toBe(this.original.id);
+        expect(this.originalExists).toBe(true);
         this.original.running = true;
         return this.result(this.original.id);
-      case "container:rm":
-        expect(args[2]).toBe(this.replacement?.id);
-        this.replacement = null;
-        return this.result();
+      case "container:rm": {
+        switch (args[2]) {
+          case this.original.id:
+            expect(this.originalExists).toBe(true);
+            this.originalExists = false;
+            return this.result();
+          case this.replacement?.id:
+            this.replacement = null;
+            return this.result();
+          default:
+            return this.result("", { status: 125 });
+        }
+      }
       case "container:exists": {
-        const exists = args[2] === this.original.id || args[2] === this.replacement?.id;
+        const exists =
+          (args[2] === this.original.id && this.originalExists) || args[2] === this.replacement?.id;
         return this.result("", { status: exists ? 0 : 1 });
       }
       case "container:ls": {
@@ -273,13 +292,21 @@ class PodmanHarness {
     this.capturedEnvironmentContents = fs.readFileSync(environmentFile, "utf8");
     this.capturedEnvironmentMode = fs.statSync(environmentFile).mode & 0o777;
     const configuredResult = this.createResult;
+    const labels = Object.fromEntries(
+      args
+        .map((argument, index) => ({ argument, label: args[index + 1] ?? "" }))
+        .filter(({ argument }) => argument === "--label")
+        .map(({ label }) => ({ label, separator: label.indexOf("=") }))
+        .filter(({ separator }) => separator > 0)
+        .map(({ label, separator }) => [label.slice(0, separator), label.slice(separator + 1)]),
+    );
     switch (configuredResult) {
       case null:
         this.replacement = {
           id: REPLACEMENT_RUNTIME_ID,
           name: STAGING_NAME,
           image: REPLACEMENT_IMAGE_ID,
-          labels: LABELS,
+          labels: { ...this.replacementImageLabels, ...labels },
           entrypoint: ENTRYPOINT_ARGV,
           command: COMMAND_ARGV,
           environment: this.replacementEnvironment,
@@ -313,7 +340,7 @@ class PodmanHarness {
         return this.result("", { status: 125, error: new Error("inspect interrupted") });
     }
     const container =
-      runtimeId === this.original.id
+      runtimeId === this.original.id && this.originalExists
         ? this.original
         : runtimeId === this.replacement?.id
           ? this.replacement
@@ -335,6 +362,8 @@ function journalStore(): PodmanBootstrapJournalStore {
 function watcherLease() {
   const assertStillStopped = vi.fn();
   const resumeAndProve = vi.fn();
+  const resumeForObservationAndProve = vi.fn();
+  const requiesceAndProve = vi.fn();
   const lease: PodmanGatewayWatcherLease = {
     record: {
       schemaVersion: PODMAN_WATCHER_LEASE_SCHEMA_VERSION,
@@ -349,7 +378,10 @@ function watcherLease() {
       pid: 1234,
       processStartIdentity: "pid-start-1234",
     },
+    assertStillHeld: assertStillStopped,
     assertStillStopped,
+    resumeForObservationAndProve,
+    requiesceAndProve,
     resumeAndProve,
   };
   return { assertStillStopped, lease, resumeAndProve };
@@ -392,7 +424,7 @@ describe("Podman bootstrap stopped replacement", () => {
       id: REPLACEMENT_RUNTIME_ID,
       name: STAGING_NAME,
       image: REPLACEMENT_IMAGE_ID,
-      labels: LABELS,
+      labels: REPLACEMENT_LABELS,
       running: false,
     });
     expect(harness.stateVolume).toEqual({
@@ -415,6 +447,12 @@ describe("Podman bootstrap stopped replacement", () => {
       `${PODMAN_SANDBOX_NAME_LABEL}=${SANDBOX_NAME}`,
       STATE_VOLUME_NAME,
     ]);
+    expect(harness.calls).toContainEqual(
+      expect.arrayContaining([
+        "--volume",
+        `${STATE_VOLUME_NAME}:${PODMAN_BOOTSTRAP_STATE_DIRECTORY}:rw,z,copy`,
+      ]),
+    );
     expect(harness.capturedEnvironmentMode).toBe(0o600);
     expect(harness.capturedEnvironmentContents).toBe(`${ENVIRONMENT.join("\n")}\n`);
     expect(fs.existsSync(harness.capturedEnvironmentFile as string)).toBe(false);
@@ -525,26 +563,25 @@ describe("Podman bootstrap stopped replacement", () => {
     expect(harness.calls).toEqual([]);
   });
 
-  it.each([
-    "-eSECRET=1",
-    "-lcom.nvidia.nemoclaw.override=true",
-    "-d=true",
-  ])("rejects attached protected shorthand %s before invoking Podman", (argument) => {
-    const harness = new PodmanHarness();
-    const store = journalStore();
-    const watcher = watcherLease();
+  it.each(["-eSECRET=1", "-lcom.nvidia.nemoclaw.override=true", "-d=true"])(
+    "rejects attached protected shorthand %s before invoking Podman",
+    (argument) => {
+      const harness = new PodmanHarness();
+      const store = journalStore();
+      const watcher = watcherLease();
 
-    expect(() =>
-      prepareStoppedPodmanBootstrapReplacement({
-        engine: harness.engine,
-        journalStore: store,
-        watcherLease: watcher.lease,
-        plan: { ...plan, runtimeArgs: [argument] },
-      }),
-    ).toThrow("cannot set");
-    expect(store.load(BOOTSTRAP_IDENTITY)).toBeNull();
-    expect(harness.calls).toEqual([]);
-  });
+      expect(() =>
+        prepareStoppedPodmanBootstrapReplacement({
+          engine: harness.engine,
+          journalStore: store,
+          watcherLease: watcher.lease,
+          plan: { ...plan, runtimeArgs: [argument] },
+        }),
+      ).toThrow("cannot set");
+      expect(store.load(BOOTSTRAP_IDENTITY)).toBeNull();
+      expect(harness.calls).toEqual([]);
+    },
+  );
 
   it("does not confuse supported long options with protected shorthand", () => {
     const harness = new PodmanHarness();
@@ -686,8 +723,21 @@ describe("Podman bootstrap stopped replacement", () => {
     expect(store.load(BOOTSTRAP_IDENTITY)?.phase).toBe("state-volume-created");
   });
 
+  it("accepts additional labels inherited from the pinned replacement image", () => {
+    const harness = new PodmanHarness();
+    harness.replacementImageLabels = {
+      "io.nvidia.nemoclaw.managed-image.contract": "1",
+      "org.opencontainers.image.revision": "candidate-revision",
+    };
+    const store = journalStore();
+    const watcher = watcherLease();
+
+    expect(() => prepare(harness, store, watcher.lease)).not.toThrow();
+  });
+
   it("stops only the exact original after the stopped replacement remains stable", () => {
     const harness = new PodmanHarness();
+    const capture = vi.spyOn(harness.engine, "capture");
     const store = journalStore();
     const watcher = watcherLease();
     const prepared = prepare(harness, store, watcher.lease);
@@ -702,9 +752,32 @@ describe("Podman bootstrap stopped replacement", () => {
 
     expect(stopped.journal.phase).toBe("original-stopped");
     expect(harness.original.running).toBe(false);
+    expect(harness.originalExists).toBe(false);
     expect(harness.replacement?.running).toBe(false);
     expect(harness.calls).toContainEqual(["container", "stop", ORIGINAL_RUNTIME_ID]);
+    expect(capture).toHaveBeenCalledWith(["container", "stop", ORIGINAL_RUNTIME_ID], 60_000);
     expect(watcher.resumeAndProve).not.toHaveBeenCalled();
+  });
+
+  it("accepts watcher quiescence that already stopped the exact original", () => {
+    const harness = new PodmanHarness();
+    const store = journalStore();
+    const watcher = watcherLease();
+    const prepared = prepare(harness, store, watcher.lease);
+    harness.original.running = false;
+
+    const stopped = stopExactPodmanBootstrapOriginal({
+      engine: harness.engine,
+      journalStore: store,
+      watcherLease: watcher.lease,
+      prepared,
+      heldWorkload,
+    });
+
+    expect(stopped.journal.phase).toBe("original-stopped");
+    expect(harness.originalExists).toBe(false);
+    expect(harness.calls).not.toContainEqual(["container", "stop", ORIGINAL_RUNTIME_ID]);
+    expect(harness.calls).toContainEqual(["container", "rm", ORIGINAL_RUNTIME_ID]);
   });
 
   it.each([
@@ -741,7 +814,7 @@ describe("Podman bootstrap stopped replacement", () => {
     expect(store.load(BOOTSTRAP_IDENTITY)?.phase).toBe("replacement-created");
   });
 
-  it("rolls back an exact stopped replacement and restarts the exact original", () => {
+  it("rolls back the replacement after the original handoff", () => {
     const harness = new PodmanHarness();
     const store = journalStore();
     const watcher = watcherLease();
@@ -765,17 +838,17 @@ describe("Podman bootstrap stopped replacement", () => {
     expect(receipt).toEqual({
       bootstrapIdentity: BOOTSTRAP_IDENTITY,
       originalRuntimeId: ORIGINAL_RUNTIME_ID,
-      originalStarted: true,
+      originalStarted: false,
       replacementRemoved: true,
       replacementStateVolumeRemoved: true,
     });
-    expect(harness.original.running).toBe(true);
+    expect(harness.originalExists).toBe(false);
     expect(harness.replacement).toBeNull();
     expect(harness.stateVolume).toBeNull();
     expect(store.load(BOOTSTRAP_IDENTITY)).toBeNull();
     expect(harness.calls).toContainEqual(["container", "rm", REPLACEMENT_RUNTIME_ID]);
     expect(harness.calls).toContainEqual(["volume", "rm", STATE_VOLUME_NAME]);
-    expect(harness.calls).toContainEqual(["container", "start", ORIGINAL_RUNTIME_ID]);
+    expect(harness.calls).not.toContainEqual(["container", "start", ORIGINAL_RUNTIME_ID]);
     expect(watcher.resumeAndProve).not.toHaveBeenCalled();
   });
 

@@ -2,17 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Prompt-cancellation package contract for the policy preset pickers (#7418).
+ * Non-interactive package contract for policy preset selection (#7418).
  *
  * A boot unit runs `nemoclaw <sandbox> policy-add` with no preset name and a
- * closed stdin. That reaches the interactive picker, and the prompt hits EOF.
- * The `question` callback never fired, the picker promise never settled, and
- * the CLI exited 0 having applied nothing. Automation could not distinguish
- * an applied preset from a no-op.
+ * pipe-backed stdin. The CLI must reject the missing preset before it starts
+ * the interactive picker. Automation can then distinguish refusal from a
+ * successful mutation.
  *
- * These tests drive the compiled CLI (`dist/nemoclaw.js`) on real stdin at
- * EOF, so readline decides when the prompt closes. Only the registry and
- * preset lookups are stubbed, which replaces on-disk sandbox state.
+ * These tests drive the compiled CLI (`dist/nemoclaw.js`) with a pipe-backed
+ * stdin. Only the registry and preset lookups are stubbed, which replaces
+ * on-disk sandbox state.
  */
 
 import { spawnSync } from "node:child_process";
@@ -26,10 +25,13 @@ const REPO_ROOT = path.join(import.meta.dirname, "../../..");
 const CLI_PATH = JSON.stringify(path.join(REPO_ROOT, "dist", "nemoclaw.js"));
 const POLICIES_PATH = JSON.stringify(path.join(REPO_ROOT, "dist", "lib", "policy", "index.js"));
 const REGISTRY_PATH = JSON.stringify(path.join(REPO_ROOT, "dist", "lib", "state", "registry.js"));
+const CROSS_PORT_PATH = JSON.stringify(
+  path.join(REPO_ROOT, "dist", "lib", "state", "registry", "cross-port.js"),
+);
 
 /**
- * Run a policy command with no preset name against a closed stdin. `input: ""`
- * gives the child an already-ended pipe, which is the EOF a boot unit
+ * Run a policy command with no preset name and no terminal input. `input: ""`
+ * gives the child an already-ended pipe, which is the stdin shape a boot unit
  * produces.
  */
 function runPolicyCommandAtStdinEof(command: "policy-add" | "policy-remove") {
@@ -37,6 +39,7 @@ function runPolicyCommandAtStdinEof(command: "policy-add" | "policy-remove") {
   const scriptPath = path.join(tmpDir, "policy-prompt-eof-check.js");
   const script = String.raw`
 const registry = require(${REGISTRY_PATH});
+const crossPort = require(${CROSS_PORT_PATH});
 const policies = require(${POLICIES_PATH});
 policies.listPresets = () => [
   { file: "npm.yaml", name: "npm", description: "npm registry access" },
@@ -45,8 +48,12 @@ policies.listPresets = () => [
 policies.listCustomPresets = () => [];
 policies.getAppliedPresets = () => ["npm"];
 registry.getSandbox = (name) =>
-  name === "test-sandbox" ? { name, policies: ["npm"], customPolicies: [] } : null;
+  name === "test-sandbox" ? { name } : null;
 registry.listSandboxes = () => ({ sandboxes: [{ name: "test-sandbox" }] });
+crossPort.findSandboxAcrossGatewayRoots = (name) =>
+  name === "test-sandbox"
+    ? { entry: { name }, gatewayPort: null, registryFile: "test-registry" }
+    : null;
 process.argv = ["node", "nemoclaw.js", "test-sandbox", ${JSON.stringify(command)}];
 require(${CLI_PATH});
 `;
@@ -76,25 +83,23 @@ describe("policy preset prompt cancellation", () => {
       menu: "Applied presets:",
       usage: "policy remove <preset>",
     },
-  ])("$command exits non-zero when the picker prompt hits EOF (#7418)", ({
-    command,
-    menu,
-    usage,
-  }) => {
-    const result = runPolicyCommandAtStdinEof(command);
+  ])(
+    "$command exits non-zero before opening a picker without a terminal (#7418)",
+    ({ command, menu, usage }) => {
+      const result = runPolicyCommandAtStdinEof(command);
 
-    // The child exited on its own rather than being killed by the defensive
-    // timeout above. A hang would produce SIGKILL and a null status; the
-    // pre-#7418 regression exited 0 and is caught by the final assertion.
-    expect(result.error).toBeUndefined();
-    expect(result.signal).toBeNull();
-    // The picker was reached, so this is prompt EOF rather than the
-    // NEMOCLAW_NON_INTERACTIVE=1 guard exiting earlier.
-    expect(result.stderr).toContain(menu);
-    expect(result.stderr).toContain("No input available on stdin");
-    expect(result.stderr).toContain(usage);
-    expect(result.status).toBe(1);
-    // Above the child's 30s cap, so any hang fails on the assertions above
-    // rather than as a bare suite timeout.
-  }, 45_000);
+      // The child exited on its own rather than being killed by the defensive
+      // timeout above. A hang would produce SIGKILL and a null status; the
+      // pre-#7418 regression exited 0 and is caught by the final assertion.
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.stderr).not.toContain(menu);
+      expect(result.stderr).toContain("No input available on stdin");
+      expect(result.stderr).toContain(usage);
+      expect(result.status).toBe(1);
+      // Above the child's 30s cap, so any hang fails on the assertions above
+      // rather than as a bare suite timeout.
+    },
+    45_000,
+  );
 });

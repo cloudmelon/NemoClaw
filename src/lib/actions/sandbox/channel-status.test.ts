@@ -4,10 +4,22 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   entry,
-  makeDeps,
+  makeDeps as makeSyncDeps,
   showSandboxChannelStatus,
   TELEGRAM_PROBE_UNKNOWN_STDOUT,
 } from "./channel-status.test-helpers";
+
+function makeDeps(options: Parameters<typeof makeSyncDeps>[0]) {
+  const result = makeSyncDeps(options);
+  const execSandbox = result.deps.execSandbox;
+  return {
+    ...result,
+    deps: {
+      ...result.deps,
+      execSandbox: async (...args: Parameters<typeof execSandbox>) => execSandbox(...args),
+    },
+  };
+}
 
 // The whatsapp status hook now reads OpenClaw's authoritative live status JSON
 // (`openclaw channels status --channel whatsapp --json`) instead of scraping
@@ -31,6 +43,36 @@ function hermesSessionProbeOutput(options: {
     `GATEWAY_SESSION=${options.gatewaySessionCreds ? "present" : "missing"}`,
     `DASHBOARD_SESSION=${options.dashboardSessionCreds ? "present" : "missing"}`,
   ].join("\n");
+}
+
+const HERMES_DEFAULT_SESSION_DIR = "/sandbox/.hermes/platforms/whatsapp/session";
+const HERMES_DASHBOARD_SESSION_DIR =
+  "/sandbox/.hermes/profiles/dashboard-home/platforms/whatsapp/session";
+
+function hermesExec(options: {
+  readonly configuredSessionPath?: string;
+  readonly credsDirs: readonly string[];
+}) {
+  const hasCreds = (credsFile: string) =>
+    options.credsDirs.some((dir) => credsFile === `${dir}/creds.json`);
+  return vi.fn((_sandbox: string, command: string, _timeoutMs?: number) => {
+    return command.startsWith("python3 -c ")
+      ? options.configuredSessionPath === undefined
+        ? { status: 1, stdout: "", stderr: "config unavailable" }
+        : {
+            status: 0,
+            stdout: `NEMOCLAW_HERMES_WHATSAPP_CONFIG_V1\n${JSON.stringify(options.configuredSessionPath)}`,
+            stderr: "",
+          }
+      : {
+          status: 0,
+          stdout: hermesSessionProbeOutput({
+            gatewaySessionCreds: hasCreds(/gateway='([^']*)'/.exec(command)?.[1] ?? ""),
+            dashboardSessionCreds: hasCreds(/dashboard='([^']*)'/.exec(command)?.[1] ?? ""),
+          }),
+          stderr: "",
+        };
+  });
 }
 
 describe("showSandboxChannelStatus (whatsapp)", () => {
@@ -286,12 +328,65 @@ describe("showSandboxChannelStatus (whatsapp)", () => {
     expect(session?.severity).toBe("ok");
   });
 
+  // Keep this compatibility assertion only for the support period tracked by #8947.
+  it("clears the session-path split during the compatibility period (#8947)", async () => {
+    const exec = hermesExec({
+      configuredSessionPath: HERMES_DASHBOARD_SESSION_DIR,
+      credsDirs: [HERMES_DASHBOARD_SESSION_DIR],
+    });
+    const { deps, out_lines } = makeDeps({
+      exec,
+      agentName: "hermes",
+      sandbox: entry(["whatsapp"], [], {}, "hermes"),
+    });
+    const result = await showSandboxChannelStatus("alpha", { deps, channel: "whatsapp" });
+    const signals = result && "report" in result ? result.report.signals : [];
+    const dump = out_lines.join("\n");
+    expect(result && "report" in result && result.report.verdict).not.toBe("unpaired");
+    expect(signals.find((signal) => signal.label === "Session location")?.severity).toBe("ok");
+    expect(signals.find((signal) => signal.label === "Session path override")?.severity).toBe(
+      "info",
+    );
+    expect(dump).not.toContain("the Hermes gateway session path is empty");
+    expect(dump).toContain(HERMES_DASHBOARD_SESSION_DIR);
+    expect(exec.mock.calls.map((call) => String(call[1] ?? "")).join("\n")).toContain(
+      `gateway='${HERMES_DASHBOARD_SESSION_DIR}/creds.json'`,
+    );
+  });
+
+  it("keeps the default session path when the configured session path is unsupported (#8718)", async () => {
+    const exec = hermesExec({
+      configuredSessionPath: "/etc/hermes/session",
+      credsDirs: [HERMES_DASHBOARD_SESSION_DIR],
+    });
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const { deps } = makeDeps({
+      exec,
+      agentName: "hermes",
+      sandbox: entry(["whatsapp"], [], {}, "hermes"),
+    });
+    let threw: Error | null = null;
+    try {
+      await showSandboxChannelStatus("alpha", { deps, channel: "whatsapp" });
+    } catch (err) {
+      threw = err as Error;
+    } finally {
+      exitSpy.mockRestore();
+    }
+    const commands = exec.mock.calls.map((call) => String(call[1] ?? "")).join("\n");
+    expect(threw?.message).toBe("process.exit(1)");
+    expect(commands).toContain(`gateway='${HERMES_DEFAULT_SESSION_DIR}/creds.json'`);
+    expect(commands).not.toContain("/etc/hermes/session");
+  });
+
   it("skips the deep probe and reports paused state when WhatsApp is in disabledChannels", async () => {
     // Regression guard: `channels stop whatsapp` deliberately drops the
     // bridge and preset until the operator runs `channels start`. The
     // status command should reflect that rather than probing a torn-down
     // bridge and reporting failures.
-    const execSpy = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    const execSpy = vi.fn(async () => ({ status: 0, stdout: "", stderr: "" }));
     const { deps, out_lines } = makeDeps({
       exec: () => ({ status: 0, stdout: "", stderr: "" }),
       sandbox: entry(["whatsapp"], ["whatsapp"]),
@@ -299,24 +394,24 @@ describe("showSandboxChannelStatus (whatsapp)", () => {
     deps.execSandbox = execSpy as unknown as typeof deps.execSandbox;
     const result = await showSandboxChannelStatus("alpha", { deps, channel: "whatsapp" });
     expect(execSpy).not.toHaveBeenCalled();
-    expect(result && "verdict" in result && result.verdict).toBe("info");
+    expect(result && "report" in result && result.report.verdict).toBe("info");
     const dump = out_lines.join("\n");
     expect(dump).toMatch(/registered but currently paused/);
+    expect(dump).toMatch(/Verdict:.*info/);
     // The paused fallback must not claim it is the summary view nor tell the
     // operator to rerun the --channel command they are already running (#6887).
     const runtime =
-      result && "signals" in result
-        ? result.signals.find((s) => s.label === "Runtime health")
+      result && "report" in result
+        ? result.report.signals.find((s) => s.label === "Runtime health")
         : undefined;
     expect(runtime?.detail).toBe("not checked — whatsapp is currently paused");
     expect(runtime?.hint).toBeUndefined();
   });
 
   it("labels a paused telegram channel as paused rather than summary view under --channel (#6887)", async () => {
-    // A probe-capable channel that is paused lands on the basic report even
-    // under an explicit --channel request, since the probe is gated on
-    // !channelIsPaused. The Runtime health signal must reflect the paused state.
-    const execSpy = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+    // A probe-capable channel that is paused skips the live probe but keeps the
+    // detailed envelope. The Runtime health signal must reflect the paused state.
+    const execSpy = vi.fn(async () => ({ status: 0, stdout: "", stderr: "" }));
     const { deps } = makeDeps({
       exec: () => ({ status: 0, stdout: "", stderr: "" }),
       sandbox: entry(["telegram"], ["telegram"]),
@@ -329,11 +424,26 @@ describe("showSandboxChannelStatus (whatsapp)", () => {
       .join("\n");
     expect(probeCommands).not.toMatch(/gateway\.log|pgrep/);
     const runtime =
-      result && "signals" in result
-        ? result.signals.find((s) => s.label === "Runtime health")
+      result && "report" in result
+        ? result.report.signals.find((s) => s.label === "Runtime health")
         : undefined;
     expect(runtime?.detail).toBe("not checked — telegram is currently paused");
     expect(runtime?.hint).toBeUndefined();
+    expect(result).toEqual({
+      schemaVersion: 1,
+      sandbox: "alpha",
+      channel: "telegram",
+      report: {
+        schemaVersion: 1,
+        agent: "openclaw",
+        channel: "telegram",
+        verdict: "info",
+        probedAt: "2026-05-28T04:00:00.000Z",
+        signals: expect.any(Array),
+        hints: expect.any(Array),
+      },
+    });
+    expect(result && (await import("./channel-status")).exitCodeFor(result)).toBe(0);
   });
 });
 
@@ -406,7 +516,7 @@ function slackWaitHarness(
 }
 
 function waitForSlack(
-  deps: ReturnType<typeof slackWaitHarness>["deps"],
+  deps: NonNullable<Parameters<typeof showSandboxChannelStatus>[1]>["deps"],
   timeoutSeconds = 10,
   pollIntervalMs = 5_000,
 ) {
@@ -443,23 +553,26 @@ describe("showSandboxChannelStatus Slack readiness wait", () => {
   it.each([
     ["openclaw", "channel_paused"],
     ["hermes", "readiness_not_supported"],
-  ] as const)("returns the agent-appropriate terminal result for paused %s Slack (#7383)", async (agentName, reason) => {
-    const { deps, probe, sleep } = slackWaitHarness([{}], { paused: true, agentName });
+  ] as const)(
+    "returns the agent-appropriate terminal result for paused %s Slack (#7383)",
+    async (agentName, reason) => {
+      const { deps, probe, sleep } = slackWaitHarness([{}], { paused: true, agentName });
 
-    const result = await waitForSlack(deps);
+      const result = await waitForSlack(deps);
 
-    expect(result && "readiness" in result ? result.readiness : null).toMatchObject({
-      state: "terminal",
-      category: "runtime",
-      reason,
-      retryable: false,
-      attempts: 1,
-      elapsedMs: 0,
-    });
-    expect(result && (await import("./channel-status")).exitCodeFor(result)).toBe(1);
-    expect(probe).not.toHaveBeenCalled();
-    expect(sleep).not.toHaveBeenCalled();
-  });
+      expect(result && "readiness" in result ? result.readiness : null).toMatchObject({
+        state: "terminal",
+        category: "runtime",
+        reason,
+        retryable: false,
+        attempts: 1,
+        elapsedMs: 0,
+      });
+      expect(result && (await import("./channel-status")).exitCodeFor(result)).toBe(1);
+      expect(probe).not.toHaveBeenCalled();
+      expect(sleep).not.toHaveBeenCalled();
+    },
+  );
 
   it("bounds every readiness dependency by one wait deadline (#7383)", async () => {
     const { deps, gatewayPolicy, probe, configRead, sleep } = slackWaitHarness(
@@ -489,6 +602,28 @@ describe("showSandboxChannelStatus Slack readiness wait", () => {
     expect(probe.mock.calls.map(([timeoutMs]) => timeoutMs)).toEqual([1_550]);
     expect(configRead.mock.calls.map(([timeoutMs]) => timeoutMs)).toEqual([1_150]);
     expect(sleep).toHaveBeenCalledWith(500);
+  });
+
+  it("applies the documented 180-second budget when the caller omits timeoutSeconds (#8883)", async () => {
+    const { deps, gatewayPolicy } = slackWaitHarness([{ connected: false }]);
+
+    const result = await showSandboxChannelStatus("alpha", {
+      deps,
+      channel: "slack",
+      wait: true,
+      timeoutSeconds: undefined,
+      pollIntervalMs: 60_000,
+      asJson: true,
+      quietJson: true,
+    });
+
+    expect(result && "readiness" in result ? result.readiness : null).toMatchObject({
+      state: "timeout",
+      category: "timeout",
+      reason: "timeout",
+      elapsedMs: 180_000,
+    });
+    expect(gatewayPolicy.mock.calls[0]?.[1]).toBe(180_000);
   });
 });
 
@@ -529,4 +664,20 @@ describe("showSandboxChannelStatus unsupported readiness wait", () => {
     ).toHaveLength(1);
     expect(sleep).not.toHaveBeenCalled();
   });
+});
+
+it("returns the status timeout when an applied-policy read remains pending", async () => {
+  vi.useFakeTimers();
+  try {
+    const { deps } = slackWaitHarness([{ connected: false }]);
+    const getAppliedPresets = vi.fn(() => new Promise<string[]>(() => {}));
+    const pending = waitForSlack({ ...deps, nowMs: () => Date.now(), getAppliedPresets }, 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await pending;
+    expect(result).toMatchObject({ readiness: { state: "timeout" } });
+    expect(getAppliedPresets).toHaveBeenCalledWith("alpha", 1_000);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
 });

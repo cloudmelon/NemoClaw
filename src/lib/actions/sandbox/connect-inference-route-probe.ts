@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { redactSensitiveText } from "../../security/redact";
+import type { OpenShellSandboxBufferedCommandRequest } from "../../adapters/openshell/sandbox-command";
+import {
+  namedOpenShellGateway,
+  selectedOpenShellGateway,
+} from "../../adapters/openshell/sandbox-observer";
 
 export type InferenceRouteProbeAgent = { name: string } | null;
 
@@ -38,16 +43,17 @@ export const INFERENCE_ROUTE_PROBE_SCRIPT = [
   INFERENCE_ROUTE_CA_VALIDATION,
   INFERENCE_ROUTE_PROBE_CORE_SCRIPT,
 ].join("; ");
-// Invalid state: a DCode login shell runs sandbox-user startup files before the
-// probe, so every inherited output descriptor is attacker-writable evidence.
-// Source boundary: the image-baked launcher reconstructs the managed proxy from
-// root-owned, mode-0444 files and execs a command without loading user profiles.
-// Source-fix constraint: raw OpenShell exec does not inherit the entrypoint's
-// trusted proxy contract, while a login shell cannot provide an output trust
-// boundary. Regression: hostile-profile tests assert that no startup file or
-// inherited descriptor can emit probe evidence. Removal condition: use a raw
-// probe only when OpenShell provides the same trusted proxy environment to every
-// sandbox exec process without shell startup.
+// Invalid state: OpenShell starts sandbox exec through a login shell before the
+// requested command (#8624; OpenShell#2668). DCode's image-owned system hook
+// selects the managed home before reading personal files. Older images can emit output and
+// create side effects before this probe begins. The launcher reconstructs the
+// managed proxy from root-owned, mode-0444 files without adding another
+// profile-sourcing shell, and the parser rejects inherited stderr or extra
+// stdout so startup output cannot become accepted probe evidence. Regression:
+// system-hook and hostile-profile tests cover startup and inherited descriptors.
+// Removal condition: use a raw probe only when OpenShell
+// provides both a non-login exec path and the trusted proxy environment to every
+// sandbox exec process.
 // This separate regular-file install is intentionally absent from older images:
 // a newer CLI probing one fails before the stateful entrypoint or dcode wrapper
 // can run, so version skew cannot mutate observability state.
@@ -79,35 +85,32 @@ export function classifyInferenceRouteFailureLabel(httpStatus: number): Inferenc
   return httpStatus >= 500 && httpStatus < 600 ? "unhealthy" : "unreachable";
 }
 
-export function buildSandboxInferenceRouteProbeArgs(
+/** Build the transport-neutral buffered request for an inference route probe. */
+export function buildSandboxInferenceRouteProbeRequest(
   sandboxName: string,
   agent: InferenceRouteProbeAgent,
-): string[] {
-  if (agent?.name === "langchain-deepagents-code") {
-    return [
-      "sandbox",
-      "exec",
-      "--name",
-      sandboxName,
-      "--no-tty",
-      "--env",
-      "HOME=/usr/local/lib/nemoclaw",
-      "--env",
-      "BASH_ENV=",
-      "--env",
-      "ENV=",
-      "--",
-      // The trusted launcher ignores ambient proxy overrides and does not
-      // source sandbox-user startup files or rewrite persistent runtime
-      // state before executing this probe.
-      DCODE_MANAGED_EXEC_LAUNCHER,
-      "/bin/sh",
-      "-c",
-      INFERENCE_ROUTE_PROBE_SCRIPT,
-    ];
-  }
-
-  return ["sandbox", "exec", "--name", sandboxName, "--", "sh", "-c", INFERENCE_ROUTE_PROBE_SCRIPT];
+  gatewayName: string | undefined,
+  timeoutMilliseconds: number,
+): OpenShellSandboxBufferedCommandRequest {
+  const dcode = agent?.name === "langchain-deepagents-code";
+  return {
+    sandboxName,
+    target: gatewayName ? namedOpenShellGateway(gatewayName) : selectedOpenShellGateway(),
+    command: dcode
+      ? [DCODE_MANAGED_EXEC_LAUNCHER, "/bin/sh", "-c", INFERENCE_ROUTE_PROBE_SCRIPT]
+      : ["sh", "-c", INFERENCE_ROUTE_PROBE_SCRIPT],
+    ...(dcode
+      ? {
+          sandboxEnvironment: {
+            BASH_ENV: "",
+            ENV: "",
+            HOME: "/usr/local/lib/nemoclaw",
+          },
+        }
+      : {}),
+    ...(dcode ? { tty: false } : {}),
+    timeoutMilliseconds,
+  };
 }
 
 /** Parse the shared route-probe output used by connect, status, and doctor. */

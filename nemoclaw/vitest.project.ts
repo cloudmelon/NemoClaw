@@ -5,9 +5,25 @@ import path from "node:path";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "..");
 const canonicalBannerBoundary = path.resolve(import.meta.dirname, "src/shared/banner-boundary.cts");
+const canonicalCredentialFilterBoundary = path.resolve(
+  import.meta.dirname,
+  "src/shared/credential-filter-boundary.cts",
+);
+const canonicalOpenShellExternalTargetBoundary = path.resolve(
+  import.meta.dirname,
+  "src/shared/openshell-external-target-boundary.cts",
+);
+const canonicalOpenShellObservationBoundary = path.resolve(
+  import.meta.dirname,
+  "src/shared/openshell-observation-boundary.cts",
+);
 const canonicalOpenShellPolicyBoundary = path.resolve(
   import.meta.dirname,
   "src/shared/openshell-policy-boundary.cts",
+);
+const canonicalPrivateNetworksBoundary = path.resolve(
+  import.meta.dirname,
+  "src/shared/private-networks-boundary.cts",
 );
 const canonicalSandboxName = path.resolve(import.meta.dirname, "src/shared/sandbox-name.cts");
 const canonicalSnapshotSanitizerBoundary = path.resolve(
@@ -49,8 +65,24 @@ const pluginVitestProjectOptions = {
         replacement: canonicalBannerBoundary,
       },
       {
+        find: /^.*credential-filter-boundary\.cjs$/,
+        replacement: canonicalCredentialFilterBoundary,
+      },
+      {
+        find: /^.*openshell-external-target-boundary\.cjs$/,
+        replacement: canonicalOpenShellExternalTargetBoundary,
+      },
+      {
+        find: /^.*openshell-observation-boundary\.cjs$/,
+        replacement: canonicalOpenShellObservationBoundary,
+      },
+      {
         find: /^.*openshell-policy-boundary\.cjs$/,
         replacement: canonicalOpenShellPolicyBoundary,
+      },
+      {
+        find: /^.*private-networks-boundary\.cjs$/,
+        replacement: canonicalPrivateNetworksBoundary,
       },
       {
         find: /^.*sandbox-name\.cjs$/,

@@ -28,7 +28,7 @@ import {
 import { expect, test } from "../fixtures/e2e-test.ts";
 import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
 import type { NemoClawInstance } from "../fixtures/phases/onboarding.ts";
-import { ubuntuRepoDocker } from "../registry/matrix.ts";
+import { ubuntuRepoManagedRuntime } from "../registry/matrix.ts";
 import { stripTerminalControl } from "../support/issue-4434-tui-capture.ts";
 import {
   buildIssue6194OpenShellApprovalExpectScript,
@@ -48,14 +48,13 @@ import {
   normalizeIssue2603Trace,
 } from "./openclaw-tui-run-classification.ts";
 
-// Reuses the standard ubuntu-repo-docker environment with the
-// `cloud-openclaw` onboarding profile (already in
-// `runtime-support.ts:SUPPORTED_ONBOARDING`). We don't route through the
+// Reuses the standard Ubuntu environment with the `cloud-openclaw`
+// onboarding profile. We don't route through the
 // target registry because the registry is keyed on steady-state
 // expected-state probes; this test's regression-target probes are bespoke
 // websocket-trace assertions that don't fit the
 // `from(env) → from(state, instance)` model.
-const ENVIRONMENT = ubuntuRepoDocker("cloud-openclaw");
+const ENVIRONMENT = ubuntuRepoManagedRuntime("cloud-openclaw");
 
 const SANDBOX_NAME = "e2e-oc-tui-corr";
 // OpenClaw 2026.7.1 is the post-fix regression-guard version for #2603 + #3145.
@@ -69,7 +68,7 @@ const LIVE_SCRIPT_NAME = "openclaw-issue2603-chat-correlation.cjs";
 const SANDBOX_GATEWAY_PORT = 18789;
 
 // ─── Trace analyzer types + helpers (mirrored from
-//     test/openclaw-tui-chat-correlation.test.ts so the live test is
+//     test/agents/openclaw/openclaw-tui-chat-correlation.test.ts so the live test is
 //     self-contained; kept in lockstep with the unit-test analyzer
 //     via review).
 //     ─────────────────────────────────────────────────────────────────
@@ -267,7 +266,11 @@ function looksLikeEventCaptureFailure(repro: LiveIssue2603Trace): boolean {
 function issue2603AttemptOutcome(
   repro: LiveIssue2603Trace,
   index: number,
-): Issue2603AttemptOutcome & { attempt: number; eventCount: number; chatEventCount: number } {
+): Issue2603AttemptOutcome & {
+  attempt: number;
+  eventCount: number;
+  chatEventCount: number;
+} {
   const failedAttempt = {
     attempt: index + 1,
     captureFailure: false,
@@ -303,7 +306,7 @@ function issue2603AttemptOutcome(
 // ─── In-sandbox websocket repro driver ─────────────────────────────
 
 function buildLiveReproScript(): string {
-  // Verbatim port of the script in test/openclaw-tui-chat-correlation.test.ts
+  // Verbatim port of the script in test/agents/openclaw/openclaw-tui-chat-correlation.test.ts
   // (loaded at runtime from /usr/local/lib/node_modules/openclaw/package.json
   // so it picks up the in-sandbox OpenClaw `ws` dependency without the
   // sandbox needing its own npm install).
@@ -455,7 +458,7 @@ ws.on("open", async () => {
 // Idempotent: returns 0 if the in-sandbox gateway already responds to
 // /health, otherwise launches `openclaw gateway run --port 18789`,
 // sleeps 10s, and re-checks. Mirrors the legacy `ensureGatewayRunning`
-// helper from test/openclaw-tui-chat-correlation.test.ts.
+// helper from test/agents/openclaw/openclaw-tui-chat-correlation.test.ts.
 async function ensureSandboxGatewayRunning(
   sandbox: SandboxClient,
   sandboxName: string,
@@ -549,7 +552,6 @@ async function runLiveIssue2603ReproWithEventCaptureRetry(
 
 // ─── The live regression guard ─────────────────────────────────────
 
-// biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
 test(
   "openclaw-tui-chat-correlation keeps rapid sends correlated and accepts terminal input after connected idle (#2603, #3145, #6194)",
   {
@@ -592,7 +594,7 @@ test(
     });
     expect(checkoutRef.exitCode, resultText(checkoutRef)).toBe(0);
     const refEvidence = verifyNemoClawRefFidelity({
-      expectedRef: process.env.NEMOCLAW_TUI_EXPECTED_CHECKOUT_SHA,
+      expectedRef: process.env.NEMOCLAW_E2E_EXPECTED_SHA,
       actualRef: checkoutRef.stdout.trim(),
       cliPath: host.commandPath,
       expectedCliPath: CLI_ENTRYPOINT,
@@ -648,7 +650,9 @@ test(
     const expectScript = artifacts.pathFor("issue6194-openclaw-tui.expect");
     const tuiSession = `${ISSUE6194_TUI_SESSION_PREFIX}-${instance.sandboxName}-${Date.now()}-${randomUUID()}`;
     precreateIssue6194Capture(captureFile);
-    writeFileSync(expectScript, buildIssue6194TuiExpectScript(), { mode: 0o700 });
+    writeFileSync(expectScript, buildIssue6194TuiExpectScript(), {
+      mode: 0o700,
+    });
     try {
       const tui = await host.command("expect", [expectScript], {
         artifactName: "issue6194-openclaw-tui-post-idle",

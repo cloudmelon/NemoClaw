@@ -5,12 +5,19 @@ import type {
   ContainerEngine,
   ContainerEngineCommandResult,
 } from "../../adapters/container-engine";
+import {
+  OPENSHELL_MAIN_PROCESS_SPEC_ENV,
+  parseOpenShellMainProcessSpecEnvValue,
+} from "../docker-startup-command-env";
 import { MANAGED_BOOTSTRAP_IDENTITY_ENV } from "./adapter";
 
-// OpenShell v0.0.101 Podman ownership contract. Keep the legacy managed marker,
-// but bind sandbox identity to the same labels and default-workspace name that
-// the pinned OpenShell release emits.
+// Transitional #11255 compatibility: delete this held-workload boundary when
+// the basic onboarder no longer stages a replacement before native launch.
+// Until then, bind Podman identity to the exact contract emitted by the pinned
+// OpenShell release.
 export const PODMAN_MANAGED_LABEL = "openshell.managed";
+export const PODMAN_OPENSHELL_MANAGED_BY_LABEL = "openshell.ai/managed-by";
+export const PODMAN_OPENSHELL_MANAGED_BY_VALUE = "openshell";
 export const PODMAN_SANDBOX_ID_LABEL = "openshell.ai/sandbox-id";
 export const PODMAN_SANDBOX_NAME_LABEL = "openshell.ai/sandbox-name";
 export const PODMAN_SANDBOX_NAMESPACE_LABEL = "openshell.ai/sandbox-namespace";
@@ -27,7 +34,6 @@ const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/u;
 const MAX_STRING_BYTES = 64 * 1024;
 const MAX_ARGV_BYTES = 128 * 1024;
 const MAX_CONTAINER_NAME_BYTES = 255;
-const OPENSHELL_DRIVER_IDLE_COMMAND = "sleep infinity";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -252,8 +258,10 @@ function parseObservation(
   if (state.Running !== true || state.Paused === true || state.Restarting === true) {
     throw new Error("Podman held workload must be stably running before bootstrap preparation.");
   }
-  const configuredUser = String(config.User ?? "");
-  if (configuredUser !== "" && configuredUser !== "0" && configuredUser !== "root") {
+  const configuredUser = String(config.User ?? "")
+    .trim()
+    .toLowerCase();
+  if (!["", "0", "0:0", "root", "root:root"].includes(configuredUser)) {
     throw new Error("Podman held workload does not use the image-owned root supervisor boundary.");
   }
   const supervisorArgv = Object.freeze([
@@ -273,8 +281,12 @@ function parseObservation(
     throw new Error("Podman held workload bootstrap identity binding changed before preparation.");
   }
   if (
-    exactEnvironmentValue(environment, "OPENSHELL_SANDBOX_COMMAND") !==
-    OPENSHELL_DRIVER_IDLE_COMMAND
+    !exactArrayEqual(
+      parseOpenShellMainProcessSpecEnvValue(
+        exactEnvironmentValue(environment, OPENSHELL_MAIN_PROCESS_SPEC_ENV),
+      ).command,
+      input.expectedHeldWorkloadArgv,
+    )
   ) {
     throw new Error("Podman held workload left the OpenShell idle hold boundary.");
   }
@@ -306,7 +318,7 @@ function sameObservation(
 }
 
 /**
- * Resolve and inspect one OpenShell v0.0.101 Podman workload twice. The caller
+ * Resolve and inspect one OpenShell Podman workload twice. The caller
  * receives only immutable ownership and startup evidence; replacement planning
  * remains in the provider transaction that owns the complete launch spec.
  */
@@ -323,7 +335,7 @@ export function inspectExactPodmanHeldWorkload(
   const sandboxName = safeSandboxName(input.sandboxName);
   const sandboxId = safeSandboxId(input.sandboxId);
   if (input.sandboxNamespace !== PODMAN_SANDBOX_NAMESPACE) {
-    throw new Error("Managed bootstrap Podman sandbox namespace must match OpenShell v0.0.101.");
+    throw new Error("Managed bootstrap Podman sandbox namespace must match OpenShell.");
   }
   const sandboxNamespace = PODMAN_SANDBOX_NAMESPACE;
   exactContainerName(sandboxName, sandboxId);

@@ -6,6 +6,8 @@
  * formatting helpers used across the CLI.
  */
 
+import { MAX_CANONICAL_ENDPOINT_LENGTH } from "./endpoint-url-safety.ts";
+
 export function compactText(value = ""): string {
   return String(value).replace(/\s+/g, " ").trim();
 }
@@ -21,8 +23,6 @@ export function stripEndpointSuffix(pathname = "", suffixes: string[] = []): str
 }
 
 export type EndpointFlavor = "anthropic" | "openai";
-
-const MAX_CANONICAL_ENDPOINT_LENGTH = 2048;
 
 export function normalizeProviderBaseUrl(
   value: string | URL | null | undefined,
@@ -78,6 +78,16 @@ export function isLoopbackHostname(hostname = ""): boolean {
   return (
     normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized)
   );
+}
+
+/**
+ * Classify a socket peer address as loopback. Dual-stack listeners report IPv4
+ * peers as IPv4-mapped IPv6 (`::ffff:127.0.0.1`), so strip that prefix first.
+ */
+export function isLoopbackRemoteAddress(remoteAddress: string | undefined): boolean {
+  if (!remoteAddress) return false;
+  const normalized = remoteAddress.replace(/^::ffff:/, "");
+  return normalized === "127.0.0.1" || normalized === "::1";
 }
 
 export function formatEnvAssignment(name: string, value: string): string {

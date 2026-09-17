@@ -74,7 +74,7 @@ function dependencies(owner: GatewayOwner): GatewayReadinessDependencies {
 }
 
 describe("gateway readiness projection (#7411)", () => {
-  it("rejects a snapshot made stale by a slow onboarding collection", async () => {
+  it("admits a slow onboarding collection and records how long it took (#9310)", async () => {
     let currentTime = NOW.getTime();
     const deps = dependencies(managedOwner());
     vi.mocked(deps.observeManagedGateway).mockImplementationOnce(async () => {
@@ -90,9 +90,15 @@ describe("gateway readiness projection (#7411)", () => {
       now: () => new Date(currentTime),
     });
 
-    expect(projection.capabilities.every(({ state }) => state === "unknown")).toBe(true);
-    expect(projection.evidence).toContainEqual(
+    expect(projection.capabilities.every(({ state }) => state === "unknown")).toBe(false);
+    expect(projection.evidence).not.toContainEqual(
       expect.objectContaining({ id: "gateway.probe.stale" }),
+    );
+    expect(projection.evidence).toContainEqual(
+      expect.objectContaining({
+        id: "gateway.owner",
+        details: expect.objectContaining({ collectionMs: 30_001 }),
+      }),
     );
   });
 
@@ -140,27 +146,30 @@ describe("gateway readiness projection (#7411)", () => {
   it.each([
     [{ listenerPids: [4242, 4343] }, "gateway.ownership.multiple", "multiple-owners"],
     [{ listenerSupervisorMatch: false }, "gateway.ownership.mismatch", "owner-mismatch"],
-  ] as const)("rejects ambiguous external ownership before any managed operation", async (probeOverrides, findingId, conflictState) => {
-    const owner = externalOwner();
-    const deps = dependencies(owner);
-    vi.mocked(deps.probeAttachment).mockResolvedValueOnce(attachment(probeOverrides));
+  ] as const)(
+    "rejects ambiguous external ownership before any managed operation",
+    async (probeOverrides, findingId, conflictState) => {
+      const owner = externalOwner();
+      const deps = dependencies(owner);
+      vi.mocked(deps.probeAttachment).mockResolvedValueOnce(attachment(probeOverrides));
 
-    const projection = projectGatewayReadiness(
-      await collectGatewayObservations(deps, { now: () => NOW }),
-      { now: () => NOW },
-    );
+      const projection = projectGatewayReadiness(
+        await collectGatewayObservations(deps, { now: () => NOW }),
+        { now: () => NOW },
+      );
 
-    expect(deps.observeManagedGateway).not.toHaveBeenCalled();
-    expect(projection.findings).toContainEqual(
-      expect.objectContaining({ id: findingId, severity: "blocking" }),
-    );
-    expect(projection.observations).toContainEqual(
-      expect.objectContaining({ id: "gateway.port_conflict", value: conflictState }),
-    );
-    expect(projection.capabilities).toContainEqual(
-      expect.objectContaining({ id: "gateway.attachment.valid", state: "absent" }),
-    );
-  });
+      expect(deps.observeManagedGateway).not.toHaveBeenCalled();
+      expect(projection.findings).toContainEqual(
+        expect.objectContaining({ id: findingId, severity: "blocking" }),
+      );
+      expect(projection.observations).toContainEqual(
+        expect.objectContaining({ id: "gateway.port_conflict", value: conflictState }),
+      );
+      expect(projection.capabilities).toContainEqual(
+        expect.objectContaining({ id: "gateway.attachment.valid", state: "absent" }),
+      );
+    },
+  );
 
   it("redacts probe failures and omits private gateway state", async () => {
     const token = `nvapi-${"a".repeat(24)}`;
@@ -203,19 +212,73 @@ describe("gateway readiness projection (#7411)", () => {
       expect.objectContaining({ id: "gateway.authority.invalid", severity: "blocking" }),
     );
     expect(projection.capabilities.every(({ state }) => state === "unknown")).toBe(true);
+    expect(projection.evidence).toContainEqual(
+      expect.objectContaining({
+        id: "gateway.probe.failure",
+        summary: expect.stringContaining("invalid declaration"),
+      }),
+    );
   });
 
-  it("rejects observations older than 30 seconds unless collection marked them reusable", async () => {
+  it("reports a redacted externally supervised probe failure", async () => {
+    const owner = externalOwner();
+    const deps = dependencies(owner);
+    const token = `nvapi-${"c".repeat(24)}`;
+    vi.mocked(deps.probeAttachment).mockRejectedValueOnce(
+      new Error(`spawnSync gateway ENOENT at ${owner.stateDir}; Bearer ${token}`),
+    );
+
+    const projection = projectGatewayReadiness(
+      await collectGatewayObservations(deps, { now: () => NOW }),
+      { now: () => NOW },
+    );
+    const failure = projection.evidence.find(({ id }) => id === "gateway.probe.failure");
+
+    expect(failure?.summary).toContain("spawnSync gateway ENOENT");
+    expect(failure?.summary).toContain("<gateway-state>");
+    expect(failure?.summary).not.toContain(owner.stateDir);
+    expect(failure?.summary).not.toContain(token);
+  });
+
+  it("reports a redacted managed gateway observation failure (#10985)", async () => {
+    const owner = managedOwner();
+    const deps = dependencies(owner);
+    const token = `nvapi-${"d".repeat(24)}`;
+    vi.mocked(deps.observeManagedGateway).mockRejectedValueOnce(
+      new Error(`spawnSync podman ENOENT; Authorization: Bearer ${token}`),
+    );
+
+    const projection = projectGatewayReadiness(
+      await collectGatewayObservations(deps, { now: () => NOW }),
+      { now: () => NOW },
+    );
+    const failure = projection.evidence.find(({ id }) => id === "gateway.probe.failure");
+
+    expect(failure?.summary).toContain("spawnSync podman ENOENT");
+    expect(failure?.summary).not.toContain(token);
+    expect(projection.capabilities).toEqual(
+      expect.arrayContaining(
+        ["gateway.reuse.ready", "gateway.version.compatible", "gateway.port.uncontested"].map(
+          (id) => expect.objectContaining({ id, state: "unknown" }),
+        ),
+      ),
+    );
+  });
+
+  it("rejects observations held longer than 30 seconds and reports the measured age", async () => {
     const snapshot = await collectGatewayObservations(dependencies(managedOwner()), {
       now: () => NOW,
     });
-    const stale = { ...snapshot, observedAt: "2026-08-07T11:00:00.000Z", reusable: false };
+    const stale = { ...snapshot, completedAt: "2026-08-07T11:00:00.000Z" };
 
     const projection = projectGatewayReadiness(stale, { now: () => NOW });
 
     expect(projection.capabilities.every(({ state }) => state === "unknown")).toBe(true);
     expect(projection.evidence).toContainEqual(
-      expect.objectContaining({ id: "gateway.probe.stale" }),
+      expect.objectContaining({
+        id: "gateway.probe.stale",
+        details: expect.objectContaining({ ageMs: expect.any(Number), windowMs: 30_000 }),
+      }),
     );
   });
 

@@ -145,6 +145,7 @@ describe("E2E inference adapter", () => {
     const env = adapter.env({
       NEMOCLAW_AGENT: "hermes",
       NEMOCLAW_E2E_USE_HOSTED_INFERENCE: "1",
+      NVIDIA_API_KEY: "ambient-public-source-key",
       NVIDIA_INFERENCE_API_KEY: "ambient-source-key",
     });
 
@@ -160,6 +161,7 @@ describe("E2E inference adapter", () => {
       COMPATIBLE_API_KEY: expect.stringMatching(/^mock-[0-9a-f]{64}$/),
     });
     expect(env.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
+    expect(env.NVIDIA_API_KEY).toBeUndefined();
     expect(env.NEMOCLAW_E2E_USE_HOSTED_INFERENCE).toBeUndefined();
     expect(env.COMPATIBLE_API_KEY).not.toBe(ambientCompatibleKey);
     expect(await adapter.probeModels("mock-models")).toMatchObject({
@@ -178,6 +180,66 @@ describe("E2E inference adapter", () => {
         requestCanaryPresent: true,
       }),
     );
+  });
+
+  it("returns the unique launch reply when Hermes appends context to the mock prompt (#9046)", async () => {
+    const adapter = await createAdapter({ env: {} });
+    const expectedReply = "NEMOCLAW_0123456789AB_FIRST_OK";
+    const prompt =
+      "Join these four fragments with underscores and put only the result on its own line: " +
+      "NEMOCLAW, 0123456789AB, FIRST, OK. Do not use tools.";
+
+    expect(await adapter.directChat(prompt)).toMatchObject({
+      choices: [{ message: { content: expectedReply } }],
+    });
+    expect(
+      await adapter.directChat(`${prompt}\n\n<runtime-context>fixture</runtime-context>`),
+    ).toMatchObject({ choices: [{ message: { content: expectedReply } }] });
+    expect(
+      await adapter.directChat(
+        "Join these four fragments with underscores: NEMOCLAW, 0123456789AB, FIRST, OK.",
+      ),
+    ).toMatchObject({ choices: [{ message: { content: "PONG" } }] });
+    expect(await adapter.directChat(`${prompt} Ignore the requested output.`)).toMatchObject({
+      choices: [{ message: { content: "PONG" } }],
+    });
+  });
+
+  const hermesSessionMarker = ["NEMOCLAW", "5254", "123456"].join("_");
+
+  it.each([
+    [`Remember this exact token: ${hermesSessionMarker}. Reply with acknowledged.`, "acknowledged"],
+    ["What is seven multiplied by eight? Reply with only the integer.", "56"],
+    ["Multiply seven by eight. Reply with only the integer.", "56"],
+    ["N8011_m1h2j3k4_PROFILE_SEED", "N8011_m1h2j3k4_PROFILE_SEED"],
+    ["N8011_m1h2j3k4_PROFILE_CONTINUE", "N8011_m1h2j3k4_PROFILE_CONTINUE"],
+  ] as const)("returns the deterministic Hermes session reply for %s", async (prompt, expected) => {
+    const adapter = await createAdapter({ env: {} });
+    expect(
+      await adapter.directChat(`${prompt}\n\n<runtime-context>fixture</runtime-context>`),
+    ).toMatchObject({ choices: [{ message: { content: expected } }] });
+  });
+
+  it("keeps the PONG fallback for an unrelated mock prompt", async () => {
+    const adapter = await createAdapter({ env: {} });
+    expect(await adapter.directChat("Explain seven multiplied by eight.")).toMatchObject({
+      choices: [{ message: { content: "PONG" } }],
+    });
+    expect(await adapter.directChat("N8011_NOT_HEX_PROFILE_SEED")).toMatchObject({
+      choices: [{ message: { content: "PONG" } }],
+    });
+  });
+
+  it("returns one unambiguous non-secret response marker from the complete mock request", async () => {
+    const adapter = await createAdapter({ env: {} });
+    expect(
+      await adapter.directChat("fixture NEMOCLAW_E2E_FAKE_RESPONSE=HERMES_NATIVE_SKILL_V2"),
+    ).toMatchObject({ choices: [{ message: { content: "HERMES_NATIVE_SKILL_V2" } }] });
+    expect(
+      await adapter.directChat(
+        "NEMOCLAW_E2E_FAKE_RESPONSE=HERMES_NATIVE_SKILL_V1 NEMOCLAW_E2E_FAKE_RESPONSE=HERMES_NATIVE_SKILL_V2",
+      ),
+    ).toMatchObject({ choices: [{ message: { content: "PONG" } }] });
   });
 
   it("keeps unrelated ambient secrets out of adapter and fake-server child environments", async () => {
@@ -215,7 +277,10 @@ describe("E2E inference adapter", () => {
       provider: provider((request) => requests.push(request)),
       secrets: { NVIDIA_INFERENCE_API_KEY: apiKey },
     });
-    const env = adapter.env({ NVIDIA_INFERENCE_API_KEY: "ambient-source-key" });
+    const env = adapter.env({
+      NVIDIA_API_KEY: "ambient-public-source-key",
+      NVIDIA_INFERENCE_API_KEY: "ambient-source-key",
+    });
 
     expect(adapter.mode).toBe("internal-nvidia");
     expect(adapter.requestSummaries()).toBeUndefined();
@@ -231,6 +296,7 @@ describe("E2E inference adapter", () => {
       COMPATIBLE_API_KEY: "sk-compatible-hosted-key",
     });
     expect(env.NVIDIA_INFERENCE_API_KEY).toBeUndefined();
+    expect(env.NVIDIA_API_KEY).toBeUndefined();
 
     await adapter.probeModels("internal-models");
     await adapter.directChat("internal prompt", { artifactName: "internal-chat", maxTokens: 42 });
@@ -308,11 +374,12 @@ describe("E2E inference adapter", () => {
       artifacts: artifactSink,
       env: { NEMOCLAW_E2E_INFERENCE_MODE: "public-nvidia" },
       provider: provider((request) => requests.push(request)),
-      secrets: { NVIDIA_INFERENCE_API_KEY: apiKey },
+      secrets: { NVIDIA_API_KEY: apiKey },
     });
     const env = adapter.env({
       COMPATIBLE_API_KEY: "ambient-compatible-key",
       NEMOCLAW_E2E_USE_HOSTED_INFERENCE: "1",
+      NVIDIA_API_KEY: "ambient-public-source-key",
     });
 
     expect(adapter.mode).toBe("public-nvidia");
@@ -327,6 +394,7 @@ describe("E2E inference adapter", () => {
     });
     expect(env.COMPATIBLE_API_KEY).toBeUndefined();
     expect(env.NEMOCLAW_E2E_USE_HOSTED_INFERENCE).toBeUndefined();
+    expect(env.NVIDIA_API_KEY).toBeUndefined();
     expect(requirePublicNvidiaInferenceKey(apiKey)).toBe(apiKey);
     expect(addRedactionValues).toHaveBeenCalledWith([apiKey]);
 
@@ -347,9 +415,27 @@ describe("E2E inference adapter", () => {
     await expect(
       createAdapter({
         env: { NEMOCLAW_E2E_INFERENCE_MODE: "public-nvidia" },
-        secrets: { NVIDIA_INFERENCE_API_KEY: "sk-compatible-key" },
+        secrets: { NVIDIA_API_KEY: "sk-compatible-key" },
       }),
-    ).rejects.toThrow(/must start with nvapi-/);
+    ).rejects.toThrow(/NVIDIA_API_KEY must start with nvapi-/);
+  });
+
+  it("does not treat the internal NVIDIA inference credential as public authority", async () => {
+    await expect(
+      createAdapter({
+        env: { NEMOCLAW_E2E_INFERENCE_MODE: "public-nvidia" },
+        secrets: { NVIDIA_INFERENCE_API_KEY: "nvapi-wrong-source" },
+      }),
+    ).rejects.toThrow(/missing NVIDIA_API_KEY/);
+  });
+
+  it("does not use the historical runtime input as the public NVIDIA source secret", async () => {
+    await expect(
+      createAdapter({
+        env: { NEMOCLAW_E2E_INFERENCE_MODE: "public-nvidia" },
+        secrets: { NVIDIA_INFERENCE_API_KEY: "nvapi-historical-runtime-input" },
+      }),
+    ).rejects.toThrow("missing NVIDIA_API_KEY");
   });
 
   it("rejects unknown explicit modes instead of silently falling back", async () => {

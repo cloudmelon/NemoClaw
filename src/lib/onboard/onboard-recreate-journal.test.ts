@@ -20,6 +20,7 @@ vi.mock("./gateway-teardown-authority", () => ({
 import type { Session } from "../state/onboard-session";
 import * as onboardSession from "../state/onboard-session";
 import * as registry from "../state/registry";
+import { fingerprintSandboxRecreateValue } from "./sandbox-recreate-transaction";
 import {
   fingerprintOnboardRecreateTargetIntent,
   type OnboardRecreateTargetIntent,
@@ -38,7 +39,6 @@ const BASE_INTENT: OnboardRecreateTargetIntent = {
   toolDisclosure: "progressive",
   dcodeAutoApprovalMode: null,
   observabilityEnabled: false,
-  policyTier: "restricted",
 };
 
 describe("non-resumed replacement target fingerprint (#7735)", () => {
@@ -48,18 +48,15 @@ describe("non-resumed replacement target fingerprint (#7735)", () => {
     );
   });
 
-  it("changes when a recorded replacement input changes", () => {
-    for (const drift of [
-      { observabilityEnabled: true },
-      { toolDisclosure: "direct" },
-      { sandboxGpuConfig: { sandboxGpuEnabled: true, mode: "all" } },
-      { dcodeAutoApprovalMode: "thread-opt-in" },
-      { policyTier: "balanced" },
-    ]) {
-      expect(fingerprintOnboardRecreateTargetIntent({ ...BASE_INTENT, ...drift })).not.toBe(
-        fingerprintOnboardRecreateTargetIntent(BASE_INTENT),
-      );
-    }
+  it.each([
+    { observabilityEnabled: true },
+    { toolDisclosure: "direct" },
+    { sandboxGpuConfig: { sandboxGpuEnabled: true, mode: "all" } },
+    { dcodeAutoApprovalMode: "thread-opt-in" },
+  ])("changes when a recorded replacement input changes [case %#]", (drift) => {
+    expect(fingerprintOnboardRecreateTargetIntent({ ...BASE_INTENT, ...drift })).not.toBe(
+      fingerprintOnboardRecreateTargetIntent(BASE_INTENT),
+    );
   });
 
   it("changes when the replacement targets another gateway", () => {
@@ -74,6 +71,8 @@ describe("non-resumed replacement target fingerprint (#7735)", () => {
 });
 
 const SANDBOX_ID = "sbx-71c9a4e08b";
+const SANDBOX_FINGERPRINT = fingerprintSandboxRecreateValue(SANDBOX_ID);
+const REPLACEMENT_FINGERPRINT = fingerprintSandboxRecreateValue("sbx-2f80d5a613");
 
 const NON_DEFAULT_TARGET = {
   sandboxName: "alpha",
@@ -100,6 +99,25 @@ function absentProbe() {
   };
 }
 
+function listedPresentProbe(phase = "Ready") {
+  return {
+    status: 0,
+    output: "",
+    stdout: JSON.stringify([
+      {
+        id: SANDBOX_ID,
+        name: "alpha",
+        labels: {},
+        resource_version: 1,
+        created_at: "2026-09-12T00:00:00Z",
+        phase,
+        current_policy_version: 1,
+      },
+    ]),
+    stderr: "",
+  };
+}
+
 describe("non-resumed onboard replacement journal (#7735)", () => {
   let session: Session;
 
@@ -110,6 +128,9 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
     vi.spyOn(onboardSession, "updateSession").mockImplementation((mutator) => {
       session = mutator(session) ?? session;
       return session;
+    });
+    vi.spyOn(onboardSession, "compareAndSwapSession").mockImplementation((matches, mutator) => {
+      return matches(session) ? ((session = mutator(session) ?? session), "updated") : "mismatch";
     });
     vi.spyOn(registry, "getSandbox").mockReturnValue({
       name: "alpha",
@@ -134,9 +155,9 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
     vi.restoreAllMocks();
   });
 
-  function open(intent: OnboardRecreateTargetIntent = BASE_INTENT) {
+  function open(intent: OnboardRecreateTargetIntent = BASE_INTENT, target = NON_DEFAULT_TARGET) {
     return openOnboardRecreateJournal({
-      target: NON_DEFAULT_TARGET,
+      target,
       agentName: "openclaw",
       intent,
       note: vi.fn(),
@@ -160,6 +181,7 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
     open();
 
     expect(mocks.resolveGatewayTeardownAuthority).toHaveBeenCalledWith({
+      sandboxName: "alpha",
       gatewayName: "nemoclaw-9090",
       gatewayPort: 9090,
     });
@@ -177,10 +199,17 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
   it("queries only the journaled gateway so a sibling gateway is never reached", () => {
     open();
 
-    for (const call of mocks.captureOpenshell.mock.calls) {
-      expect(call[0]).toEqual(["sandbox", "get", "-g", "nemoclaw-9090", "alpha"]);
-    }
-    expect(mocks.captureOpenshell).toHaveBeenCalled();
+    const expectedCommand = ["sandbox", "get", "-g", "nemoclaw-9090", "alpha"];
+    const expectedOptions = {
+      ignoreError: true,
+      includeStderr: true,
+      includeStreams: true,
+      timeout: 15_000,
+    };
+    expect(mocks.captureOpenshell.mock.calls).toEqual([
+      [expectedCommand, expectedOptions],
+      [expectedCommand, expectedOptions],
+    ]);
   });
 
   it("journals a not-ready repair before the delete boundary", () => {
@@ -219,7 +248,7 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
     runtime.confirmDeleted();
     runtime.advance("creating");
     mocks.captureOpenshell.mockReturnValue(livePresentProbe());
-    runtime.recordCreated();
+    runtime.recordCreated({ state: "ready", liveIdentityFingerprint: SANDBOX_FINGERPRINT });
 
     runtime.complete();
 
@@ -233,7 +262,7 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
     first.confirmDeleted();
     first.advance("creating");
     mocks.captureOpenshell.mockReturnValue(replacementProbe());
-    first.recordCreated();
+    first.recordCreated({ state: "ready", liveIdentityFingerprint: REPLACEMENT_FINGERPRINT });
     first.advance("registry_committing");
     vi.spyOn(registry, "getSandbox").mockReturnValue({
       name: "alpha",
@@ -257,7 +286,7 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
     first.confirmDeleted();
     first.advance("creating");
     mocks.captureOpenshell.mockReturnValue(replacementProbe());
-    first.recordCreated();
+    first.recordCreated({ state: "ready", liveIdentityFingerprint: REPLACEMENT_FINGERPRINT });
     first.advance("completed");
     vi.spyOn(registry, "getSandbox").mockReturnValue({
       name: "alpha",
@@ -312,13 +341,88 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
     expect(session.checkpoint?.sandboxRecreate ?? null).toBeNull();
   });
 
-  it("fails closed when the gateway reports neither a live sandbox nor explicit absence", () => {
-    mocks.captureOpenshell.mockReturnValue({
+  it.each([
+    `Error: code: 'Internal error', message: "h2 protocol error"`,
+    `Error: code: 'Permission denied', message: "sandbox has no spec"`,
+    `Error: code: 'Internal error', message: "sandbox has no spec"\nconnection refused`,
+    `Error: code: 'Permission denied', message: "provider 'compatible-endpoint' not found"`,
+    `Error: code: 'The system is not in a state required for the operation's execution', message: "gateway 'nemoclaw' not found"`,
+    `Error: code: 'The system is not in a state required for the operation's execution', message: "provider 'compatible-endpoint' not found"\nconnection refused`,
+  ])("does not inventory an unrelated or mixed diagnostic [case %#]", (stderr) => {
+    mocks.captureOpenshell.mockReturnValue({ status: 1, output: "", stdout: "", stderr });
+    expect(() => open()).toThrow(/neither a live sandbox nor explicit absence/);
+    expect(session.checkpoint?.sandboxRecreate ?? null).toBeNull();
+    expect(mocks.captureOpenshell).toHaveBeenCalledTimes(1);
+    expect(mocks.captureOpenshell).not.toHaveBeenCalledWith(
+      ["sandbox", "list", "-g", "nemoclaw-9090", "-o", "json"],
+      expect.anything(),
+    );
+  });
+
+  it.each([
+    'status: Internal, message: "sandbox has no spec", details: []',
+    `Error: code: 'Internal error', message: "sandbox has no spec"`,
+    `Error:   × code: 'Internal error', message: "sandbox has no spec"\n`,
+    `Error:   × code: 'Internal error',\n  │ message: "sandbox has no spec"\n`,
+    `Error:   × code: 'The system is not in a state required for the operation's\n  │ execution', message: "provider 'compatible-endpoint' not found"\n\n`,
+  ])("journals retained legacy identity for the OpenShell diagnostic [case %#]", (diagnostic) => {
+    const configFailure = {
       status: 1,
       output: "",
       stdout: "",
-      stderr: "Error: connection refused",
+      stderr: diagnostic,
+    };
+    mocks.captureOpenshell
+      .mockReturnValueOnce(configFailure)
+      .mockReturnValueOnce(listedPresentProbe("Provisioning"))
+      .mockReturnValueOnce(configFailure)
+      .mockReturnValueOnce(listedPresentProbe("Provisioning"));
+
+    open();
+
+    expect(session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "planned",
+      sourceLiveIdentityFingerprint: SANDBOX_FINGERPRINT,
     });
+    expect(mocks.captureOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "list", "-g", "nemoclaw-9090", "-o", "json"],
+      expect.objectContaining({ timeout: 15_000 }),
+    );
+  });
+
+  it.each([
+    { status: 1, stdout: "", stderr: "transport error" },
+    { status: 0, stdout: "malformed-json", stderr: "" },
+  ])("reports inconclusive inventory without exposing its output [case %#]", (inventory) => {
+    mocks.captureOpenshell
+      .mockReturnValueOnce({
+        status: 1,
+        output: "",
+        stdout: "",
+        stderr: `Error: code: 'Internal error', message: "sandbox has no spec"`,
+      })
+      .mockReturnValueOnce({ ...inventory, output: "credential-canary" });
+    let thrown: unknown;
+    try {
+      open();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/Legacy config is unreadable; inventory=unknown/);
+    expect((thrown as Error).message).not.toContain("credential-canary");
+    expect(session.checkpoint?.sandboxRecreate ?? null).toBeNull();
+  });
+
+  it("does not infer deletion from an empty inventory after a config read fails", () => {
+    mocks.captureOpenshell
+      .mockReturnValueOnce({
+        status: 1,
+        output: "",
+        stdout: "",
+        stderr: 'status: Internal, message: "sandbox has no spec", details: []',
+      })
+      .mockReturnValueOnce({ status: 0, output: "", stdout: "[]", stderr: "" });
 
     expect(() => open()).toThrow(/neither a live sandbox nor explicit absence/);
     expect(session.checkpoint?.sandboxRecreate ?? null).toBeNull();
@@ -343,5 +447,78 @@ describe("non-resumed onboard replacement journal (#7735)", () => {
 
     expect(session.checkpoint?.sandboxRecreate?.phase).toBe("deleted");
     expect(session.checkpoint?.sandboxRecreate?.sourceLiveIdentityFingerprint).toBeNull();
+  });
+
+  it("accepts OpenShell 0.0.116 wrapped missing-sandbox evidence", () => {
+    mocks.captureOpenshell.mockReturnValue({
+      status: 1,
+      output: "",
+      stdout: "",
+      stderr:
+        "Error:   × code: 'Some requested entity was not found', message:\n" +
+        '  │ "sandbox not found"',
+    });
+
+    open();
+
+    expect(session.checkpoint?.sandboxRecreate?.phase).toBe("deleted");
+    expect(session.checkpoint?.sandboxRecreate?.sourceLiveIdentityFingerprint).toBeNull();
+  });
+
+  it("starts a fresh journal when the stranded one no longer owns a replacement (#10473)", () => {
+    vi.spyOn(registry, "getSandbox").mockReturnValue({
+      name: "alpha",
+      agent: "openclaw",
+      gatewayName: "nemoclaw-9090",
+      gatewayPort: 9090,
+      lifecycleGeneration: "44444444-4444-4444-8444-444444444444",
+      lifecycleLiveIdentityFingerprint: SANDBOX_FINGERPRINT,
+    } as registry.SandboxEntry);
+    const stranded = open();
+    stranded.advance("deleted");
+    expect(session.checkpoint?.sandboxRecreate?.phase).toBe("deleted");
+
+    const restarted = open();
+
+    expect(restarted.targetGeneration).not.toBe(stranded.targetGeneration);
+    expect(restarted.acceptedTarget).toBe(false);
+    expect(session.checkpoint?.sandboxRecreate).toMatchObject({
+      phase: "planned",
+      revision: 0,
+      sourceLiveIdentityFingerprint: SANDBOX_FINGERPRINT,
+    });
+  });
+
+  it("keeps a stranded journal when the matching source is on another gateway (#10473)", () => {
+    mocks.captureOpenshell.mockReturnValue(absentProbe());
+    open();
+    const stranded = session.checkpoint?.sandboxRecreate;
+    expect(stranded).toMatchObject({ gatewayName: "nemoclaw-9090", phase: "deleted" });
+
+    // Same sandbox name and same live identity, but the row and the probe now
+    // describe a sandbox on a different gateway. The journal may still own an
+    // unregistered replacement on nemoclaw-9090, so it must survive.
+    mocks.captureOpenshell.mockReturnValue(livePresentProbe());
+    vi.spyOn(registry, "getSandbox").mockReturnValue({
+      name: "alpha",
+      agent: "openclaw",
+      gatewayName: "nemoclaw-7070",
+      gatewayPort: 7070,
+      lifecycleGeneration: "44444444-4444-4444-8444-444444444444",
+      lifecycleLiveIdentityFingerprint: SANDBOX_FINGERPRINT,
+    } as registry.SandboxEntry);
+
+    expect(() =>
+      open(BASE_INTENT, {
+        sandboxName: "alpha",
+        gatewayName: "nemoclaw-7070",
+        gatewayPort: 7070,
+      }),
+    ).toThrow(/different recreate transaction in progress/);
+    expect(session.checkpoint?.sandboxRecreate).toMatchObject({
+      id: stranded?.id,
+      gatewayName: "nemoclaw-9090",
+      phase: "deleted",
+    });
   });
 });

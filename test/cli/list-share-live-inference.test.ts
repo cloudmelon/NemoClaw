@@ -66,6 +66,53 @@ function createShareTestEnv(prefix: string): Record<string, string> {
 }
 
 describe("list shows live gateway inference", () => {
+  it("redacts URL credentials while reporting raw route drift", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-list-redacted-drift-"));
+    const localBin = path.join(home, "bin");
+    const registryDir = path.join(home, ".nemoclaw");
+    fs.mkdirSync(localBin, { recursive: true });
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(registryDir, "sandboxes.json"),
+      JSON.stringify({
+        sandboxes: {
+          test: {
+            name: "test",
+            model: "https://stored-user:stored-password@example.com/model",
+            provider: "https://stored-user:stored-password@example.com/provider",
+          },
+        },
+        defaultSandbox: "test",
+      }),
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      path.join(localBin, "openshell"),
+      [
+        "#!/usr/bin/env bash",
+        'if [ "$1" = "inference" ] && [ "$2" = "get" ]; then',
+        "  echo 'Gateway inference:'",
+        "  echo '  Provider: live-provider'",
+        "  echo '  Model: live-model'",
+        "  echo '  Version: 1'",
+        "  exit 0",
+        "fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    const result = runWithEnv("list", {
+      HOME: home,
+      PATH: `${localBin}:${process.env.PATH || ""}`,
+    });
+
+    expect(result.code).toBe(0);
+    expect(result.out).not.toMatch(/stored-(?:user|password)/);
+    expect(result.out).toContain("model: live-model  provider: live-provider");
+    expect(result.out).toContain("live OpenShell gateway differs from onboarded");
+  });
+
   it("shows live gateway inference for the default sandbox (#2369)", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-list-live-"));
     const localBin = path.join(home, "bin");
@@ -81,7 +128,6 @@ describe("list shows live gateway inference", () => {
             model: "configured-model",
             provider: "configured-provider",
             gpuEnabled: true,
-            policies: ["pypi", "npm"],
           },
         },
         defaultSandbox: "test",
@@ -100,6 +146,15 @@ describe("list shows live gateway inference", () => {
         "  echo '  Version: 1'",
         "  exit 0",
         "fi",
+        'if [ "$1" = "policy" ] && [ "$2" = "get" ]; then',
+        "  cat <<'YAML'",
+        "version: 1",
+        "network_policies:",
+        "  pypi: {}",
+        "  npm_yarn: {}",
+        "YAML",
+        "  exit 0",
+        "fi",
         "exit 0",
       ].join("\n"),
       { mode: 0o755 },
@@ -113,11 +168,11 @@ describe("list shows live gateway inference", () => {
     expect(r.code).toBe(0);
     // Live gateway values render on the default sandbox's main row.
     expect(r.out).toContain(
-      "agent: openclaw  model: nvidia/nemotron-3-super-120b-a12b  provider: nvidia-prod  sandbox GPU  policies: pypi, npm",
+      "agent: openclaw  model: nvidia/nemotron-3-super-120b-a12b  provider: nvidia-prod  sandbox GPU  policies: npm, pypi",
     );
     // The stale (stored) row must not appear.
     expect(r.out).not.toContain(
-      "agent: openclaw  model: configured-model  provider: configured-provider  sandbox GPU  policies: pypi, npm",
+      "agent: openclaw  model: configured-model  provider: configured-provider  sandbox GPU  policies: npm, pypi",
     );
     // Onboarded values appear in an explicit live-gateway drift annotation.
     expect(r.out).toContain(
@@ -140,7 +195,6 @@ describe("list shows live gateway inference", () => {
             model: "llama3.2:1b",
             provider: "ollama-local",
             gpuEnabled: false,
-            policies: [],
           },
         },
         defaultSandbox: "test",
@@ -179,7 +233,6 @@ describe("list shows live gateway inference", () => {
       model: "configured-model",
       provider: "nvidia-prod",
       gpuEnabled: false,
-      policies: ["pypi"],
     });
     fs.writeFileSync(
       path.join(localBin, "openshell"),
@@ -234,7 +287,6 @@ describe("list shows live gateway inference", () => {
               model: "nvidia/nemotron-3-super-120b-a12b",
               provider: "nvidia-prod",
               gpuEnabled: false,
-              policies: [],
               agentVersion: "2026.3.11",
             },
           },
@@ -281,7 +333,7 @@ describe("list shows live gateway inference", () => {
         PATH: `${localBin}:${process.env.PATH || ""}`,
       });
 
-      expect(r.code).toBe(0);
+      expect(r.code).toBe(1); // #10211: --check now exits nonzero when it finds a stale sandbox.
       // Should report the stale sandbox with version info
       expect(r.out).toContain("my-agent");
       expect(r.out).toContain("2026.3.11");
@@ -309,7 +361,6 @@ describe("list shows live gateway inference", () => {
               model: "nvidia/nemotron-3-super-120b-a12b",
               provider: "nvidia-prod",
               gpuEnabled: false,
-              policies: [],
               agentVersion: "9999.12.31",
             },
           },
@@ -386,7 +437,6 @@ describe("list shows live gateway inference", () => {
               model: "nvidia/nemotron-3-super-120b-a12b",
               provider: "nvidia-prod",
               gpuEnabled: false,
-              policies: [],
               agentVersion: OPENCLAW_EXPECTED_VERSION,
               nemoclawVersion: "0.0.1",
             },
@@ -432,7 +482,7 @@ describe("list shows live gateway inference", () => {
         PATH: `${localBin}:${process.env.PATH || ""}`,
       });
 
-      expect(r.code).toBe(0);
+      expect(r.code).toBe(1); // #10211: --check now exits nonzero when it finds a stale sandbox.
       expect(r.out).not.toContain("All sandboxes are up to date.");
       expect(r.out).toContain("my-agent");
       // Surfaces the NemoClaw image drift with the stale recorded fingerprint.
@@ -460,7 +510,6 @@ describe("list shows live gateway inference", () => {
               model: "nvidia/nemotron-3-super-120b-a12b",
               provider: "nvidia-prod",
               gpuEnabled: false,
-              policies: [],
               agentVersion: "2026.5.18",
             },
           },
@@ -502,7 +551,7 @@ describe("list shows live gateway inference", () => {
         PATH: `${localBin}:${process.env.PATH || ""}`,
       });
 
-      expect(r.code).toBe(0);
+      expect(r.code).toBe(1); // #10211: --check now exits nonzero when it finds a stale sandbox.
       expect(r.out).toContain("my-agent");
       expect(r.out).toContain("2026.3.11");
       expect(r.out).toMatch(/stale|need upgrading/i);
@@ -516,29 +565,36 @@ describe("list shows live gateway inference", () => {
     const r = runWithEnv("alpha share", env);
 
     expect(r.code).toBe(0);
-    expect(r.out).toContain("$ nemoclaw sandbox share <mount|unmount|status> <name>");
+    expect(r.out).toContain("$ nemoclaw alpha share <mount|unmount|status>");
     expect(r.out).toContain("mount");
     expect(r.out).toContain("unmount");
     expect(r.out).toContain("status");
   });
 
-  it("share help uses native oclif usage", testTimeoutOptions(15_000), () => {
-    const env = createShareTestEnv("nemoclaw-cli-share-help-");
+  it.each(
+    Array.from(
+      [
+        ["mount", "alpha share mount [sandbox-path] [local-mount-point]"],
+        ["unmount", "alpha share unmount [local-mount-point]"],
+        ["status", "alpha share status [local-mount-point]"],
+      ],
+      ([subcommand, usage]) => ({ subcommand, usage }),
+    ),
+  )(
+    "$subcommand share help shows sandbox-first usage",
+    testTimeoutOptions(15_000),
+    ({ subcommand, usage }) => {
+      const env = createShareTestEnv("nemoclaw-cli-share-help-");
 
-    const parent = runWithEnv("alpha share --help", env);
-    expect(parent.code).toBe(0);
-    expect(parent.out).toContain("$ nemoclaw sandbox share <mount|unmount|status> <name>");
+      const parent = runWithEnv("alpha share --help", env);
+      expect(parent.code).toBe(0);
+      expect(parent.out).toContain("$ nemoclaw alpha share <mount|unmount|status>");
 
-    for (const [subcommand, usage] of [
-      ["mount", "share mount <name> [sandbox-path] [local-mount-point]"],
-      ["unmount", "share unmount <name> [local-mount-point]"],
-      ["status", "share status <name> [local-mount-point]"],
-    ]) {
       const result = runWithEnv(`alpha share ${subcommand} --help`, env);
       expect(result.code).toBe(0);
-      expect(result.out).toContain(`$ nemoclaw sandbox ${usage}`);
-    }
-  });
+      expect(result.out).toContain(`$ nemoclaw ${usage}`);
+    },
+  );
 
   it(
     "share is recognized as a valid sandbox action (not 'Unknown action')",

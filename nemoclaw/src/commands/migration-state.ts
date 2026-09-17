@@ -3,7 +3,6 @@
 
 import { createHash } from "node:crypto";
 import {
-  chmodSync,
   copyFileSync,
   cpSync,
   existsSync,
@@ -11,7 +10,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  renameSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -20,6 +19,7 @@ import path from "node:path";
 import JSON5 from "json5";
 import { create as createTar } from "tar";
 import type { PluginLogger } from "../index.js";
+import { reserveSnapshotDir } from "../blueprint/snapshot-directory.js";
 import {
   CREDENTIAL_SENSITIVE_BASENAMES,
   isSensitiveFile,
@@ -30,6 +30,10 @@ import {
   sanitizeOpenClawConfigFile,
 } from "../security/snapshot-sanitizer.js";
 import { isObjectRecord, type UnknownRecord } from "../shared/object-record.js";
+import {
+  restoreDescriptorSnapshotReplacements,
+  type DescriptorRestoreReplacement,
+} from "../shared/migration-restore-boundary.cjs";
 import {
   decodeDescriptorSnapshotContent,
   inspectDescriptorSnapshotRoot,
@@ -75,6 +79,7 @@ export interface HostOpenClawState {
 
 export interface SnapshotManifest {
   version: number;
+  timestamp?: string;
   createdAt: string;
   homeDir: string;
   stateDir: string;
@@ -112,7 +117,8 @@ function readString(value: unknown): string | null {
 
 function readTrimmedString(value: unknown): string | null {
   const trimmed = readString(value)?.trim();
-  return trimmed ? trimmed : null;
+  if (!trimmed) return null;
+  return trimmed;
 }
 
 function readRecord(value: unknown): UnknownRecord | null {
@@ -139,7 +145,8 @@ function parseConfigDocument(value: unknown, context: string): OpenClawConfigDoc
 }
 
 function resolveHostHome(env: NodeJS.ProcessEnv = process.env): string {
-  const fallbackHome = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir();
+  const fallbackHome =
+    readTrimmedString(env.HOME) ?? readTrimmedString(env.USERPROFILE) ?? os.homedir();
   const explicitHome = env.OPENCLAW_HOME?.trim();
   if (explicitHome) {
     if (explicitHome === "~") {
@@ -549,6 +556,52 @@ function copyDirectory(
   });
 }
 
+function resolveThroughExistingAncestor(inputPath: string): string {
+  let existingPath = path.resolve(inputPath);
+  let existingStat: ReturnType<typeof lstatSync> | null = null;
+  const missingSegments: string[] = [];
+
+  while (true) {
+    try {
+      existingStat = lstatSync(existingPath);
+      break;
+    } catch (err: unknown) {
+      const errorCode = (err as NodeJS.ErrnoException).code;
+      const missingPath =
+        errorCode === "ENOENT" ||
+        errorCode === "ENOTDIR" ||
+        (err instanceof Error && err.message.startsWith("ENOENT:"));
+      if (!missingPath) {
+        throw err;
+      }
+    }
+    const parentPath = path.dirname(existingPath);
+    if (parentPath === existingPath) {
+      break;
+    }
+    missingSegments.unshift(path.basename(existingPath));
+    existingPath = parentPath;
+  }
+
+  const canonicalExistingPath =
+    existingStat && Object.hasOwn(existingStat, "dev") ? realpathSync(existingPath) : existingPath;
+  return normalizeHostPath(path.join(canonicalExistingPath, ...missingSegments));
+}
+
+function resolveContainedPath(candidatePath: string, rootPath: string): string | null {
+  try {
+    const resolvedRoot = resolveThroughExistingAncestor(rootPath);
+    const resolvedCandidate = resolveThroughExistingAncestor(candidatePath);
+    return isWithinRoot(resolvedCandidate, resolvedRoot) ? resolvedCandidate : null;
+  } catch {
+    return null;
+  }
+}
+
+function pathsOverlap(leftPath: string, rightPath: string): boolean {
+  return isWithinRoot(leftPath, rightPath) || isWithinRoot(rightPath, leftPath);
+}
+
 function writeSnapshotManifest(snapshotDir: string, manifest: SnapshotManifest): void {
   writeFileSync(path.join(snapshotDir, "snapshot.json"), JSON.stringify(manifest, null, 2));
 }
@@ -577,6 +630,7 @@ function isSnapshotManifest(value: unknown): value is SnapshotManifest {
   return (
     isObjectRecord(value) &&
     typeof value.version === "number" &&
+    (value.timestamp === undefined || typeof value.timestamp === "string") &&
     typeof value.createdAt === "string" &&
     typeof value.homeDir === "string" &&
     typeof value.stateDir === "string" &&
@@ -618,7 +672,7 @@ function loadCopiedConfigDocument(configPath: string): OpenClawConfigDocument {
     path.basename(configPath),
   );
   const scanned = scan?.files[0];
-  if (scan === null || scan.files.length !== 1 || scanned?.path !== path.basename(configPath)) {
+  if (scan?.files.length !== 1 || scanned?.path !== path.basename(configPath)) {
     throw new Error(`Failed descriptor-bound scan of copied OpenClaw config: ${configPath}`);
   }
   const raw = decodeDescriptorSnapshotContent(scanned.content);
@@ -673,9 +727,7 @@ export function setConfigValue(document: UnknownRecord, configPath: string, valu
     if (isArrayIndex) {
       const array = requireArray(current, configPath);
       const arrayIndex = Number.parseInt(token, 10);
-      if (array[arrayIndex] == null) {
-        array[arrayIndex] = isArrayIndexToken(nextToken) ? [] : {};
-      }
+      array[arrayIndex] ??= isArrayIndexToken(nextToken) ? [] : {};
       current = array[arrayIndex];
       continue;
     }
@@ -762,16 +814,17 @@ export function createSnapshotBundle(
     return null;
   }
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const parentDir = path.join(
+  const snapshotsDir = path.join(
     hostState.homeDir,
     ".nemoclaw",
     options.persist ? "snapshots" : "staging",
-    timestamp,
   );
+  // Empty until this operation owns a directory, so failure cleanup can never remove another one.
+  let parentDir = "";
 
   try {
-    mkdirSync(parentDir, { recursive: true });
+    parentDir = reserveSnapshotDir(snapshotsDir, Date.now());
+    const timestamp = path.basename(parentDir);
     const snapshotStateDir = path.join(parentDir, "openclaw");
     copyDirectory(hostState.stateDir, snapshotStateDir, { stripCredentials: true });
     sanitizeMigrationDirectory(snapshotStateDir);
@@ -808,6 +861,7 @@ export function createSnapshotBundle(
 
     const manifest: SnapshotManifest = {
       version: SNAPSHOT_VERSION,
+      timestamp,
       createdAt: new Date().toISOString(),
       homeDir: hostState.homeDir,
       stateDir: hostState.stateDir,
@@ -883,7 +937,14 @@ export function restoreSnapshotToHost(
 ): boolean {
   const manifest = readSnapshotManifest(snapshotDir);
   const snapshotStateDir = path.join(snapshotDir, "openclaw");
-  if (!existsSync(snapshotStateDir)) {
+  const resolvedSnapshotRoot = resolveContainedPath(snapshotDir, snapshotDir);
+  const resolvedSnapshotStateDir = resolveContainedPath(snapshotStateDir, snapshotDir);
+  if (
+    !resolvedSnapshotRoot ||
+    !resolvedSnapshotStateDir ||
+    !existsSync(snapshotStateDir) ||
+    !lstatSync(snapshotStateDir).isDirectory()
+  ) {
     logger.error(`Snapshot directory not found: ${snapshotStateDir}`);
     return false;
   }
@@ -892,9 +953,16 @@ export function restoreSnapshotToHost(
   // Use the host's actual home directory — NOT manifest.homeDir which is
   // attacker-controlled data from the snapshot JSON.
   const trustedRoot = resolveHostHome();
+  const resolvedTrustedRoot = resolveContainedPath(trustedRoot, trustedRoot);
+  const resolvedManifestHome = resolveContainedPath(manifest.homeDir, trustedRoot);
 
   // Validate manifest.homeDir itself is within trusted root
-  if (typeof manifest.homeDir !== "string" || !isWithinRoot(manifest.homeDir, trustedRoot)) {
+  if (
+    typeof manifest.homeDir !== "string" ||
+    !resolvedTrustedRoot ||
+    !resolvedManifestHome ||
+    !isWithinRoot(resolvedManifestHome, resolvedTrustedRoot)
+  ) {
     logger.error(
       `Snapshot manifest homeDir is outside the trusted host root. ` +
         `Refusing to restore. homeDir=${manifest.homeDir}, trustedRoot=${trustedRoot}`,
@@ -905,6 +973,11 @@ export function restoreSnapshotToHost(
   // Validate stateDir type and containment
   if (typeof manifest.stateDir !== "string") {
     logger.error(`Snapshot manifest stateDir is not a string. Refusing to restore.`);
+    return false;
+  }
+  const resolvedStateDir = resolveContainedPath(manifest.stateDir, manifest.stateDir);
+  if (!resolvedStateDir) {
+    logger.error(`Snapshot manifest stateDir cannot be resolved safely. Refusing to restore.`);
     return false;
   }
 
@@ -919,7 +992,7 @@ export function restoreSnapshotToHost(
       );
       return false;
     }
-  } else if (!isWithinRoot(manifest.stateDir, trustedRoot)) {
+  } else if (!isWithinRoot(resolvedStateDir, resolvedTrustedRoot)) {
     logger.error(
       `Snapshot manifest stateDir is outside the trusted host root. ` +
         `Refusing to restore. stateDir=${manifest.stateDir}, trustedRoot=${trustedRoot}`,
@@ -927,6 +1000,53 @@ export function restoreSnapshotToHost(
     return false;
   }
 
+  const externalRestores: Array<{
+    root: MigrationExternalRoot;
+    snapshotPath: string;
+    resolvedSnapshotPath: string;
+    resolvedTarget: string;
+  }> = [];
+  for (const root of manifest.externalRoots) {
+    const expectedRelativePath = path.join("external", root.id);
+    const snapshotPath = path.join(snapshotDir, root.snapshotRelativePath);
+    const resolvedSnapshotPath = resolveContainedPath(snapshotPath, snapshotDir);
+    const resolvedTarget = resolveContainedPath(root.sourcePath, trustedRoot);
+    if (
+      root.snapshotRelativePath !== expectedRelativePath ||
+      !resolvedSnapshotPath ||
+      !existsSync(snapshotPath) ||
+      !lstatSync(snapshotPath).isDirectory()
+    ) {
+      logger.error(`Snapshot external root is missing or invalid: ${root.snapshotRelativePath}`);
+      return false;
+    }
+    if (
+      !path.isAbsolute(root.sourcePath) ||
+      !resolvedTarget ||
+      resolvedTarget === resolvedTrustedRoot ||
+      pathsOverlap(resolvedTarget, resolvedStateDir)
+    ) {
+      logger.error(
+        `Snapshot external root is outside the trusted host root or overlaps OpenClaw state. ` +
+          `Refusing to restore. sourcePath=${root.sourcePath}, trustedRoot=${trustedRoot}`,
+      );
+      return false;
+    }
+    const overlappingRoot = externalRestores.find((entry) =>
+      pathsOverlap(entry.resolvedTarget, resolvedTarget),
+    );
+    if (overlappingRoot) {
+      logger.error(
+        overlappingRoot.resolvedTarget === resolvedTarget
+          ? `Snapshot external root target is duplicated: ${root.sourcePath}`
+          : `Snapshot external root targets overlap: ${overlappingRoot.root.sourcePath} and ${root.sourcePath}`,
+      );
+      return false;
+    }
+    externalRestores.push({ root, snapshotPath, resolvedSnapshotPath, resolvedTarget });
+  }
+
+  let resolvedConfigPath: string | null = null;
   if (manifest.hasExternalConfig) {
     // Validate configPath type — fail closed when hasExternalConfig is true
     // but configPath is null/empty (partial restore would silently skip config).
@@ -948,10 +1068,25 @@ export function restoreSnapshotToHost(
         );
         return false;
       }
-    } else if (!isWithinRoot(manifest.configPath, trustedRoot)) {
+      resolvedConfigPath = resolveContainedPath(manifest.configPath, manifest.configPath);
+    } else {
+      resolvedConfigPath = resolveContainedPath(manifest.configPath, trustedRoot);
+    }
+    if (!resolvedConfigPath) {
       logger.error(
         `Snapshot manifest configPath is outside the trusted host root. ` +
           `Refusing to restore. configPath=${manifest.configPath}, trustedRoot=${trustedRoot}`,
+      );
+      return false;
+    }
+    const canonicalConfigPath = resolvedConfigPath;
+    if (
+      pathsOverlap(resolvedConfigPath, resolvedStateDir) ||
+      externalRestores.some((entry) => pathsOverlap(canonicalConfigPath, entry.resolvedTarget))
+    ) {
+      logger.error(
+        `Snapshot external config overlaps a restored directory. ` +
+          `Refusing to restore. configPath=${manifest.configPath}`,
       );
       return false;
     }
@@ -990,34 +1125,63 @@ export function restoreSnapshotToHost(
     }
   }
 
-  try {
-    if (existsSync(manifest.stateDir)) {
-      const archiveName = `${manifest.stateDir}.nemoclaw-archived-${String(Date.now())}`;
-      renameSync(manifest.stateDir, archiveName);
-      logger.info(`Archived current state directory to ${archiveName}`);
+  const replacements: DescriptorRestoreReplacement[] = [
+    {
+      sourcePath: resolvedSnapshotStateDir,
+      targetPath: normalizeHostPath(manifest.stateDir),
+      label: "OpenClaw state directory",
+      kind: "directory",
+      ...(!manifest.hasExternalConfig && existsSync(path.join(snapshotStateDir, "openclaw.json"))
+        ? { modeOverrides: [{ relativePath: "openclaw.json", mode: 0o600 }] }
+        : {}),
+    },
+    ...externalRestores.map(({ root, resolvedSnapshotPath }) => ({
+      sourcePath: resolvedSnapshotPath,
+      targetPath: normalizeHostPath(root.sourcePath),
+      label: root.label,
+      kind: "directory" as const,
+    })),
+  ];
+
+  if (manifest.hasExternalConfig && manifest.configPath && resolvedConfigPath) {
+    const configSnapshotPath = path.join(snapshotDir, "config", "openclaw.json");
+    const resolvedConfigSnapshotPath = resolveContainedPath(configSnapshotPath, snapshotDir);
+    if (
+      !resolvedConfigSnapshotPath ||
+      !existsSync(configSnapshotPath) ||
+      !lstatSync(configSnapshotPath).isFile()
+    ) {
+      logger.error(`Snapshot external config is missing or invalid: ${configSnapshotPath}`);
+      return false;
     }
+    replacements.push({
+      sourcePath: resolvedConfigSnapshotPath,
+      targetPath: normalizeHostPath(manifest.configPath),
+      label: "external config",
+      kind: "file",
+      mode: 0o600,
+    });
+  }
 
-    mkdirSync(path.dirname(manifest.stateDir), { recursive: true });
-    copyDirectory(snapshotStateDir, manifest.stateDir);
-
-    if (manifest.hasExternalConfig && manifest.configPath) {
-      const configSnapshotPath = path.join(snapshotDir, "config", "openclaw.json");
-      mkdirSync(path.dirname(manifest.configPath), { recursive: true });
-      copyFileSync(configSnapshotPath, manifest.configPath);
-      chmodSync(manifest.configPath, 0o600);
-      logger.info(`Restored external config to ${manifest.configPath}`);
-    } else {
-      const restoredBundledConfigPath = path.join(manifest.stateDir, "openclaw.json");
-      if (existsSync(restoredBundledConfigPath)) {
-        chmodSync(restoredBundledConfigPath, 0o600);
-      }
-    }
-
-    logger.info("Host OpenClaw state restored.");
-    return true;
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.error(`Restoration failed: ${msg}`);
+  const result = restoreDescriptorSnapshotReplacements(replacements);
+  if (!result.ok) {
+    const recovery = result.rollbackFailures.length
+      ? `Rollback incomplete (${result.rollbackFailures.join("; ")}). Archives: ${result.retainedArchives.join(", ") || "none"}`
+      : result.phase === "commit"
+        ? "Previous host state was restored."
+        : "host state was not changed.";
+    logger.error(`Restoration failed during ${result.phase}: ${result.message}. ${recovery}`);
     return false;
   }
+  if (result.cleanupFailures.length) {
+    logger.warn(
+      `Host OpenClaw state restored, but archive cleanup was incomplete: ${result.cleanupFailures.join("; ")}. ` +
+        `Retained archives: ${result.retainedArchives.join(", ") || "none"}`,
+    );
+  }
+  for (const replacement of replacements) {
+    logger.info(`Restored ${replacement.label} to ${replacement.targetPath}`);
+  }
+  logger.info("Host OpenClaw state restored.");
+  return true;
 }

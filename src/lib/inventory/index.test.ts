@@ -69,6 +69,7 @@ describe("inventory commands", () => {
         recoveredFromGateway: 0,
       },
       lastOnboardedSandbox: "alpha",
+      incompleteOnboarding: null,
       sandboxes: [],
     });
     expect(getLiveInference).not.toHaveBeenCalled();
@@ -88,7 +89,6 @@ describe("inventory commands", () => {
             model: "configured-alpha",
             provider: "configured-provider",
             gpuEnabled: true,
-            policies: ["pypi"],
             agent: "openclaw",
           },
         ],
@@ -112,6 +112,7 @@ describe("inventory commands", () => {
         recoveredFromGateway: 2,
       },
       lastOnboardedSandbox: "alpha",
+      incompleteOnboarding: null,
       sandboxes: [
         {
           name: "alpha",
@@ -124,7 +125,7 @@ describe("inventory commands", () => {
           sandboxGpuDevice: null,
           openshellDriver: null,
           openshellVersion: null,
-          policies: ["pypi"],
+          policies: [],
           agent: "openclaw",
           isDefault: true,
           activeSessionCount: 1,
@@ -237,11 +238,81 @@ describe("inventory commands", () => {
     expect(inventory.sandboxes.map((sandbox) => sandbox.name)).toEqual(["real"]);
   });
 
-  it("keeps a created sandbox with a lingering pending reservation flag (#7609)", async () => {
+  it("reports a session-owned inference-route reservation as incomplete onboarding (#10097)", async () => {
     const inventory = await getSandboxInventory({
       recoverRegistryEntries: async () => ({
-        // createdAt is set, so this is a real sandbox — the filter must NOT hide
-        // it just because the reservation flag was not cleared.
+        sandboxes: [
+          {
+            name: "sandbox-d",
+            provider: "nvidia-prod",
+            model: "nvidia/model",
+            pendingRouteReservation: true,
+            reservationSessionId: "session-d",
+          },
+        ],
+        defaultSandbox: null,
+      }),
+      getLiveInference: () => null,
+      loadLastSession: () => ({
+        sessionId: "session-d",
+        resumable: true,
+        status: "failed",
+        sandboxName: "sandbox-d",
+        lastStepStarted: "inference",
+        lastCompletedStep: "inference",
+        failure: { step: "inference", interrupted: true },
+      }),
+    });
+
+    expect(inventory.incompleteOnboarding).toEqual({
+      name: "sandbox-d",
+      status: "failed",
+      step: "inference",
+      interrupted: true,
+      resumable: true,
+    });
+    expect(inventory.sandboxes).toEqual([]);
+
+    const lines: string[] = [];
+    renderSandboxInventoryText(inventory, (message = "") => lines.push(message));
+    expect(lines).toContain("  Incomplete onboarding:");
+    expect(lines).toContain("    sandbox-d  interrupted at inference");
+    expect(lines).toContain(
+      "      NemoClaw reserved the inference route but did not register the sandbox.",
+    );
+    expect(lines).toContain("      Resume with `nemoclaw onboard --resume`.");
+    expect(lines).not.toContain("  Sandboxes:");
+  });
+
+  it("keeps an inference-route reservation owned by another session hidden (#10097)", async () => {
+    const inventory = await getSandboxInventory({
+      recoverRegistryEntries: async () => ({
+        sandboxes: [
+          {
+            name: "sandbox-d",
+            pendingRouteReservation: true,
+            reservationSessionId: "older-session",
+          },
+        ],
+        defaultSandbox: null,
+      }),
+      getLiveInference: () => null,
+      loadLastSession: () => ({
+        sessionId: "current-session",
+        resumable: true,
+        status: "failed",
+        sandboxName: "sandbox-d",
+        failure: { step: "inference", interrupted: true },
+      }),
+    });
+
+    expect(inventory.incompleteOnboarding).toBeNull();
+    expect(inventory.sandboxes).toEqual([]);
+  });
+
+  it("hides a created pending sandbox until lifecycle finalization (#9733)", async () => {
+    const inventory = await getSandboxInventory({
+      recoverRegistryEntries: async () => ({
         sandboxes: [
           {
             name: "created",
@@ -257,11 +328,11 @@ describe("inventory commands", () => {
       loadLastSession: () => null,
     });
 
-    expect(inventory.sandboxes.map((sandbox) => sandbox.name)).toEqual(["created"]);
+    expect(inventory.sandboxes).toEqual([]);
   });
 
-  it("hides route-only reservations from status output too (#7609)", () => {
-    const report = getStatusReport({
+  it("hides route-only reservations from status output too (#7609)", async () => {
+    const report = await getStatusReport({
       listSandboxes: () => ({
         sandboxes: [
           {
@@ -269,6 +340,13 @@ describe("inventory commands", () => {
             provider: "nvidia-prod",
             model: "m",
             pendingRouteReservation: true,
+          },
+          {
+            name: "created-pending",
+            provider: "nvidia-prod",
+            model: "m",
+            pendingRouteReservation: true,
+            createdAt: "2026-01-01T00:00:00Z",
           },
           { name: "real", provider: "nvidia-prod", model: "m", createdAt: "2026-01-01T00:00:00Z" },
         ],
@@ -281,7 +359,7 @@ describe("inventory commands", () => {
     expect(report.sandboxes.map((sandbox) => sandbox.name)).toEqual(["real"]);
 
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           {
@@ -298,6 +376,62 @@ describe("inventory commands", () => {
       log: (message = "") => lines.push(message),
     });
     expect(lines.some((line) => line.includes("base-img-reject"))).toBe(false);
+  });
+
+  it("reports incomplete onboarding in global status without sandbox probes (#10097)", async () => {
+    const listSandboxes = () => ({
+      sandboxes: [
+        {
+          name: "sandbox-d",
+          pendingRouteReservation: true as const,
+          reservationSessionId: "session-d",
+        },
+      ],
+      defaultSandbox: null,
+    });
+    const loadLastSession = () => ({
+      sessionId: "session-d",
+      resumable: true,
+      status: "failed",
+      sandboxName: "sandbox-d",
+      lastCompletedStep: "inference",
+      failure: { step: "inference", interrupted: true },
+    });
+    const getLiveInference = vi.fn();
+    const getGatewayHealth = vi.fn();
+    const report = await getStatusReport({
+      listSandboxes,
+      loadLastSession,
+      getLiveInference,
+      getGatewayHealth,
+      getServiceStatuses: () => [],
+      showServiceStatus: vi.fn(),
+    });
+
+    expect(report.incompleteOnboarding).toEqual({
+      name: "sandbox-d",
+      status: "failed",
+      step: "inference",
+      interrupted: true,
+      resumable: true,
+    });
+    expect(report.sandboxes).toEqual([]);
+    expect(getLiveInference).not.toHaveBeenCalled();
+    expect(getGatewayHealth).not.toHaveBeenCalled();
+
+    const lines: string[] = [];
+    await showStatusCommand({
+      listSandboxes,
+      loadLastSession,
+      getLiveInference,
+      getGatewayHealth,
+      showServiceStatus: vi.fn(),
+      log: (message = "") => lines.push(message),
+    });
+    expect(lines).toContain("  Incomplete onboarding:");
+    expect(lines).toContain("    sandbox-d  interrupted at inference");
+    expect(getLiveInference).not.toHaveBeenCalled();
+    expect(getGatewayHealth).not.toHaveBeenCalled();
   });
 
   it("shows the empty-state hint when only route-only reservations exist (#7609)", async () => {
@@ -316,8 +450,8 @@ describe("inventory commands", () => {
     expect(lines.some((line) => line.includes("base-img-reject"))).toBe(false);
   });
 
-  it("normalizes invalid configured inference fields out of status rows", () => {
-    const report = getStatusReport({
+  it("awaits gateway health and normalizes invalid configured inference fields", async () => {
+    const report = await getStatusReport({
       listSandboxes: () => ({
         sandboxes: [
           { name: "blank-provider", provider: "", model: "nvidia/test" },
@@ -327,6 +461,8 @@ describe("inventory commands", () => {
         defaultSandbox: "blank-provider",
       }),
       getLiveInference: () => null,
+      getGatewayHealth: () =>
+        Promise.resolve({ healthy: false, state: "named_unreachable", reason: "offline" }),
       showServiceStatus: vi.fn(),
     });
 
@@ -335,11 +471,117 @@ describe("inventory commands", () => {
       { name: "blank-model", provider: "nvidia-prod", model: null },
       { name: "configured", provider: "nvidia-prod", model: "nvidia/test" },
     ]);
+    expect(report.gatewayHealth).toEqual({
+      healthy: false,
+      state: "named_unreachable",
+      reason: "offline",
+    });
   });
 
-  it("omits invalid configured inference fields from status text", () => {
+  it("reports schema-5 phase without ambient global probes", async () => {
+    const getLiveInference = vi.fn();
+    const getGatewayHealth = vi.fn();
+    const getServiceStatuses = vi.fn();
+    const report = await getStatusReport({
+      listSandboxes: () => ({
+        sandboxes: [
+          {
+            name: "alpha",
+            agent: "hermes",
+            provider: "ollama",
+            model: "qwen3-vl:4b",
+          },
+        ],
+        defaultSandbox: "alpha",
+      }),
+      getHermesPortablePhase: () => "configuring",
+      getHermesPortableHostAuthorityCount: () => 1,
+      getLiveInference,
+      getGatewayHealth,
+      getServiceStatuses,
+      showServiceStatus: vi.fn(),
+    });
+
+    expect(report.sandboxes[0]).toMatchObject({
+      agent: "hermes",
+      name: "alpha",
+      phase: "configuring",
+    });
+    expect(report.liveInference).toBeNull();
+    expect(report.gatewayHealth).toBeNull();
+    expect(report.services).toEqual([]);
+    expect(getLiveInference).not.toHaveBeenCalled();
+    expect(getGatewayHealth).not.toHaveBeenCalled();
+    expect(getServiceStatuses).not.toHaveBeenCalled();
+  });
+
+  it("renders schema-5 phase without sessions, services, messaging, or logs", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    const effects = {
+      getLiveInference: vi.fn(),
+      getActiveSessionCount: vi.fn(),
+      getGatewayHealth: vi.fn(),
+      showServiceStatus: vi.fn(),
+      findMessagingOverlaps: vi.fn(),
+      checkMessagingBridgeHealth: vi.fn(),
+      readGatewayLog: vi.fn(),
+    };
+    await showStatusCommand({
+      listSandboxes: () => ({
+        sandboxes: [{ name: "alpha", agent: "hermes", provider: "ollama", model: "qwen3-vl:4b" }],
+        defaultSandbox: "alpha",
+      }),
+      getHermesPortablePhase: () => "active",
+      getHermesPortableHostAuthorityCount: () => 1,
+      ...effects,
+      log: (message = "") => lines.push(message),
+    });
+
+    expect(lines).toContain("      agent: hermes  phase: active");
+    expect(Object.values(effects).every((effect) => effect.mock.calls.length === 0)).toBe(true);
+  });
+
+  it("fails before ambient probes when a schema-5 phase has no registry row", async () => {
+    const getLiveInference = vi.fn();
+    const showServiceStatus = vi.fn();
+    await expect(
+      showStatusCommand({
+        listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
+        getHermesPortableHostAuthorityCount: () => 1,
+        getHermesPortablePhase: vi.fn(),
+        getLiveInference,
+        showServiceStatus,
+      }),
+    ).rejects.toThrow("without an exact registry row");
+    expect(getLiveInference).not.toHaveBeenCalled();
+    expect(showServiceStatus).not.toHaveBeenCalled();
+  });
+
+  it("fails before ambient probes when schema-5 registry agreement is rejected", async () => {
+    const getLiveInference = vi.fn();
+    const getGatewayAuthority = vi.fn();
+    await expect(
+      getStatusReport({
+        listSandboxes: () => ({
+          sandboxes: [{ name: "alpha", agent: "hermes" }],
+          defaultSandbox: "alpha",
+        }),
+        getHermesPortableHostAuthorityCount: () => 1,
+        getHermesPortablePhase: () => {
+          throw new Error("registry row disagreement");
+        },
+        getLiveInference,
+        getGatewayAuthority,
+        showServiceStatus: vi.fn(),
+      }),
+    ).rejects.toThrow("registry row disagreement");
+    expect(getLiveInference).not.toHaveBeenCalled();
+    expect(getGatewayAuthority).not.toHaveBeenCalled();
+  });
+
+  it("omits invalid configured inference fields from status text", async () => {
+    const lines: string[] = [];
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", provider: "", model: "   " }],
         defaultSandbox: "alpha",
@@ -400,7 +642,6 @@ describe("inventory commands", () => {
             model: "nvidia/nemotron-3-super-120b-a12b",
             provider: "nvidia-prod",
             gpuEnabled: true,
-            policies: ["pypi"],
           },
         ],
         defaultSandbox: "alpha",
@@ -408,6 +649,7 @@ describe("inventory commands", () => {
         recoveredFromGateway: 1,
       }),
       getLiveInference: () => null,
+      getPolicyPresets: () => ["pypi"],
       loadLastSession: () => null,
       log: (message = "") => lines.push(message),
     });
@@ -430,7 +672,6 @@ describe("inventory commands", () => {
             model: "nvidia/nemotron-3-super-120b-a12b",
             provider: "nvidia-prod",
             gpuEnabled: false,
-            policies: [],
             agent: "hermes",
           },
         ],
@@ -456,14 +697,12 @@ describe("inventory commands", () => {
             model: "configured-alpha",
             provider: "configured-provider",
             gpuEnabled: true,
-            policies: [],
           },
           {
             name: "beta",
             model: "configured-beta",
             provider: "beta-provider",
             gpuEnabled: false,
-            policies: [],
           },
         ],
         defaultSandbox: "alpha",
@@ -501,7 +740,6 @@ describe("inventory commands", () => {
             model: "configured-alpha",
             provider: "configured-provider",
             gpuEnabled: true,
-            policies: [],
           },
         ],
         defaultSandbox: "alpha",
@@ -527,7 +765,6 @@ describe("inventory commands", () => {
             model: "configured-alpha",
             provider: "configured-provider",
             gpuEnabled: true,
-            policies: [],
           },
         ],
         defaultSandbox: "alpha",
@@ -553,7 +790,6 @@ describe("inventory commands", () => {
             model: "configured-alpha",
             provider: "configured-provider",
             gpuEnabled: true,
-            policies: [],
           },
         ],
         defaultSandbox: "alpha",
@@ -582,7 +818,6 @@ describe("inventory commands", () => {
             model: "configured-alpha",
             provider: "configured-provider",
             gpuEnabled: true,
-            policies: [],
           },
         ],
         defaultSandbox: "alpha",
@@ -601,12 +836,12 @@ describe("inventory commands", () => {
     );
   });
 
-  it("flags messaging bridge as degraded when checkMessagingBridgeHealth reports conflicts", () => {
+  it("flags messaging bridge as degraded when checkMessagingBridgeHealth reports conflicts", async () => {
     const lines: string[] = [];
     const checkMessagingBridgeHealth = vi
       .fn()
       .mockReturnValue([{ channel: "telegram", conflicts: 7 }]);
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           {
@@ -629,10 +864,10 @@ describe("inventory commands", () => {
     );
   });
 
-  it("skips messaging bridge check when the default sandbox has no channels", () => {
+  it("skips messaging bridge check when the default sandbox has no channels", async () => {
     const lines: string[] = [];
     const checkMessagingBridgeHealth = vi.fn().mockReturnValue([]);
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", model: "m" }],
         defaultSandbox: "alpha",
@@ -647,14 +882,14 @@ describe("inventory commands", () => {
     expect(lines.some((l) => l.includes("degraded"))).toBe(false);
   });
 
-  it("prints a cross-sandbox overlap warning when findMessagingOverlaps reports overlaps", () => {
+  it("prints a cross-sandbox overlap warning when findMessagingOverlaps reports overlaps", async () => {
     const lines: string[] = [];
     const findMessagingOverlaps = vi
       .fn()
       .mockReturnValue([
         { channel: "telegram", sandboxes: ["alice", "bob"], reason: "matching-token" },
       ]);
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           { name: "alice", model: "m", messaging: messagingState("alice", ["telegram"]) },
@@ -674,12 +909,12 @@ describe("inventory commands", () => {
     ).toBe(true);
   });
 
-  it("defaults missing overlap reason to the conservative warning", () => {
+  it("defaults missing overlap reason to the conservative warning", async () => {
     const lines: string[] = [];
     const findMessagingOverlaps = vi
       .fn()
       .mockReturnValue([{ channel: "telegram", sandboxes: ["alice", "bob"] }]);
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           { name: "alice", model: "m", messaging: messagingState("alice", ["telegram"]) },
@@ -702,7 +937,7 @@ describe("inventory commands", () => {
     ).toBe(true);
   });
 
-  it("marks a shared-gateway Slack Socket Mode overlap as conflicted (#4953)", () => {
+  it("marks a shared-gateway Slack Socket Mode overlap as conflicted (#4953)", async () => {
     const lines: string[] = [];
     const findMessagingOverlaps = vi.fn().mockReturnValue([
       {
@@ -713,7 +948,7 @@ describe("inventory commands", () => {
           "'{first}' and '{second}' both have Slack Socket Mode enabled on the same gateway; only one sandbox can receive Slack Socket Mode events unless the gateway supports multiplexing.",
       },
     ]);
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           { name: "alice", model: "m", messaging: messagingState("alice", ["slack"]) },
@@ -734,7 +969,7 @@ describe("inventory commands", () => {
     ).toBe(true);
   });
 
-  it("prints a Teams webhook port overlap warning with the port", () => {
+  it("prints a Teams webhook port overlap warning with the port", async () => {
     const lines: string[] = [];
     const findMessagingOverlaps = vi.fn().mockReturnValue([
       {
@@ -746,7 +981,7 @@ describe("inventory commands", () => {
           "'{first}' and '{second}' both use Microsoft Teams webhook port {port}; no two active Teams sandboxes can share that local forward.",
       },
     ]);
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           { name: "alice", model: "m", messaging: messagingState("alice", ["teams"]) },
@@ -769,7 +1004,7 @@ describe("inventory commands", () => {
     ).toBe(true);
   });
 
-  it("surfaces Hermes gateway log when messaging is degraded", () => {
+  it("surfaces Hermes gateway log when messaging is degraded", async () => {
     const lines: string[] = [];
     const checkMessagingBridgeHealth = vi
       .fn()
@@ -780,7 +1015,7 @@ describe("inventory commands", () => {
         "2026-04-17 getUpdates conflict: terminated by other getUpdates\n" +
           "2026-04-17 retrying in 5s",
       );
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           {
@@ -804,13 +1039,13 @@ describe("inventory commands", () => {
     expect(lines.some((l) => l.includes("getUpdates conflict"))).toBe(true);
   });
 
-  it("does not show gateway log for non-Hermes sandboxes", () => {
+  it("does not show gateway log for non-Hermes sandboxes", async () => {
     const lines: string[] = [];
     const checkMessagingBridgeHealth = vi
       .fn()
       .mockReturnValue([{ channel: "telegram", conflicts: 3 }]);
     const readGatewayLog = vi.fn();
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           {
@@ -831,10 +1066,10 @@ describe("inventory commands", () => {
     expect(readGatewayLog).not.toHaveBeenCalled();
   });
 
-  it("prints sandbox models in status and delegates service status", () => {
+  it("prints sandbox models in status and delegates service status", async () => {
     const lines: string[] = [];
     const showServiceStatus = vi.fn();
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           {
@@ -888,13 +1123,13 @@ describe("inventory commands", () => {
       else delete process.env.NEMOCLAW_SANDBOX;
     });
 
-    it("reuses the existing sandbox list when resolving status service sandbox", () => {
+    it("reuses the existing sandbox list when resolving status service sandbox", async () => {
       const listSandboxes = vi.fn(() => ({
         sandboxes: [{ name: "alpha", model: "nvidia/nemotron-3-super-120b-a12b" }],
         defaultSandbox: "alpha",
       }));
       const showServiceStatus = vi.fn();
-      showStatusCommand({
+      await showStatusCommand({
         listSandboxes,
         getLiveInference: () => null,
         showServiceStatus,
@@ -904,13 +1139,13 @@ describe("inventory commands", () => {
       expect(showServiceStatus).toHaveBeenCalledWith({ sandboxName: "alpha" });
     });
 
-    it("reuses the existing sandbox list when resolving JSON status service sandbox", () => {
+    it("reuses the existing sandbox list when resolving JSON status service sandbox", async () => {
       const listSandboxes = vi.fn(() => ({
         sandboxes: [{ name: "alpha", model: "nvidia/nemotron-3-super-120b-a12b" }],
         defaultSandbox: "alpha",
       }));
       const getServiceStatuses = vi.fn().mockReturnValue([]);
-      const report = getStatusReport({
+      const report = await getStatusReport({
         listSandboxes,
         getLiveInference: () => null,
         getServiceStatuses,
@@ -921,10 +1156,10 @@ describe("inventory commands", () => {
       expect(report.defaultSandbox).toBe("alpha");
     });
 
-    it("resolves service status sandbox from SANDBOX_NAME env", () => {
+    it("resolves service status sandbox from SANDBOX_NAME env", async () => {
       process.env.SANDBOX_NAME = "env-sandbox";
       const showServiceStatus = vi.fn();
-      showStatusCommand({
+      await showStatusCommand({
         listSandboxes: () => ({
           sandboxes: [{ name: "env-sandbox" }, { name: "registry-default" }],
           defaultSandbox: "registry-default",
@@ -936,10 +1171,10 @@ describe("inventory commands", () => {
       expect(showServiceStatus).toHaveBeenCalledWith({ sandboxName: "env-sandbox" });
     });
 
-    it("resolves JSON service status sandbox from NEMOCLAW_SANDBOX_NAME env", () => {
+    it("resolves JSON service status sandbox from NEMOCLAW_SANDBOX_NAME env", async () => {
       process.env.NEMOCLAW_SANDBOX_NAME = "json-sandbox";
       const getServiceStatuses = vi.fn().mockReturnValue([]);
-      const report = getStatusReport({
+      const report = await getStatusReport({
         listSandboxes: () => ({
           sandboxes: [{ name: "json-sandbox" }],
           defaultSandbox: "other",
@@ -996,9 +1231,9 @@ describe("inventory commands", () => {
     });
   });
 
-  it("does not annotate status when the live gateway matches the onboarded model", () => {
+  it("does not annotate status when the live gateway matches the onboarded model", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", model: "nvidia/nemotron-3-super-120b-a12b" }],
         defaultSandbox: "alpha",
@@ -1015,9 +1250,9 @@ describe("inventory commands", () => {
     expect(lines.some((l) => l.includes("onboarded"))).toBe(false);
   });
 
-  it("falls back to stored status model when the gateway is unreachable", () => {
+  it("falls back to stored status model when the gateway is unreachable", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", model: "nvidia/nemotron-3-super-120b-a12b" }],
         defaultSandbox: "alpha",
@@ -1031,9 +1266,9 @@ describe("inventory commands", () => {
     expect(lines.some((l) => l.includes("onboarded"))).toBe(false);
   });
 
-  it("annotates status drift with 'unknown' when the onboarded model is missing", () => {
+  it("annotates status drift with 'unknown' when the onboarded model is missing", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         // sandbox registered without a model (possible per SandboxEntry type).
         sandboxes: [{ name: "alpha" }],
@@ -1051,9 +1286,9 @@ describe("inventory commands", () => {
   // #2604: bare `nemoclaw status` previously only showed the model in parens
   // and didn't label provider or connection state. Users had to run the
   // per-sandbox `nemoclaw <name> status` to see those fields.
-  it("emits an Inference line with provider / model under each sandbox row (#2604)", () => {
+  it("emits an Inference line with provider / model under each sandbox row (#2604)", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           {
@@ -1070,13 +1305,15 @@ describe("inventory commands", () => {
       log: (message = "") => lines.push(message),
     });
 
-    expect(lines).toContain("      Inference: nvidia-prod / nvidia/nemotron-3-super-120b-a12b");
-    expect(lines).toContain("      Inference: ollama-local / qwen3.5:9b");
+    expect(lines).toContain(
+      "      Inference (configured): nvidia-prod / nvidia/nemotron-3-super-120b-a12b",
+    );
+    expect(lines).toContain("      Inference (configured): ollama-local / qwen3.5:9b");
   });
 
-  it("prefers live gateway provider for the default sandbox in the Inference line (#2604)", () => {
+  it("prefers live gateway provider for the default sandbox in the Inference line (#2604)", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", model: "stored-model", provider: "stored-provider" }],
         defaultSandbox: "alpha",
@@ -1086,12 +1323,12 @@ describe("inventory commands", () => {
       log: (message = "") => lines.push(message),
     });
 
-    expect(lines).toContain("      Inference: live-provider / live-model");
+    expect(lines).toContain("      Inference (configured): live-provider / live-model");
   });
 
-  it("emits an SSH sessions line per sandbox when getActiveSessionCount is provided (#2604)", () => {
+  it("emits an SSH sessions line per sandbox when getActiveSessionCount is provided (#2604)", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [
           { name: "alpha", model: "m" },
@@ -1109,9 +1346,9 @@ describe("inventory commands", () => {
     expect(lines).toContain("      SSH sessions: none");
   });
 
-  it("renders the exact active count when exactly one session (#2604)", () => {
+  it("renders the exact active count when exactly one session (#2604)", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", model: "m" }],
         defaultSandbox: "alpha",
@@ -1125,9 +1362,9 @@ describe("inventory commands", () => {
     expect(lines).toContain("      SSH sessions: 1");
   });
 
-  it("omits the SSH sessions line when getActiveSessionCount returns null (probe unavailable)", () => {
+  it("omits the SSH sessions line when getActiveSessionCount returns null (probe unavailable)", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", model: "m" }],
         defaultSandbox: "alpha",
@@ -1141,9 +1378,9 @@ describe("inventory commands", () => {
     expect(lines.some((l) => l.includes("SSH sessions:"))).toBe(false);
   });
 
-  it("omits the SSH sessions line when the dep is not wired", () => {
+  it("omits the SSH sessions line when the dep is not wired", async () => {
     const lines: string[] = [];
-    showStatusCommand({
+    await showStatusCommand({
       listSandboxes: () => ({
         sandboxes: [{ name: "alpha", model: "m" }],
         defaultSandbox: "alpha",
@@ -1156,23 +1393,25 @@ describe("inventory commands", () => {
     expect(lines.some((l) => l.includes("SSH sessions:"))).toBe(false);
   });
 
-  it("emits a gateway-down diagnostic and sets process.exitCode when the gateway is unhealthy (#3386)", () => {
+  it("awaits asynchronous gateway health, emits its diagnostic, and sets process.exitCode (#3386)", async () => {
     const previousExitCode = process.exitCode;
     process.exitCode = 0;
     const lines: string[] = [];
     try {
-      showStatusCommand({
+      await showStatusCommand({
         listSandboxes: () => ({
           sandboxes: [{ name: "alpha", model: "m" }],
           defaultSandbox: "alpha",
         }),
         getLiveInference: () => null,
         showServiceStatus: vi.fn(),
-        getGatewayHealth: () => ({
-          healthy: false,
-          state: "named_unreachable",
-          reason: "host port held or container not running",
-        }),
+        getGatewayHealth: () =>
+          Promise.resolve({
+            healthy: false,
+            state: "named_unreachable",
+            reason: "host port held or container not running",
+          }),
+        getGatewayStartGuidance: () => "Start the gateway with its lifecycle owner.",
         log: (message = "") => lines.push(message),
       });
 
@@ -1181,18 +1420,19 @@ describe("inventory commands", () => {
           l.includes("gateway: down [named_unreachable] (host port held or container not running)"),
         ),
       ).toBe(true);
+      expect(lines).toContain("    Start the gateway with its lifecycle owner.");
       expect(process.exitCode).toBe(1);
     } finally {
       process.exitCode = previousExitCode;
     }
   });
 
-  it("keeps process.exitCode at 0 when getGatewayHealth reports healthy", () => {
+  it("keeps process.exitCode at 0 when getGatewayHealth reports healthy", async () => {
     const previousExitCode = process.exitCode;
     process.exitCode = 0;
     const lines: string[] = [];
     try {
-      showStatusCommand({
+      await showStatusCommand({
         listSandboxes: () => ({
           sandboxes: [{ name: "alpha", model: "m" }],
           defaultSandbox: "alpha",
@@ -1210,11 +1450,11 @@ describe("inventory commands", () => {
     }
   });
 
-  it("preserves legacy 0-exit behaviour when getGatewayHealth dep is omitted", () => {
+  it("preserves legacy 0-exit behaviour when getGatewayHealth dep is omitted", async () => {
     const previousExitCode = process.exitCode;
     process.exitCode = 0;
     try {
-      showStatusCommand({
+      await showStatusCommand({
         listSandboxes: () => ({
           sandboxes: [{ name: "alpha", model: "m" }],
           defaultSandbox: "alpha",
@@ -1228,13 +1468,13 @@ describe("inventory commands", () => {
     }
   });
 
-  it("skips the gateway health check when no sandboxes are registered", () => {
+  it("skips the gateway health check when no sandboxes are registered", async () => {
     const previousExitCode = process.exitCode;
     process.exitCode = 0;
     const lines: string[] = [];
     const getGatewayHealth = vi.fn();
     try {
-      showStatusCommand({
+      await showStatusCommand({
         listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
         getLiveInference: () => null,
         showServiceStatus: vi.fn(),

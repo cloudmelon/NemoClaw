@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { canonicalTargets } from "./definitions/baseline.ts";
-import type { TargetDefinition } from "./types.ts";
+import { requireLiveTargetExecution } from "./execution.ts";
+import { requireExpectedState } from "./expected-states.ts";
+import {
+  CONFIG_EXPORT_EXPECTATIONS,
+  CONFIG_EXPORT_REFUSAL_CATEGORIES,
+  type TargetDefinition,
+} from "./types.ts";
 
 export const TARGET_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 export const TARGET_ID_PATTERN_DESCRIPTION =
@@ -34,6 +40,31 @@ export function buildTargetRegistry(targets: TargetDefinition[]): TargetRegistry
   if (duplicates.size > 0) {
     throw new Error(`Duplicate target IDs: ${Array.from(duplicates).sort().join(", ")}`);
   }
+  for (const target of targets) {
+    requireLiveTargetExecution(target);
+    const expectedState = requireExpectedState(target.expectedStateId);
+    if (!CONFIG_EXPORT_EXPECTATIONS.includes(target.configExport?.expectation)) {
+      throw new Error(
+        `Target '${target.id}' has a config export coverage gap; declare required, expected-refusal, or no-usable-sandbox.`,
+      );
+    }
+    if (
+      target.configExport.expectation === "no-usable-sandbox" &&
+      expectedState.sandbox?.expected !== "absent"
+    ) {
+      throw new Error(
+        `Target '${target.id}' no-usable-sandbox config export requires an absent sandbox expected state.`,
+      );
+    }
+    if (
+      target.configExport.expectation === "expected-refusal" &&
+      !CONFIG_EXPORT_REFUSAL_CATEGORIES.includes(target.configExport.failureCategory)
+    ) {
+      throw new Error(
+        `Target '${target.id}' must declare the exact expected config export refusal category.`,
+      );
+    }
+  }
   return { targets: [...targets], byId };
 }
 
@@ -41,10 +72,6 @@ const registry = buildTargetRegistry(canonicalTargets());
 
 export function listTargets(): TargetDefinition[] {
   return [...registry.targets].sort((a, b) => a.id.localeCompare(b.id));
-}
-
-export function hasRegisteredRuntimeProfile(profileId: string): boolean {
-  return registry.targets.some((target) => target.runtimeCase?.profileId === profileId);
 }
 
 export function getTarget(id: string): TargetDefinition | undefined {

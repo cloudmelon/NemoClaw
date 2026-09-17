@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared test harness for the Hermes CLI wrapper suites
-// (test/hermes-gateway-wrapper.test.ts and
-// test/hermes-wrapper-oneshot-routing.test.ts). Both suites drive
+// (test/agents/hermes/hermes-gateway-wrapper.test.ts and
+// test/agents/hermes/hermes-wrapper-oneshot-routing.test.ts). Both suites drive
 // agents/hermes/hermes-wrapper.py by copying it into a temp dir alongside the
 // runtime-env validator, planting stubs, and spawning it. Extracted here — a
 // non-`.test.` module — so the shared `runWrapper` helper (and its planted-PATH
@@ -56,6 +56,7 @@ export type WrapperRun = {
   realInvoked: boolean;
   realArgs: string;
   realArgv: string[];
+  realEnv: Record<string, string>;
 };
 
 export type StubBehaviour = { stdout?: string; stderr?: string; exitCode?: number };
@@ -87,6 +88,7 @@ export function runWrapper(
     sessionBoundaries?: string[];
     upstreamVersion?: string;
     validatorScript?: string;
+    envFileContent?: string;
   } = {},
 ): WrapperRun {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-hermes-wrapper-"));
@@ -102,16 +104,21 @@ export function runWrapper(
     fs.writeFileSync(path.join(dir, "validate-env-secret-boundary.py"), validatorContent, {
       mode: 0o755,
     });
+    fs.writeFileSync(
+      path.join(dir, ".env"),
+      opts.envFileContent ?? "API_SERVER_HOST=127.0.0.1\nAPI_SERVER_PORT=8642\n",
+    );
     fs.chmodSync(path.join(dir, "hermes"), 0o755);
 
     const marker = path.join(dir, "real-invoked.txt");
+    const envMarker = path.join(dir, "real-env.json");
     const stubStdout = opts.stub?.stdout ?? "";
     const stubStderr = opts.stub?.stderr ?? "";
     const stubExit = opts.stub?.exitCode ?? 0;
     const stubScript = [
       "#!/usr/bin/env bash",
-      `if [ "\${NEMOCLAW_HERMES_ADAPTER_VERSION_PROBE:-}" = "1" ]; then printf 'Hermes Agent v${opts.upstreamVersion ?? "0.19.0"}\\n'; exit 0; fi`,
-      `node -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)))' ${JSON.stringify(marker)} "$@"`,
+      `if [ "\${NEMOCLAW_HERMES_ADAPTER_VERSION_PROBE:-}" = "1" ]; then printf 'Hermes Agent v${opts.upstreamVersion ?? "0.20.6"}\\n'; exit 0; fi`,
+      `node -e 'const fs=require("node:fs"); fs.writeFileSync(process.argv[1], JSON.stringify(process.argv.slice(3))); fs.writeFileSync(process.argv[2], JSON.stringify(process.env))' ${JSON.stringify(marker)} ${JSON.stringify(envMarker)} "$@"`,
       stubStdout ? `cat <<'__NEMOCLAW_STUB_EOF__'\n${stubStdout}\n__NEMOCLAW_STUB_EOF__` : "",
       stubStderr
         ? `cat <<'__NEMOCLAW_STUB_ERR_EOF__' >&2\n${stubStderr}\n__NEMOCLAW_STUB_ERR_EOF__`
@@ -139,11 +146,17 @@ export function runWrapper(
     const result = spawnSync(path.join(dir, "hermes"), args, {
       encoding: "utf-8",
       timeout: 10000,
-      env: { PATH: `${pathPrefix}${process.env.PATH ?? ""}`, HOME: dir, ...env },
+      env: {
+        PATH: `${pathPrefix}${process.env.PATH ?? ""}`,
+        HOME: dir,
+        HERMES_LAZY_INSTALL_TARGET: "/sandbox/.hermes/lazy-packages",
+        ...env,
+      },
     });
 
     const realInvoked = fs.existsSync(marker);
     const realArgv = realInvoked ? JSON.parse(fs.readFileSync(marker, "utf-8")) : [];
+    const realEnv = fs.existsSync(envMarker) ? JSON.parse(fs.readFileSync(envMarker, "utf-8")) : {};
     return {
       status: result.status,
       stdout: result.stdout ?? "",
@@ -151,6 +164,7 @@ export function runWrapper(
       realInvoked,
       realArgs: realArgv.join(" "),
       realArgv,
+      realEnv,
     };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });

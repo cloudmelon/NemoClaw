@@ -20,8 +20,8 @@ const onboardProviderHelpers = require("../../src/lib/onboard/providers") as {
     baseUrl: string | null,
     env: Record<string, string | undefined>,
     runOpenshell: DirectRunOpenshell,
-  ) => { ok: boolean; status?: number; message?: string };
-  providerExistsInGateway: (name: string, runOpenshell: DirectRunOpenshell) => boolean;
+  ) => Promise<{ ok: boolean; status?: number; message?: string }>;
+  providerExistsInGateway: (name: string, runOpenshell: DirectRunOpenshell) => Promise<boolean>;
 };
 const localInferenceModule =
   require("../../src/lib/inference/local") as typeof import("../../src/lib/inference/local.js");
@@ -51,6 +51,53 @@ export type DirectSetupHarnessOptions = {
   ) => DirectRunStubResult | undefined;
   overrides?: Partial<SetupInferenceDeps>;
 };
+
+/** Model stale Anthropic registration removal without bypassing provider parsing or recovery. */
+export function createStaleAnthropicProviderRunner(
+  provider: string,
+  credentialEnv: string,
+  attachedSandboxes: readonly string[] = [],
+): (args: string[]) => DirectRunStubResult | undefined {
+  let exists = true;
+  let attached = attachedSandboxes;
+  return (args) => {
+    const isProviderOperation =
+      (args[0] === "provider" && ["get", "delete"].includes(args[1])) ||
+      (args[0] === "sandbox" && args[1] === "provider" && args[2] === "detach");
+    if (isProviderOperation && (!exists || args.at(-1) !== provider)) {
+      return { status: 1, stderr: `provider '${args.at(-1)}' not found` };
+    }
+    if (args[0] === "provider" && args[1] === "get") {
+      return {
+        status: 0,
+        stdout: `Name: ${provider}\nType: anthropic\nCredential keys: ${credentialEnv}\nConfig keys: ANTHROPIC_BASE_URL`,
+      };
+    }
+    if (args[0] === "provider" && args[1] === "delete") {
+      if (attached.length > 0) {
+        return {
+          status: 1,
+          stderr: `provider '${provider}' is attached to sandbox(es): ${attached.join(", ")}`,
+        };
+      }
+      exists = false;
+      return { status: 0 };
+    }
+    if (args[0] === "sandbox" && args[1] === "provider" && args.includes("detach")) {
+      attached = attached.filter((sandbox) => !args.includes(sandbox));
+      return { status: 0 };
+    }
+    return undefined;
+  };
+}
+
+const OPENAI_ENDPOINTLESS_PROFILE = JSON.stringify({
+  id: "openai",
+  credentials: [],
+  endpoints: [],
+  binaries: [],
+  inference_capable: true,
+});
 
 type DirectCommandRoute = {
   name: string;
@@ -109,6 +156,17 @@ fs.appendFileSync(${JSON.stringify(commandLogPath)}, JSON.stringify({ argv, env:
 if (argv[0] === "inference" && argv[1] === "get") {
   process.stdout.write(${JSON.stringify(
     `Gateway inference:\n  Provider: ${options.provider}\n  Model: ${options.model}\n`,
+  )});
+}
+if (argv[0] === "provider" && argv[1] === "get") {
+  process.stdout.write(${JSON.stringify(
+    [
+      `Name: ${options.provider}`,
+      `Type: ${options.provider === "nvidia-prod" ? "nvidia" : "openai"}`,
+      `Credential keys: ${options.credentialEnv}`,
+      `Config keys: ${options.provider === "nvidia-prod" ? "<none>" : "OPENAI_BASE_URL"}`,
+      "",
+    ].join("\n"),
   )});
 }
 process.exit(0);
@@ -271,6 +329,7 @@ export function createDirectSetupInferenceHarnessFactory(
     const errors: string[] = [];
     const logs: string[] = [];
     const updateSandbox = vi.fn(() => true);
+    const unloadOllamaModels = vi.fn();
     const verifyInferenceRoute = vi.fn();
     const verifyOnboardInferenceSmoke = vi.fn();
     const runOpenshell: DirectRunOpenshell = (args, runOptions = {}) => {
@@ -279,14 +338,48 @@ export function createDirectSetupInferenceHarnessFactory(
         env: runOptions.env,
         ignoreError: runOptions.ignoreError,
       });
-      return directRunResult(options.runOpenshell?.(args, runOptions, commands));
+      const routed = options.runOpenshell?.(args, runOptions, commands);
+      if (routed !== undefined) {
+        if (args[0] === "provider" && args[1] === "get") {
+          const providerName = args.at(-1) ?? "provider";
+          if (routed.status === 1 && !routed.stdout && !routed.stderr) {
+            return directRunResult({
+              ...routed,
+              stderr: `provider '${providerName}' not found`,
+            });
+          }
+        }
+        return directRunResult(routed);
+      }
+      if (
+        args[0] === "provider" &&
+        args[1] === "profile" &&
+        args.includes("export") &&
+        args.includes("openai")
+      ) {
+        return directRunResult({ status: 0, stdout: OPENAI_ENDPOINTLESS_PROFILE });
+      }
+      if (args[0] === "provider" && args[1] === "get") {
+        const providerName = args.at(-1) ?? "provider";
+        return directRunResult({
+          status: 1,
+          stderr: `provider '${providerName}' not found`,
+        });
+      }
+      return directRunResult();
     };
-    const setupInference = createSetupInference({
+    const setupInferenceWithoutPolicyAuthority = createSetupInference({
       checkGatewayRouteCompatibility: () => ({ ok: true }),
+      withGatewayRouteMutationLock: async <T>(
+        _gatewayName: string,
+        operation: () => Promise<T> | T,
+      ) => await operation(),
+      withSandboxMutationLock: async <T>(_sandboxName: string, operation: () => Promise<T> | T) =>
+        await operation(),
       step: () => {},
       getGatewayName: () => "nemoclaw",
       runOpenshell,
-      upsertProvider: (
+      upsertProvider: async (
         name: string,
         type: string,
         credentialEnv: string,
@@ -294,7 +387,7 @@ export function createDirectSetupInferenceHarnessFactory(
         env: Record<string, string | undefined> | undefined,
         gatewayName: string,
       ) =>
-        onboardProviderHelpers.upsertProvider(
+        await onboardProviderHelpers.upsertProvider(
           name,
           type,
           credentialEnv,
@@ -350,14 +443,48 @@ export function createDirectSetupInferenceHarnessFactory(
       exitProcess: (code: number): never => {
         throw Object.assign(new Error(`EXIT_CALLED:${code}`), { code });
       },
+      // #9110: neutralize the GPU-release seams so harness consumers backed by
+      // the production defaults never read the developer's real registry or
+      // curl a live Ollama daemon.
+      getSandbox: () => null,
+      listSandboxes: () => ({ sandboxes: [], defaultSandbox: null }),
+      unloadOllamaModels,
+      withOllamaModelOwnershipLock: (operation) => operation(),
       ...options.overrides,
     });
+    const revalidateSandboxIdentity = vi.fn();
+    const setupInference: SetupInference = (
+      sandboxName,
+      model,
+      provider,
+      endpointUrl,
+      credentialEnv,
+      hermesAuthMethod,
+      hermesToolGateways,
+      inferenceOptions = {},
+    ) =>
+      setupInferenceWithoutPolicyAuthority(
+        sandboxName,
+        model,
+        provider,
+        endpointUrl,
+        credentialEnv,
+        hermesAuthMethod,
+        hermesToolGateways,
+        {
+          ...inferenceOptions,
+          revalidateSandboxIdentity:
+            inferenceOptions.revalidateSandboxIdentity ?? revalidateSandboxIdentity,
+        },
+      );
     return {
       commands,
       errors,
       logs,
       runOpenshell,
       setupInference,
+      revalidateSandboxIdentity,
+      unloadOllamaModels,
       updateSandbox,
       verifyInferenceRoute,
       verifyOnboardInferenceSmoke,

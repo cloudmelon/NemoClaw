@@ -8,6 +8,10 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import {
+  E2E_CATALOGUE_RUNNER_KEYS,
+  E2E_TARGET_CATALOGUE,
+} from "../../../tools/e2e/target-catalogue.mts";
 import { validateE2eWorkflow } from "../../../tools/e2e/workflow-boundary.mts";
 import { readWorkflow } from "../../helpers/e2e-workflow-contract";
 import { requireFixture } from "./require-fixture";
@@ -27,6 +31,7 @@ type RoutingWorkflow = {
       outputs?: Record<string, string>;
       steps?: WorkflowStep[];
       "runs-on"?: string;
+      with?: Record<string, string>;
     }
   >;
 };
@@ -66,19 +71,14 @@ function evaluateRouting(
 
 const standardRouting = {
   "channels-stop-start-hermes": "ubuntu-latest",
-  "channels-stop-start-openclaw": "ubuntu-latest",
   "common-egress-agent": "ubuntu-latest",
   "hermes-discord": "ubuntu-latest",
   "hermes-e2e": "ubuntu-latest",
   "hermes-inference-switch": "ubuntu-latest",
-  "hermes-shields-config": "ubuntu-latest",
   "mcp-bridge-deepagents": "ubuntu-latest",
   "mcp-bridge-hermes": "ubuntu-latest",
   "mcp-bridge-openclaw": "ubuntu-latest",
-  "rebuild-hermes": "ubuntu-latest",
-  "rebuild-hermes-stale-base": "ubuntu-latest",
   "security-posture-hermes": "ubuntu-latest",
-  "security-posture-openclaw": "ubuntu-latest",
 };
 
 describe("larger-runner workflow routing boundary", () => {
@@ -109,21 +109,19 @@ describe("larger-runner workflow routing boundary", () => {
       ref: "refs/heads/main",
       repository: "NVIDIA/NemoClaw",
     },
-  ])("keeps every candidate on standard runners when $name (#7145)", ({
-    checkoutSha,
-    label,
-    ref,
-    repository,
-  }) => {
-    expect(
-      evaluateRouting(readWorkflow() as RoutingWorkflow, {
-        checkoutSha,
-        label,
-        ref,
-        repository,
-      }),
-    ).toEqual(standardRouting);
-  });
+  ])(
+    "keeps every candidate on standard runners when $name (#7145)",
+    ({ checkoutSha, label, ref, repository }) => {
+      expect(
+        evaluateRouting(readWorkflow() as RoutingWorkflow, {
+          checkoutSha,
+          label,
+          ref,
+          repository,
+        }),
+      ).toEqual(standardRouting);
+    },
+  );
 
   // source-shape-contract: security -- Executes the shipped pre-checkout router to prove trusted main can reach only the reviewed heavy lanes
   it("routes only the measured heavy lanes on trusted main (#7145)", () => {
@@ -141,14 +139,23 @@ describe("larger-runner workflow routing boundary", () => {
       "hermes-discord": largerRunner,
       "hermes-e2e": largerRunner,
       "hermes-inference-switch": largerRunner,
-      "hermes-shields-config": largerRunner,
       "mcp-bridge-deepagents": largerRunner,
       "mcp-bridge-hermes": largerRunner,
-      "rebuild-hermes": largerRunner,
-      "rebuild-hermes-stale-base": largerRunner,
       "security-posture-hermes": largerRunner,
     });
   });
+
+  it.each(Array.from(E2E_CATALOGUE_RUNNER_KEYS, (value) => [value]))(
+    "keeps catalogue runner key %s in the trusted routing map (#7145)",
+    (runnerKey) => {
+      const usedRunnerKeys = [
+        ...new Set(E2E_TARGET_CATALOGUE.map((target) => target.runnerKey).filter(Boolean)),
+      ].sort();
+      expect(usedRunnerKeys).toEqual([...E2E_CATALOGUE_RUNNER_KEYS].sort());
+
+      expect(standardRouting).toHaveProperty(runnerKey, "ubuntu-latest");
+    },
+  );
 
   // source-shape-contract: security -- Executes the shipped pre-checkout router to prove malformed administrator labels fail before job routing
   it("rejects malformed administrator workflow labels (#7145)", () => {
@@ -186,28 +193,38 @@ describe("larger-runner workflow routing boundary", () => {
 
   it("rejects routing any lane outside the centralized eligible set (#7145)", () => {
     const workflow = readWorkflow() as RoutingWorkflow;
-    workflow.jobs["common-egress-agent"]["runs-on"] = "ubuntu-latest";
+    workflow.jobs["catalogue-brave-nvidia-inference"].with!.runner = "ubuntu-latest";
     workflow.jobs["hermes-e2e"]["runs-on"] = "ubuntu-latest";
     workflow.jobs["mcp-bridge"]["runs-on"] = "ubuntu-latest";
-    workflow.jobs["security-posture"]["runs-on"] = "ubuntu-latest";
-    workflow.jobs["channels-stop-start"]["runs-on"] = "ubuntu-latest";
     workflow.jobs["mcp-bridge-dev"]["runs-on"] =
       "${{ fromJSON(needs.generate-matrix.outputs.runner_routing)['mcp-bridge-deepagents'] }}";
-    workflow.jobs["network-policy"]["runs-on"] = "${{ vars.E2E_LARGER_RUNNER_LABEL }}";
-    workflow.jobs["shields-config"]["runs-on"] =
-      "${{ fromJSON(needs.generate-matrix.outputs.runner_routing)['common-egress-agent'] }}";
+    workflow.jobs["messaging-providers"]["runs-on"] = "${{ vars.E2E_LARGER_RUNNER_LABEL }}";
+    workflow.jobs["messaging-providers"].with = {
+      runner:
+        "${{ fromJSON(needs.generate-matrix.outputs.runner_routing)['common-egress-agent'] }}",
+    };
 
     expect(validateE2eWorkflow(workflow)).toEqual(
       expect.arrayContaining([
-        "common-egress-agent job must use the trusted larger-runner routing map",
+        "catalogue-brave-nvidia-inference job must route catalogue runners through the trusted runner map",
         "hermes-e2e job must use the trusted larger-runner routing map",
         "mcp-bridge job must route each matrix entry through the trusted runner map",
-        "security-posture job must route each matrix entry through the trusted runner map",
-        "channels-stop-start job must route each matrix entry through the trusted runner map",
         "mcp-bridge-dev job must remain on ubuntu-latest",
-        "network-policy job must not consume E2E_LARGER_RUNNER_LABEL directly",
-        "shields-config job must not use the larger-runner routing map",
+        "messaging-providers job must not consume E2E_LARGER_RUNNER_LABEL directly",
+        "messaging-providers job must not use the larger-runner routing map",
       ]),
     );
   });
+
+  it.each(["catalogue-standard", "catalogue-nvidia-api", "catalogue-nvidia-inference"])(
+    "rejects bypassing trusted runner routing in %s (#7145)",
+    (jobName) => {
+      const workflow = readWorkflow() as RoutingWorkflow;
+      workflow.jobs[jobName].with!.runner = "${{ matrix.runner }}";
+
+      expect(validateE2eWorkflow(workflow)).toContain(
+        `${jobName} job must route catalogue runners through the trusted runner map`,
+      );
+    },
+  );
 });

@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-contributor-update-dependencies
-description: Audit and implement a dependency upgrade as a semantic migration. Use when changing a library, CLI, service, image, runtime, installer artifact, or transitive dependency, including a Hermes release. Trace upstream changes into current NemoClaw consumers, resolve security and lifecycle concerns, and verify the exact artifacts that NemoClaw uses. Trigger keywords - update dependency, upgrade dependency, bump version, dependency migration, release audit, update Hermes, upgrade Hermes, review Hermes release, publish Hermes base image.
+description: "Audit and implement a NemoClaw dependency version upgrade, including Hermes and base images. Use when the dependency itself is changing."
 ---
 
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
@@ -71,6 +71,10 @@ Pass the reviewed absolute Git and gh executable paths. Preserve its minimal all
 environments and its byte and record ceilings. Keep private report permissions at mode 0600.
 Follow the current collector help when those controls evolve.
 
+## Keep Point-in-Time Review Records out of the Repository
+
+Do not commit or update point-in-time release ledgers, concern records, dependency-review reports, review reports, or qualification reports anywhere in the repository. This prohibition does not apply to durable, code-synchronized dependency contract documents owned by a component. Encode durable claims in executable configuration and tests. For a user-visible change, update the canonical `docs/` page with current supported behavior and operator action. Preserve historical executable fixtures only when they still support a current test.
+
 ## Resolve concerns
 
 Use [Contract audit](references/contract-audit.md) to select the relevant risk surfaces and record
@@ -85,8 +89,7 @@ For each concern:
 5. Record the evidence and any remaining external gate.
 
 Implement migrations in upstream release order. Remove a workaround only when current upstream
-source and runtime evidence satisfy its recorded removal condition. Preserve historical fixtures
-and evidence that do not select current behavior.
+source and runtime evidence satisfy its recorded removal condition. Preserve historical executable fixtures only when they still support a current test.
 
 ## Verify the result
 

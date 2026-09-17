@@ -10,6 +10,7 @@ import { loadServingCatalog } from "../inference/serving/catalog-loader";
 import { NEMOCLAW_SERVING_PRESET_ENV } from "../inference/serving/managed-cluster-discovery";
 import {
   resolveServingProfileSelection,
+  servingBackendProviderKey,
   type ServingProfileListEntry,
   ServingProfileSelectionError,
 } from "../inference/serving/profile-list";
@@ -18,16 +19,19 @@ import {
   servingProfileProvenance,
 } from "../inference/serving/profile-provenance";
 import type { CompiledServingCatalog, ServingProfileProvenance } from "../inference/serving/types";
-import { VLLM_EXTRA_ARGS_ENV } from "../inference/vllm-models";
+import {
+  NEMOCLAW_VLLM_GPU_DEVICE_ENV,
+  normalizeVllmGpuDevice,
+  VLLM_EXTRA_ARGS_ENV,
+} from "../inference/vllm-models";
 import {
   resolveToolDisclosureRequest,
   TOOL_DISCLOSURE_ENV,
   type ToolDisclosure,
 } from "../tool-disclosure";
-import { applyAgentsManifestEnv } from "./agents-manifest";
+import { applyAgentsManifestEnv, assertNoPerAgentMaxSpawnDepthJson } from "./agents-manifest";
 import type { OnboardFlags } from "./command-support";
 import {
-  EXPERIMENTAL_PROFILE_ENV,
   type ExperimentalOnboardProfile,
   PORTABLE_EXPERIMENTAL_PROFILE,
 } from "./docker-driver-platform";
@@ -45,10 +49,21 @@ import {
   resolveLocalModelProfilePlan,
 } from "./local-model-profile/plan";
 import { managedSandboxFeatureIssue } from "./managed-sandbox-feature";
-import { parseReadOnlyHostMounts } from "./host-mount";
+import { parseReadOnlyHostMounts, requireReadOnlyHostMountRuntimeSupport } from "./host-mount";
 import { DCODE_OBSERVABILITY_FEATURE } from "./observability-policy-presets";
 import { isOpenclawAgent } from "./openclaw-otel-policy-presets";
 import { NOTICE_ACCEPT_ENV, NOTICE_ACCEPT_FLAG_NAME } from "./usage-notice";
+import {
+  OnboardRestoreSnapshotDriftError,
+  OnboardResumeIntentError,
+  resolveOnboardResumeIntent,
+  type OnboardResumeIntentSnapshot,
+  type ResolvedOnboardResumeIntent,
+  isTrustedOnboardError,
+  redactOnboardErrorText,
+  redactOnboardDiagnosticText,
+  sanitizeOnboardFailure,
+} from "./session-bootstrap";
 
 export interface OnboardCommandOptions {
   tempManagedRuntime: boolean;
@@ -57,11 +72,13 @@ export interface OnboardCommandOptions {
   resume: boolean;
   fresh: boolean;
   recreateSandbox: boolean;
+  apfInterceptorRequested: boolean | null;
   fromDockerfile: string | null;
   sandboxName: string | null;
   hostMounts?: import("../state/registry/types").SandboxHostMount[];
   sandboxGpu: "enable" | "disable" | null;
   sandboxGpuDevice: string | null;
+  vllmGpuDevice: string | null;
   acceptThirdPartySoftware: boolean;
   agent: string | null;
   agentsManifest: string | null;
@@ -74,6 +91,8 @@ export interface OnboardCommandOptions {
   noOllamaAutostart: boolean;
   experimentalProfile: ExperimentalOnboardProfile | null;
   portableInferenceActivation: PortableInferenceActivation | null;
+  deferProcessExit: true;
+  resumeIntentSnapshot: OnboardResumeIntentSnapshot | null;
   servingProfile: string | null;
   servingProfileProvenance: ServingProfileProvenance | null;
 }
@@ -81,12 +100,19 @@ export interface OnboardCommandOptions {
 export interface ResolveOnboardOptionsDeps {
   env: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
+  arch?: NodeJS.Architecture;
+  runtimeProviders?: import("./runtime-provider/access").RuntimeProviderBundleRegistry;
   listAgents?: () => string[];
   listServingProfiles?: () => ServingProfileListEntry[];
   loadServingCatalog?: () => CompiledServingCatalog;
-  loadSession?: () => { servingProfileProvenance?: ServingProfileProvenance | null } | null;
+  loadSession?: () => {
+    servingProfileProvenance?: ServingProfileProvenance | null;
+    vllmGpuDevice?: string | null;
+  } | null;
   error?: (message?: string) => void;
   exit?: (code: number) => never;
+  resumeIntent?: ResolvedOnboardResumeIntent;
+  resolveResumeIntent?: typeof resolveOnboardResumeIntent;
 }
 
 export interface RunOnboardCommandDeps extends ResolveOnboardOptionsDeps {
@@ -98,7 +124,7 @@ export interface RunOnboardCommandDeps extends ResolveOnboardOptionsDeps {
 function fail(deps: ResolveOnboardOptionsDeps, message: string): never {
   const error = deps.error ?? console.error;
   const exit = deps.exit ?? ((code: number) => process.exit(code));
-  error(message);
+  error(redactOnboardDiagnosticText(message));
   return exit(1);
 }
 
@@ -176,25 +202,55 @@ function resolveSandboxGpu(flags: OnboardFlags): "enable" | "disable" | null {
   return null;
 }
 
+function resolveVllmGpuDevice(
+  requested: string | undefined,
+  resume: boolean,
+  deps: ResolveOnboardOptionsDeps,
+): string | null {
+  let normalized: string | null = null;
+  if (requested !== undefined) {
+    try {
+      normalized = normalizeVllmGpuDevice(requested);
+    } catch (error) {
+      fail(deps, `  Invalid --vllm-gpu-device: ${(error as Error).message}.`);
+    }
+  }
+  if (!resume) return normalized;
+
+  const recorded = deps.loadSession?.()?.vllmGpuDevice ?? null;
+  if (!recorded) {
+    if (normalized) {
+      fail(
+        deps,
+        "  --vllm-gpu-device cannot be added while resuming a legacy onboarding session; start fresh instead.",
+      );
+    }
+    return null;
+  }
+  if (normalized && normalized !== recorded) {
+    fail(deps, `  --vllm-gpu-device ${normalized} does not match resumed GPU device ${recorded}.`);
+  }
+  return recorded;
+}
+
 function resolveHostMounts(
   values: readonly string[] | undefined,
   experimentalProfile: ExperimentalOnboardProfile | null,
   deps: ResolveOnboardOptionsDeps,
 ): import("../state/registry/types").SandboxHostMount[] {
-  if ((values?.length ?? 0) > 0 && experimentalProfile === PORTABLE_EXPERIMENTAL_PROFILE) {
-    fail(
-      deps,
-      "  --host-mount requires the OpenShell Docker driver and cannot be used with --experimental-profile portable.",
-    );
-  }
   let mounts: import("../state/registry/types").SandboxHostMount[];
   try {
     mounts = parseReadOnlyHostMounts(values ?? []);
   } catch (error) {
     return fail(deps, `  ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (mounts.length > 0 && (deps.platform ?? process.platform) !== "linux") {
-    fail(deps, "  --host-mount is currently supported only on Linux and WSL2 hosts.");
+  try {
+    requireReadOnlyHostMountRuntimeSupport(mounts, {
+      ...deps,
+      experimentalProfile,
+    });
+  } catch (error) {
+    fail(deps, `  ${error instanceof Error ? error.message : String(error)}`);
   }
   return mounts;
 }
@@ -206,15 +262,21 @@ function validateObservabilityAgent(
 ): void {
   if (
     agent &&
-    managedSandboxFeatureIssue(DCODE_OBSERVABILITY_FEATURE, { agent, requested }) ===
-      "unsupported-request"
+    managedSandboxFeatureIssue(DCODE_OBSERVABILITY_FEATURE, {
+      agent,
+      requested,
+    }) === "unsupported-request"
   ) {
     fail(deps, "  --observability is supported only with --agent langchain-deepagents-code.");
   }
 }
 
-function resolveExperimentalProfile(flags: OnboardFlags): ExperimentalOnboardProfile | null {
-  return flags["experimental-profile"] === PORTABLE_EXPERIMENTAL_PROFILE
+function resolveExperimentalProfile(
+  flags: OnboardFlags,
+  resumeIntent: ResolvedOnboardResumeIntent | undefined,
+): ExperimentalOnboardProfile | null {
+  return flags["experimental-profile"] === PORTABLE_EXPERIMENTAL_PROFILE ||
+    resumeIntent?.snapshot?.profile === PORTABLE_EXPERIMENTAL_PROFILE
     ? PORTABLE_EXPERIMENTAL_PROFILE
     : null;
 }
@@ -224,12 +286,14 @@ const PROFILE_CONFLICT_ENV = [
   "NEMOCLAW_MODEL",
   "NEMOCLAW_VLLM_MODEL",
   VLLM_EXTRA_ARGS_ENV,
+  "NEMOCLAW_LLAMACPP_RECIPE",
   "NEMOCLAW_MANAGED_CLUSTER_PEERS",
 ] as const;
 
 function validateServingProfileConflicts(
   selectedProfileId: string,
   deps: ResolveOnboardOptionsDeps,
+  allowedLlamaCppRecipeId?: string,
 ): void {
   const existingPreset = String(deps.env[NEMOCLAW_SERVING_PRESET_ENV] ?? "").trim();
   if (existingPreset && existingPreset !== selectedProfileId) {
@@ -238,7 +302,11 @@ function validateServingProfileConflicts(
       `  --profile ${selectedProfileId} conflicts with ${NEMOCLAW_SERVING_PRESET_ENV}=${existingPreset}.`,
     );
   }
-  const conflicts = PROFILE_CONFLICT_ENV.filter((name) => String(deps.env[name] ?? "").trim());
+  const conflicts = PROFILE_CONFLICT_ENV.filter((name) => {
+    const value = String(deps.env[name] ?? "").trim();
+    if (!value) return false;
+    return name !== "NEMOCLAW_LLAMACPP_RECIPE" || value !== allowedLlamaCppRecipeId;
+  });
   if (conflicts.length > 0) {
     fail(deps, `  --profile cannot be combined with inference overrides: ${conflicts.join(", ")}.`);
   }
@@ -285,6 +353,7 @@ function resolveInstallerServingProfile(
 function resolveServingProfileLifecycle(
   flags: OnboardFlags,
   deps: ResolveOnboardOptionsDeps,
+  resume: boolean,
 ): ServingProfileProvenance | null {
   const explicit = resolveServingProfile(flags.profile, deps);
   const installerProfile = resolveInstallerServingProfile(deps);
@@ -299,13 +368,45 @@ function resolveServingProfileLifecycle(
     );
   }
   const requested = explicit ?? installerProfile;
-  if (flags.resume !== true) return requested;
-  return resolveResumedServingProfile(requested, deps);
+  const settled = resume ? resolveResumedServingProfile(requested, deps) : requested;
+  // Check the profile the run will actually apply, not just an explicit
+  // --profile: the installer and resume paths reach the same environment
+  // application, and an unmapped backend there would set the preset while
+  // leaving the provider unresolved — the silent fall-through to the provider
+  // menu this fixes (#9313).
+  return assertServingProfileProviderSupported(settled, deps);
+}
+
+function assertServingProfileProviderSupported(
+  provenance: ServingProfileProvenance | null,
+  deps: ResolveOnboardOptionsDeps,
+): ServingProfileProvenance | null {
+  const unsupported = provenance !== null && servingProfileProviderKey(provenance) === null;
+  return unsupported
+    ? fail(
+        deps,
+        `  Serving profile '${provenance.preset.id}' uses backend '${provenance.recipe.backend}', which onboarding cannot configure.`,
+      )
+    : provenance;
 }
 
 function activeServingProfileId(provenance: ServingProfileProvenance | null): string | null {
   if (!provenance || provenance.preset.supportState === "disabled") return null;
   return provenance.preset.id;
+}
+
+/**
+ * Provider the requested serving profile has to run through.
+ *
+ * The preset alone only tells provider selection *which* profile to serve once
+ * a local-inference provider has been chosen; it never chooses the provider.
+ * Because `--profile` also rejects an explicit `NEMOCLAW_PROVIDER`, leaving
+ * this unset dropped onboarding into the interactive provider menu with the
+ * requested profile unusable (#9313). Returns null for a backend that has no
+ * provider wired up, which the caller reports rather than silently ignoring.
+ */
+export function servingProfileProviderKey(provenance: ServingProfileProvenance): string | null {
+  return servingBackendProviderKey(provenance.recipe.backend);
 }
 
 function resolveResumedServingProfile(
@@ -337,18 +438,12 @@ function resolveResumedServingProfile(
       `  --profile ${requested.preset.id} does not match resumed profile ${current.preset.id}.`,
     );
   }
-  validateServingProfileConflicts(current.preset.id, deps);
+  validateServingProfileConflicts(
+    current.preset.id,
+    deps,
+    current.recipe.backend === "install-llama-cpp" ? current.recipe.id : undefined,
+  );
   return current;
-}
-
-function validateExperimentalProfileLifecycle(
-  flags: OnboardFlags,
-  profile: ExperimentalOnboardProfile | null,
-  deps: ResolveOnboardOptionsDeps,
-): void {
-  if (profile && flags.resume === true) {
-    fail(deps, "  --resume cannot be combined with --experimental-profile portable.");
-  }
 }
 
 function withPortableDefault(
@@ -358,21 +453,35 @@ function withPortableDefault(
   return requested === true || profile !== null;
 }
 
+function resolveOnboardToolDisclosure(
+  flags: OnboardFlags,
+  experimentalProfile: ExperimentalOnboardProfile | null,
+  resume: boolean,
+  deps: ResolveOnboardOptionsDeps,
+): ToolDisclosure | null {
+  if (experimentalProfile && flags["tool-disclosure"] === undefined) {
+    // The hosted installer exports the generic default. Fresh Portable owns
+    // direct disclosure, while resume keeps the recorded sandbox selection.
+    return resume ? null : "direct";
+  }
+  try {
+    return resolveToolDisclosureRequest(flags["tool-disclosure"], deps.env);
+  } catch (error) {
+    fail(deps, `  ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export function resolveOnboardOptions(
   flags: OnboardFlags,
   deps: ResolveOnboardOptionsDeps,
 ): OnboardCommandOptions {
-  const experimentalProfile = resolveExperimentalProfile(flags);
-  validateExperimentalProfileLifecycle(flags, experimentalProfile, deps);
+  const experimentalProfile = resolveExperimentalProfile(flags, deps.resumeIntent);
+  const resume = deps.resumeIntent?.effectiveResume ?? flags.resume === true;
   const agent = resolveAgent(flags.agent, deps);
-  const servingProfileProvenance = resolveServingProfileLifecycle(flags, deps);
+  const servingProfileProvenance = resolveServingProfileLifecycle(flags, deps, resume);
+  const vllmGpuDevice = resolveVllmGpuDevice(flags["vllm-gpu-device"], resume, deps);
   validateObservabilityAgent(flags.observability, agent, deps);
-  let toolDisclosure: ToolDisclosure | null;
-  try {
-    toolDisclosure = resolveToolDisclosureRequest(flags["tool-disclosure"], deps.env);
-  } catch (error) {
-    fail(deps, `  ${error instanceof Error ? error.message : String(error)}`);
-  }
+  const toolDisclosure = resolveOnboardToolDisclosure(flags, experimentalProfile, resume, deps);
   const hostMounts = resolveHostMounts(flags["host-mount"], experimentalProfile, deps);
   return {
     tempManagedRuntime: flags["temp-managed-runtime"] === true,
@@ -383,14 +492,16 @@ export function resolveOnboardOptions(
       false,
     ),
     nonInteractive: withPortableDefault(flags["non-interactive"], experimentalProfile),
-    resume: flags.resume === true,
-    fresh: withPortableDefault(flags.fresh, experimentalProfile),
+    resume,
+    fresh: resume ? false : withPortableDefault(flags.fresh, experimentalProfile),
     recreateSandbox: flags["recreate-sandbox"] === true,
+    apfInterceptorRequested: flags["apf-interceptor"] === true ? true : null,
     fromDockerfile: resolveFileOption("--from", flags.from, deps, true),
     sandboxName: flags.name ?? null,
     ...(hostMounts.length > 0 ? { hostMounts } : {}),
     sandboxGpu: resolveSandboxGpu(flags),
     sandboxGpuDevice: flags["sandbox-gpu-device"] ?? null,
+    vllmGpuDevice,
     acceptThirdPartySoftware:
       flags[NOTICE_ACCEPT_FLAG_NAME] === true || String(deps.env[NOTICE_ACCEPT_ENV] || "") === "1",
     agent,
@@ -404,6 +515,8 @@ export function resolveOnboardOptions(
     noOllamaAutostart: withPortableDefault(flags["no-ollama-autostart"], experimentalProfile),
     experimentalProfile,
     portableInferenceActivation: null,
+    deferProcessExit: true,
+    resumeIntentSnapshot: deps.resumeIntent?.snapshot ?? null,
     servingProfile: activeServingProfileId(servingProfileProvenance),
     servingProfileProvenance,
   };
@@ -414,28 +527,65 @@ export function resolveOnboardOptions(
 // rejects these with a code so callers can treat them as deliberate
 // cancellation rather than a crash. See src/lib/credentials/store.ts.
 function promptCancellationCode(error: unknown): "EOF" | "SIGINT" | null {
-  const code = (error as NodeJS.ErrnoException | null)?.code;
+  if (!isTrustedOnboardError(error)) return null;
+  const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+  if (!descriptor || !("value" in descriptor)) return null;
+  const code = descriptor.value;
   return code === "EOF" || code === "SIGINT" ? code : null;
 }
 
-function handleOnboardCommandError(error: unknown, deps: RunOnboardCommandDeps): void {
+/** Read one trusted Error data property without consulting accessors or its prototype. */
+function ownErrorData(error: Error, key: PropertyKey): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(error, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+/** Recognize the internal resume race marker without consulting untrusted inherited state. */
+function isSafeResumeIntentRaceError(error: unknown): boolean {
+  return (
+    isTrustedOnboardError(error) && ownErrorData(error, "nemoclawOnboardResumeIntentRace") === true
+  );
+}
+
+/** Recover a deferred exit only from the internal Error's safe own data fields. */
+function safeDeferredExitCode(error: unknown): number | null {
+  if (!isTrustedOnboardError(error)) return null;
+  if (ownErrorData(error, Symbol.for("nemoclaw.onboard.deferred-exit-error")) !== true) return null;
+  if (ownErrorData(error, "name") !== "OnboardDeferredExitError") return null;
+  const code = ownErrorData(error, "code");
+  return typeof code === "number" && Number.isInteger(code) ? code : null;
+}
+
+/** Report operator errors without exposing multiline secrets or truncating later recovery lines. */
+function reportOnboardCommandError(deps: RunOnboardCommandDeps, message: string): number {
+  const redacted = redactOnboardErrorText(message);
+  (deps.error ?? console.error)(redacted);
+  return 1;
+}
+
+/** Preserve cancellation and failure behavior without exposing secrets through CLI errors. */
+function handleOnboardCommandError(error: unknown, deps: RunOnboardCommandDeps): number | null {
   const cancellationCode = promptCancellationCode(error);
+  const sanitizedError = sanitizeOnboardFailure(error);
   if (cancellationCode === "SIGINT") {
     // The prompt has already restored terminal state and re-raised SIGINT.
     // Let the onboard signal handler print resumable-step guidance and
     // preserve status 130 without leaking this rejected prompt error through
     // oclif as a raw stack trace (#7439).
-    return;
+    return null;
   }
   // A rejected NEMOCLAW_GATEWAY_MANAGEMENT contract is operator input error,
   // not a crash: print the validation reason as a clean single-line CLI error
   // and exit nonzero instead of re-throwing it into a Node.js stack trace
-  // (#7627). `fail` sets exit code 1.
-  if (error instanceof GatewayManagementDeclarationError) {
-    fail(deps, `  ${error.message}`);
+  // (#7627).
+  if (sanitizedError instanceof GatewayManagementDeclarationError) {
+    return reportOnboardCommandError(deps, `  ${sanitizedError.message}`);
   }
-  if (error instanceof PortableInferenceDescriptorError) {
-    fail(deps, `  ${error.message}`);
+  if (sanitizedError instanceof PortableInferenceDescriptorError) {
+    return reportOnboardCommandError(deps, `  ${sanitizedError.message}`);
+  }
+  if (sanitizedError instanceof OnboardRestoreSnapshotDriftError) {
+    return reportOnboardCommandError(deps, `  ${sanitizedError.message}`);
   }
   // Gateway-authority refusals are reported, never rethrown. Recreation is not
   // selected in one place: `--recreate-sandbox` sets the flag, but `runOnboard`
@@ -444,50 +594,19 @@ function handleOnboardCommandError(error: unknown, deps: RunOnboardCommandDeps):
   // both of those paths emitting a raw stack trace (#8103). Within onboarding
   // the recreate journal's authority revalidation is the only source of this
   // typed error, so the operation label holds however recreation was selected.
-  if (error instanceof GatewayAuthorityError) {
-    fail(deps, gatewayAuthorityFailureLines(error, "sandbox recreate").join("\n"));
+  if (sanitizedError instanceof GatewayAuthorityError) {
+    return reportOnboardCommandError(
+      deps,
+      gatewayAuthorityFailureLines(sanitizedError, "sandbox recreate").join("\n"),
+    );
   }
   // Stdin EOF at any onboarding prompt is a cancellation, not a failure:
   // print a clear message and exit non-zero instead of either crashing with
   // a stack trace or — as in the original bug — exiting 0 silently (#5976).
-  if (cancellationCode !== "EOF") throw error;
-  fail(deps, "  Installation cancelled");
-}
-
-function applyPortableEnvironment(
-  options: OnboardCommandOptions,
-  env: NodeJS.ProcessEnv,
-): () => void {
-  if (!options.experimentalProfile) return () => {};
-  const activation = options.portableInferenceActivation;
-  const portableEnvDefaults = {
-    [EXPERIMENTAL_PROFILE_ENV]: options.experimentalProfile ?? undefined,
-    [TOOL_DISCLOSURE_ENV]: "direct",
-    NEMOCLAW_PROVIDER: activation ? "custom" : "ollama",
-    NEMOCLAW_MODEL: activation?.model ?? "qwen3-vl:4b",
-    NEMOCLAW_ENDPOINT_URL: activation?.baseUrl,
-    NEMOCLAW_PREFERRED_API: activation ? "openai-completions" : undefined,
-    NEMOCLAW_OLLAMA_NO_AUTOSTART: "1",
-    NEMOCLAW_POLICY_MODE: "suggested",
-    NEMOCLAW_POLICY_TIER: "personal",
-  } as const;
-  const previousPortableEnv = new Map<string, string | undefined>();
-  const restore = () => {
-    for (const [key, value] of previousPortableEnv) {
-      if (value === undefined) delete env[key];
-      else env[key] = value;
-    }
-  };
-  try {
-    for (const [key, value] of Object.entries(portableEnvDefaults)) {
-      previousPortableEnv.set(key, env[key]);
-      if (value !== undefined) env[key] = value;
-    }
-  } catch (error) {
-    restore();
-    throw error;
+  if (cancellationCode !== "EOF") {
+    throw sanitizedError;
   }
-  return restore;
+  return reportOnboardCommandError(deps, "  Installation cancelled");
 }
 
 function applyServingProfileEnvironment(
@@ -497,9 +616,23 @@ function applyServingProfileEnvironment(
   if (!options.servingProfile) return () => {};
   const previous = env[NEMOCLAW_SERVING_PRESET_ENV];
   env[NEMOCLAW_SERVING_PRESET_ENV] = options.servingProfile;
+  // The preset selects the model once a provider is chosen; the profile's
+  // backend is what selects the provider. Setting only the former left the
+  // provider unresolved and onboarding fell back to the menu (#9313).
+  // `validateServingProfileConflicts` already rejected an operator-supplied
+  // NEMOCLAW_PROVIDER, so nothing of the caller's is being overwritten here.
+  const providerKey = options.servingProfileProvenance
+    ? servingProfileProviderKey(options.servingProfileProvenance)
+    : null;
+  const previousProvider = env.NEMOCLAW_PROVIDER;
+  if (providerKey) env.NEMOCLAW_PROVIDER = providerKey;
   return () => {
     if (previous === undefined) delete env[NEMOCLAW_SERVING_PRESET_ENV];
     else env[NEMOCLAW_SERVING_PRESET_ENV] = previous;
+    if (providerKey) {
+      if (previousProvider === undefined) delete env.NEMOCLAW_PROVIDER;
+      else env.NEMOCLAW_PROVIDER = previousProvider;
+    }
   };
 }
 
@@ -535,38 +668,136 @@ async function activatePortableInference(
         expiresAt: descriptor.expiresAt,
       },
     },
-    credentialOverrides: { [PORTABLE_INFERENCE_CREDENTIAL_ENV]: descriptor.apiKey },
+    credentialOverrides: {
+      [PORTABLE_INFERENCE_CREDENTIAL_ENV]: descriptor.apiKey,
+    },
   };
 }
 
 export async function runOnboardCommand(deps: RunOnboardCommandDeps): Promise<void> {
-  const resolvedOptions = resolveOnboardOptions(deps.flags, deps);
   const env = deps.env ?? process.env;
-  let restorePortableEnvironment = () => {};
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await runOnboardCommandAttempt(deps, env, attempt);
+    if (result === "retry") continue;
+    if (typeof result === "number") deps.exit?.(result) ?? process.exit(result);
+    return;
+  }
+}
+
+type OnboardCommandAttemptResult = "complete" | "retry" | number;
+
+interface OnboardCommandEnvironmentSnapshot {
+  agentsManifest: string | undefined;
+  toolDisclosure: string | undefined;
+  vllmGpuDevice: string | undefined;
+  ollamaAutostart: { present: boolean; value: string | undefined };
+}
+
+function resolveCommandResumeIntent(deps: RunOnboardCommandDeps): ResolvedOnboardResumeIntent {
+  const explicitProfile =
+    deps.flags["experimental-profile"] === PORTABLE_EXPERIMENTAL_PROFILE ? "portable" : null;
+  try {
+    return deps.resolveResumeIntent
+      ? deps.resolveResumeIntent({
+          explicitResume: deps.flags.resume === true,
+          fresh: deps.flags.fresh === true,
+          explicitProfile,
+        })
+      : { effectiveResume: deps.flags.resume === true, snapshot: null };
+  } catch (error) {
+    if (error instanceof OnboardResumeIntentError) fail(deps, `  ${error.message}`);
+    throw error;
+  }
+}
+
+function handleOnboardCommandAttemptError(
+  error: unknown,
+  deps: RunOnboardCommandDeps,
+  attempt: number,
+): OnboardCommandAttemptResult {
+  if (isSafeResumeIntentRaceError(error)) {
+    if (attempt === 0) return "retry";
+    return reportOnboardCommandError(
+      deps,
+      "  The onboarding checkpoint changed while resume acquired its lock. Retry the command.",
+    );
+  }
+  const deferredExitCode = safeDeferredExitCode(error);
+  if (deferredExitCode !== null) return deferredExitCode;
+  return handleOnboardCommandError(error, deps) ?? "complete";
+}
+
+function restoreOnboardCommandEnvironment(
+  env: NodeJS.ProcessEnv,
+  options: OnboardCommandOptions,
+  snapshot: OnboardCommandEnvironmentSnapshot,
+  restoreServingProfileEnvironment: () => void,
+): void {
+  if (options.agentsManifest) {
+    if (snapshot.agentsManifest === undefined) delete env.NEMOCLAW_EXTRA_AGENTS_JSON;
+    else env.NEMOCLAW_EXTRA_AGENTS_JSON = snapshot.agentsManifest;
+  }
+  restoreServingProfileEnvironment();
+  if (snapshot.toolDisclosure === undefined) delete env[TOOL_DISCLOSURE_ENV];
+  else env[TOOL_DISCLOSURE_ENV] = snapshot.toolDisclosure;
+  if (snapshot.vllmGpuDevice === undefined) delete env[NEMOCLAW_VLLM_GPU_DEVICE_ENV];
+  else env[NEMOCLAW_VLLM_GPU_DEVICE_ENV] = snapshot.vllmGpuDevice;
+  if (snapshot.ollamaAutostart.present) {
+    env.NEMOCLAW_OLLAMA_NO_AUTOSTART = snapshot.ollamaAutostart.value ?? "";
+  } else {
+    delete env.NEMOCLAW_OLLAMA_NO_AUTOSTART;
+  }
+}
+
+async function runOnboardCommandAttempt(
+  deps: RunOnboardCommandDeps,
+  env: NodeJS.ProcessEnv,
+  attempt: number,
+): Promise<OnboardCommandAttemptResult> {
+  const resumeIntent = resolveCommandResumeIntent(deps);
+  const resolvedOptions = resolveOnboardOptions(deps.flags, {
+    ...deps,
+    resumeIntent,
+  });
   let restoreServingProfileEnvironment = () => {};
-  const previousAgentsManifest = env.NEMOCLAW_EXTRA_AGENTS_JSON;
+  const environmentSnapshot: OnboardCommandEnvironmentSnapshot = {
+    agentsManifest: env.NEMOCLAW_EXTRA_AGENTS_JSON,
+    toolDisclosure: env[TOOL_DISCLOSURE_ENV],
+    vllmGpuDevice: env[NEMOCLAW_VLLM_GPU_DEVICE_ENV],
+    ollamaAutostart: {
+      present: Object.prototype.hasOwnProperty.call(env, "NEMOCLAW_OLLAMA_NO_AUTOSTART"),
+      value: env.NEMOCLAW_OLLAMA_NO_AUTOSTART,
+    },
+  };
   let options = resolvedOptions;
   try {
+    const selectedAgent = deps.flags.agent ?? env.NEMOCLAW_AGENT;
+    const validationAgent = resolveAgentNameAlias(selectedAgent, ["openclaw"]) ?? selectedAgent;
+    if (options.agentsManifest) {
+      applyAgentsManifestEnv(options.agentsManifest, env);
+    } else if (isOpenclawAgent(validationAgent)) {
+      assertNoPerAgentMaxSpawnDepthJson(env.NEMOCLAW_EXTRA_AGENTS_JSON);
+    }
     const activation = await activatePortableInference(resolvedOptions, deps, env);
     options = activation.options;
-    restorePortableEnvironment = applyPortableEnvironment(options, env);
     restoreServingProfileEnvironment = applyServingProfileEnvironment(options, env);
-    if (options.noOllamaAutostart) env.NEMOCLAW_OLLAMA_NO_AUTOSTART = "1";
-    // Keep direct callers and the legacy monolithic onboard path on the same
-    // canonical source. No value is written for the default so resume/rebuild
-    // can distinguish an explicit request from an unset environment.
     const toolDisclosure = toolDisclosureEnvironmentOverride(options, deps.flags);
     if (toolDisclosure) env[TOOL_DISCLOSURE_ENV] = toolDisclosure;
-    if (options.agentsManifest) applyAgentsManifestEnv(options.agentsManifest, env);
-    await withCredentialOverrides(activation.credentialOverrides, () => deps.runOnboard(options));
-  } catch (error) {
-    handleOnboardCommandError(error, deps);
-  } finally {
-    if (options.agentsManifest) {
-      if (previousAgentsManifest === undefined) delete env.NEMOCLAW_EXTRA_AGENTS_JSON;
-      else env.NEMOCLAW_EXTRA_AGENTS_JSON = previousAgentsManifest;
+    if (options.vllmGpuDevice) env[NEMOCLAW_VLLM_GPU_DEVICE_ENV] = options.vllmGpuDevice;
+    else delete env[NEMOCLAW_VLLM_GPU_DEVICE_ENV];
+    if (options.noOllamaAutostart && !options.experimentalProfile) {
+      env.NEMOCLAW_OLLAMA_NO_AUTOSTART = "1";
     }
-    restoreServingProfileEnvironment();
-    restorePortableEnvironment();
+    await withCredentialOverrides(activation.credentialOverrides, () => deps.runOnboard(options));
+    return "complete";
+  } catch (error) {
+    return handleOnboardCommandAttemptError(error, deps, attempt);
+  } finally {
+    restoreOnboardCommandEnvironment(
+      env,
+      options,
+      environmentSnapshot,
+      restoreServingProfileEnvironment,
+    );
   }
 }

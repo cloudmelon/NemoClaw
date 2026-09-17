@@ -2,28 +2,57 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { dockerCapture, dockerRun } from "../adapters/docker";
+import {
+  inspectDockerSandboxIdentities,
+  type DockerSandboxIdentityObservation,
+} from "../adapters/docker/inspect";
 import type { DockerGpuPatchDeps } from "./docker-gpu-patch-types";
 
 export const OPENSHELL_MANAGED_BY_LABEL = "openshell.ai/managed-by";
 export const OPENSHELL_MANAGED_BY_VALUE = "openshell";
 export const OPENSHELL_SANDBOX_NAME_LABEL = "openshell.ai/sandbox-name";
 export const OPENSHELL_SANDBOX_ID_LABEL = "openshell.ai/sandbox-id";
+export const OPENSHELL_SANDBOX_NAMESPACE_LABEL = "openshell.ai/sandbox-namespace";
+export const OPENSHELL_SANDBOX_WORKSPACE_LABEL = "openshell.ai/sandbox-workspace";
+
+export type OpenShellSandboxOwnershipLabel = {
+  readonly label: string;
+  readonly value: string;
+};
+
+export function resolveOpenShellSandboxOwnershipLabel(
+  _env: NodeJS.ProcessEnv = process.env,
+): OpenShellSandboxOwnershipLabel {
+  return { label: OPENSHELL_MANAGED_BY_LABEL, value: OPENSHELL_MANAGED_BY_VALUE };
+}
+
+export function hasOpenShellSandboxOwnership(
+  labels: Readonly<Record<string, string>>,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const ownership = resolveOpenShellSandboxOwnershipLabel(env);
+  return labels[ownership.label] === ownership.value;
+}
 
 const DOCKER_SANDBOX_QUERY_TIMEOUT_MS = 30_000;
 const STALE_DOCKER_ORPHAN_TIMEOUT_MS = 30_000;
 
 type DockerSandboxContainerQueryDeps = Pick<DockerGpuPatchDeps, "dockerCapture" | "dockerRun">;
 
-function sandboxContainerFilterArgs(sandboxName: string): string[] {
-  return [
-    "ps",
-    "-a",
-    "--no-trunc",
-    "--filter",
-    `label=${OPENSHELL_MANAGED_BY_LABEL}=${OPENSHELL_MANAGED_BY_VALUE}`,
-    "--filter",
-    `label=${OPENSHELL_SANDBOX_NAME_LABEL}=${sandboxName}`,
-  ];
+function sandboxContainerFilterArgs(
+  sandboxName: string,
+  sandboxNamespace?: string,
+  requireManagedBy = true,
+): string[] {
+  const args = ["ps", "-a", "--no-trunc"];
+  if (requireManagedBy) {
+    args.push("--filter", `label=${OPENSHELL_MANAGED_BY_LABEL}=${OPENSHELL_MANAGED_BY_VALUE}`);
+  }
+  args.push("--filter", `label=${OPENSHELL_SANDBOX_NAME_LABEL}=${sandboxName}`);
+  if (sandboxNamespace !== undefined) {
+    args.push("--filter", `label=${OPENSHELL_SANDBOX_NAMESPACE_LABEL}=${sandboxNamespace}`);
+  }
+  return args;
 }
 
 function commandResultText(result: {
@@ -53,20 +82,20 @@ export type OpenShellDockerSandboxContainerQuery =
   | { ok: true; ids: string[] }
   | { ok: false; ids: []; error: string };
 
-/**
- * Status-bearing lookup used when an empty container list is a safety proof.
- * Unlike the best-effort discovery helper, this distinguishes Docker failure
- * from a successful query with zero labeled matches.
- */
-export function queryOpenShellDockerSandboxContainers(
-  sandboxName: string,
-  deps: DockerSandboxContainerQueryDeps = {},
+function queryDockerSandboxContainerIds(
+  filterArgs: readonly string[],
+  deps: DockerSandboxContainerQueryDeps,
+  timeoutMs: number,
 ): OpenShellDockerSandboxContainerQuery {
   const run = deps.dockerRun ?? dockerRun;
-  const result = run([...sandboxContainerFilterArgs(sandboxName), "--format", "{{.ID}}"], {
+  const requestedTimeoutMs =
+    Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.floor(timeoutMs)
+      : DOCKER_SANDBOX_QUERY_TIMEOUT_MS;
+  const result = run([...filterArgs, "--format", "{{.ID}}"], {
     ignoreError: true,
     suppressOutput: true,
-    timeout: DOCKER_SANDBOX_QUERY_TIMEOUT_MS,
+    timeout: Math.max(1, Math.min(DOCKER_SANDBOX_QUERY_TIMEOUT_MS, requestedTimeoutMs)),
   });
   if (Number(result.status ?? 1) !== 0) {
     return {
@@ -75,17 +104,200 @@ export function queryOpenShellDockerSandboxContainers(
       error: commandResultText(result) || "docker ps did not complete successfully",
     };
   }
-  const ids = String(result.stdout ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return { ok: true, ids };
+  return {
+    ok: true,
+    ids: String(result.stdout ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean),
+  };
+}
+
+/**
+ * Status-bearing lookup used when an empty container list is a safety proof.
+ * Unlike the best-effort discovery helper, this distinguishes Docker failure
+ * from a successful query with zero labeled matches.
+ */
+export function queryOpenShellDockerSandboxContainers(
+  sandboxName: string,
+  deps: DockerSandboxContainerQueryDeps = {},
+  timeoutMs: number = DOCKER_SANDBOX_QUERY_TIMEOUT_MS,
+  sandboxNamespace?: string,
+): OpenShellDockerSandboxContainerQuery {
+  return queryDockerSandboxContainerIds(
+    sandboxContainerFilterArgs(sandboxName, sandboxNamespace),
+    deps,
+    timeoutMs,
+  );
+}
+
+/**
+ * Prove that one durable replacement ID is the sole OpenShell-owned Docker
+ * runtime for its immutable sandbox namespace. Resume callers use the stopped
+ * form before a name-scoped OpenShell start and the running form before
+ * acknowledging the recovered handoff.
+ */
+export function isExactOpenShellDockerSandboxReplacement(
+  sandboxName: string,
+  replacementContainerId: string,
+  requireRunning: boolean,
+  deps: DockerSandboxContainerQueryDeps = {},
+  timeoutMs: number = DOCKER_SANDBOX_QUERY_TIMEOUT_MS,
+  now: () => Date = () => new Date(),
+): boolean {
+  const expectedContainerId = replacementContainerId.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/u.test(expectedContainerId) || timeoutMs <= 0) return false;
+  const run = deps.dockerRun ?? dockerRun;
+  try {
+    const deadline = now().getTime() + timeoutMs;
+    const namespace = run(
+      [
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        `{{ index .Config.Labels "${OPENSHELL_SANDBOX_NAMESPACE_LABEL}" }}`,
+        expectedContainerId,
+      ],
+      {
+        ignoreError: true,
+        suppressOutput: true,
+        timeout: Math.min(DOCKER_SANDBOX_QUERY_TIMEOUT_MS, timeoutMs),
+      },
+    );
+    const sandboxNamespace = String(namespace.stdout ?? "").trim();
+    if (
+      Number(namespace.status ?? 1) !== 0 ||
+      !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(sandboxNamespace)
+    ) {
+      return false;
+    }
+    let remainingMs = deadline - now().getTime();
+    if (remainingMs <= 0) return false;
+    const containers = queryOpenShellDockerSandboxContainers(
+      sandboxName,
+      { dockerRun: run },
+      remainingMs,
+      sandboxNamespace,
+    );
+    if (
+      !containers.ok ||
+      containers.ids.length !== 1 ||
+      containers.ids[0]?.trim().toLowerCase() !== expectedContainerId
+    ) {
+      return false;
+    }
+    if (!requireRunning) return true;
+    remainingMs = deadline - now().getTime();
+    if (remainingMs <= 0) return false;
+    const inspect = run(
+      [
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        "{{json .State.Running}}",
+        expectedContainerId,
+      ],
+      {
+        ignoreError: true,
+        suppressOutput: true,
+        timeout: Math.min(DOCKER_SANDBOX_QUERY_TIMEOUT_MS, remainingMs),
+      },
+    );
+    return Number(inspect.status ?? 1) === 0 && String(inspect.stdout ?? "").trim() === "true";
+  } catch {
+    return false;
+  }
 }
 
 type StaleDockerOrphanCleanupDeps = {
   queryContainers?: typeof queryOpenShellDockerSandboxContainers;
   forceRemove?: (containerId: string) => { status?: number | null };
 };
+
+type ExactDockerContainerCleanupDeps = {
+  inspectContainers?: (sandboxName: string) => DockerSandboxIdentityObservation;
+  forceRemove?: (containerId: string) => { status?: number | null };
+};
+
+export function inspectDockerSandboxNameLabeledContainers(
+  sandboxName: string,
+): DockerSandboxIdentityObservation {
+  return inspectDockerSandboxIdentities(`${OPENSHELL_SANDBOX_NAME_LABEL}=${sandboxName}`, {
+    managedBy: OPENSHELL_MANAGED_BY_LABEL,
+    workspace: OPENSHELL_SANDBOX_WORKSPACE_LABEL,
+    sandboxId: OPENSHELL_SANDBOX_ID_LABEL,
+  });
+}
+
+function exactCleanupContainerIds(
+  observation: DockerSandboxIdentityObservation,
+  phase: "inspect" | "confirm",
+): string[] {
+  const failurePrefix =
+    phase === "inspect"
+      ? "could not inspect the exact Docker cleanup target"
+      : "could not confirm exact Docker container removal";
+  if (observation.status === "probe-failed") {
+    throw new Error(`${failurePrefix}: ${observation.detail || "Docker identity probe failed"}`);
+  }
+  if (observation.malformedRows > 0) {
+    throw new Error(
+      `${failurePrefix}: Docker returned ${String(observation.malformedRows)} malformed container identity row(s)`,
+    );
+  }
+  return observation.rows.map((row) => row.id);
+}
+
+/** Remove the remaining members of one immutable, prequalified Docker container set. */
+export function removeExactOpenShellDockerSandboxContainers(
+  sandboxName: string,
+  expectedContainerIds: readonly string[],
+  log: (message: string) => void,
+  deps: ExactDockerContainerCleanupDeps = {},
+): void {
+  const expected = new Set(expectedContainerIds);
+  if (
+    expected.size !== expectedContainerIds.length ||
+    expectedContainerIds.some((containerId) => !/^[0-9a-f]{12,64}$/iu.test(containerId))
+  ) {
+    throw new Error("exact Docker cleanup contains an invalid or duplicate container identity");
+  }
+
+  // Recovery retirement requires the mutable name itself to be unambiguous.
+  // Inspect every name-labeled container, including foreign containers that do
+  // not carry OpenShell's managed-by marker, while removing only qualified IDs.
+  const inspectContainers = deps.inspectContainers ?? inspectDockerSandboxNameLabeledContainers;
+  const initialIds = exactCleanupContainerIds(inspectContainers(sandboxName), "inspect");
+  const unexpected = initialIds.filter((containerId) => !expected.has(containerId));
+  if (unexpected.length > 0) {
+    throw new Error(
+      `found labeled Docker container(s) outside the retained identity set: ${unexpected.join(", ")}; refusing replacement cleanup`,
+    );
+  }
+
+  const remaining = new Set(initialIds);
+  for (const containerId of expectedContainerIds) {
+    if (!remaining.has(containerId)) continue;
+    const removal = deps.forceRemove
+      ? deps.forceRemove(containerId)
+      : dockerRun(["rm", "-f", containerId], {
+          ignoreError: true,
+          suppressOutput: true,
+          timeout: STALE_DOCKER_ORPHAN_TIMEOUT_MS,
+        });
+    if (Number(removal.status ?? 1) !== 0) {
+      throw new Error(`could not remove exact Docker container '${containerId}'`);
+    }
+    log(`Removed exact Docker container '${containerId}' after OpenShell sandbox deletion`);
+  }
+
+  const confirmedIds = exactCleanupContainerIds(inspectContainers(sandboxName), "confirm");
+  if (confirmedIds.length !== 0) {
+    throw new Error("could not confirm exact Docker container removal");
+  }
+}
 
 /**
  * Remove one exact Docker-owned orphan when a registry row outlives its OpenShell sandbox.
@@ -169,6 +381,11 @@ export type OpenShellDockerSandboxRuntimeSnapshotQuery =
       containerId: string;
     }
   | { ok: false; error: string };
+
+export interface OpenShellDockerSandboxRuntimeSnapshotOptions {
+  /** Full transaction-owned container ID selected while a rollback backup is retained. */
+  readonly expectedContainerId?: string;
+}
 
 export function isImmutableDockerImageId(value: string): boolean {
   return /^sha256:[0-9a-f]{64}$/i.test(value);
@@ -329,7 +546,10 @@ function parseNvidiaVisibleDevices(result: {
 }
 
 /**
- * Inspect the one exactly labeled native container before deletion.
+ * Inspect a native container before deletion. Default callers must resolve one
+ * labeled container. A caller that owns a recreation transaction may instead
+ * provide the full replacement container ID. That ID must be present among
+ * the labeled replacement and retained rollback backup.
  *
  * Docker owns the fields returned here: `.Image` is the immutable retry
  * identity, `.Config.Image` is bookkeeping-only, and HostConfig supplies the
@@ -340,17 +560,27 @@ function parseNvidiaVisibleDevices(result: {
 export function queryOpenShellDockerSandboxRuntimeSnapshot(
   sandboxName: string,
   deps: DockerSandboxContainerQueryDeps = {},
+  options: OpenShellDockerSandboxRuntimeSnapshotOptions = {},
 ): OpenShellDockerSandboxRuntimeSnapshotQuery {
   const containers = queryOpenShellDockerSandboxContainers(sandboxName, deps);
   if (!containers.ok) return { ok: false, error: containers.error };
-  if (containers.ids.length !== 1) {
+  const expectedContainerId = options.expectedContainerId;
+  if (expectedContainerId !== undefined && !/^[a-f0-9]{64}$/u.test(expectedContainerId)) {
+    return { ok: false, error: "expected sandbox container ID is invalid" };
+  }
+  const selectedContainerIds = expectedContainerId
+    ? containers.ids.filter((containerId) => containerId === expectedContainerId)
+    : containers.ids;
+  if (selectedContainerIds.length !== 1) {
     return {
       ok: false,
-      error: `expected one labeled sandbox container, found ${containers.ids.length}`,
+      error: expectedContainerId
+        ? "expected activated sandbox container was not found among labeled containers"
+        : `expected one labeled sandbox container, found ${containers.ids.length}`,
     };
   }
   const run = deps.dockerRun ?? dockerRun;
-  const containerId = containers.ids[0];
+  const containerId = selectedContainerIds[0];
   const inspect = run(
     [
       "inspect",

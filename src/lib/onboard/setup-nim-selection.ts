@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { unsafeEndpointUrlViolation } from "../core/endpoint-url-safety";
+import { canonicalEndpoint, normalizeProviderBaseUrl } from "../core/url-utils";
 import { applyCompatibleEndpointContextWindow } from "../inference/compatible-endpoint-context";
 import type { TrustedPrivateEndpointCapability } from "../inference/endpoint-ssrf-preflight";
 import type { GatewayRouteDiscoveryConstraints } from "../inference/gateway-route-compatibility";
 import { getProbeExtraHeaders } from "../inference/onboard-probes";
+import { usesNvidiaEndpointProbePayload } from "../inference/openai-probe-models";
 import type { OnboardInferenceCapabilityCache } from "./inference-capability-cache";
 import type { NvidiaFeaturedModelSession } from "./nvidia-featured-model-selection";
+import { exitOnboardFromPrompt, getNavigationChoice } from "./prompt-helpers";
 import type { ReasoningEffort } from "./reasoning-mode";
 
-export { createNvidiaFeaturedModelSession } from "./nvidia-featured-model-selection";
+export {
+  createNvidiaFeaturedModelSession,
+  selectFeaturedModelAfterCredentialPrompt,
+} from "./nvidia-featured-model-selection";
 
 export type SetupNimSelectionBackNavigation = Readonly<{ kind: "NEMOCLAW_BACK_TO_SELECTION" }>;
 
@@ -52,7 +59,32 @@ export type SetupNimSelectionState<THermesAuthMethod = unknown> = {
   openRouterFeaturedModels?: NvidiaFeaturedModelSession;
   /** Attempt-wide shared-gateway guard, invoked after identity selection and before probes. */
   assertRouteCompatible?: () => GatewayRouteDiscoveryConstraints;
+  /** Receipt-bound policy check invoked immediately before provider or runtime mutations. */
+  revalidateSandboxIdentity?: (operation: string) => void;
 };
+
+/** Revalidate the current provider selection before a policy-dependent mutation. */
+export function assertSelectionMutationAuthority(
+  state: SetupNimSelectionState,
+  operation: string,
+): void {
+  state.revalidateSandboxIdentity?.(operation);
+}
+
+/** Carry the attempt's exact mutation guard through a blocking credential prompt. */
+export function credentialMutationGuardFor(
+  state: SetupNimSelectionState,
+): ((operation: string) => void) | undefined {
+  return state.revalidateSandboxIdentity;
+}
+
+export function withCredentialMutationGuard<T extends object>(
+  state: SetupNimSelectionState,
+  options: T,
+): T & { revalidateSandboxIdentity?: (operation: string) => void } {
+  const guard = credentialMutationGuardFor(state);
+  return guard ? { ...options, revalidateSandboxIdentity: guard } : options;
+}
 
 export type CloudFallbackConfig = {
   providerName: string;
@@ -95,10 +127,13 @@ export async function resolveCompatibleEndpointInput(args: {
   nonInteractive: boolean;
   prompt: (message: string) => Promise<string>;
 }): Promise<string> {
-  const envUrl = (args.envUrl || "").trim();
-  const recoveredUrl = (args.recoveredEndpointUrl || "").trim();
+  const envInput = args.envUrl || "";
+  const recoveredInput = args.recoveredEndpointUrl || "";
+  const envUrl = envInput.trim();
+  const recoveredUrl = recoveredInput.trim();
   const defaultEndpointUrl = envUrl || recoveredUrl;
-  if (args.nonInteractive) return defaultEndpointUrl;
+  const defaultEndpointInput = envUrl ? envInput : recoveredUrl ? recoveredInput : "";
+  if (args.nonInteractive) return defaultEndpointInput;
   return (
     (await args.prompt(
       defaultEndpointUrl
@@ -106,8 +141,75 @@ export async function resolveCompatibleEndpointInput(args: {
         : args.kind === "openai"
           ? "  OpenAI-compatible base URL (e.g., https://openrouter.ai): "
           : "  Anthropic-compatible base URL (e.g., https://proxy.example.com): ",
-    )) || defaultEndpointUrl
+    )) || defaultEndpointInput
   );
+}
+
+export type CompatibleEndpointSelection =
+  | { action: "retry-selection" }
+  | { action: "selected"; endpointUrl: string };
+
+/**
+ * Resolve and validate the compatible-endpoint base URL: handle back/exit
+ * navigation, reject inputs that carry components NemoClaw cannot forward
+ * (#9106), and require a non-empty normalized base URL.
+ */
+export async function resolveCompatibleEndpointSelection(args: {
+  kind: CompatibleEndpointKind;
+  envUrl: string | null | undefined;
+  recoveredEndpointUrl: string | null | undefined;
+  nonInteractive: boolean;
+  prompt: (message: string) => Promise<string>;
+}): Promise<CompatibleEndpointSelection> {
+  const endpointInput = await resolveCompatibleEndpointInput(args);
+  const navigation = getNavigationChoice(endpointInput);
+  if (navigation === "back") {
+    console.log("  Returning to provider selection.");
+    console.log("");
+    return { action: "retry-selection" };
+  }
+  if (navigation === "exit") {
+    exitOnboardFromPrompt();
+  }
+  // #9106/#9301: reject unsafe endpoint input here, before any network
+  // request, provider registration, registry write, or sandbox mutation.
+  const endpointViolation = unsafeEndpointUrlViolation(endpointInput);
+  if (endpointViolation) {
+    console.error(`  Endpoint URL ${endpointViolation.reason}`);
+    if (endpointViolation.kind === "userinfo-query-fragment") {
+      // canonicalEndpoint returns null unless the stripped base is a
+      // credential-free http(s) URL, so the hint never echoes userinfo or
+      // query values.
+      const strippedBaseUrl = canonicalEndpoint(
+        normalizeProviderBaseUrl(endpointInput, args.kind),
+        args.kind,
+      );
+      if (strippedBaseUrl) {
+        console.error(
+          `  NemoClaw does not forward these components to the endpoint. Use: ${strippedBaseUrl}`,
+        );
+      }
+    }
+    if (args.nonInteractive) {
+      process.exit(1);
+    }
+    console.log("");
+    return { action: "retry-selection" };
+  }
+  const endpointUrl = normalizeProviderBaseUrl(endpointInput, args.kind);
+  if (!endpointUrl) {
+    console.error(
+      args.kind === "openai"
+        ? "  Endpoint URL is required for Other OpenAI-compatible endpoint."
+        : "  Endpoint URL is required for Other Anthropic-compatible endpoint.",
+    );
+    if (args.nonInteractive) {
+      process.exit(1);
+    }
+    console.log("");
+    return { action: "retry-selection" };
+  }
+  return { action: "selected", endpointUrl };
 }
 
 type ProviderChoice = {
@@ -126,6 +228,7 @@ type RemoteProviderConfig = {
   label: string;
   endpointUrl: string;
   helpUrl: string | null;
+  defaultModel?: string;
 };
 
 type ProbeAuthMode = "bearer" | "query-param" | undefined;
@@ -133,9 +236,13 @@ type ProbeAuthMode = "bearer" | "query-param" | undefined;
 type ProbeOptions = {
   requireResponsesToolCalling?: boolean;
   skipResponsesProbe?: boolean;
+  useNvidiaEndpointProbePayload?: boolean;
   authMode?: ProbeAuthMode;
   extraHeaders?: readonly string[];
   capabilityCache?: OnboardInferenceCapabilityCache;
+  provider?: string;
+  providerDefaultModel?: string;
+  revalidateSandboxIdentity?: (operation: string) => void;
 };
 
 type ValidationResult =
@@ -162,6 +269,7 @@ type RemoteModelValidatorDeps = {
     credentialEnv: string,
     helpUrl: string | null,
     capabilityCache?: OnboardInferenceCapabilityCache,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ) => Promise<ValidationResult>;
   validateCustomAnthropicSelection: (
     label: string,
@@ -171,6 +279,7 @@ type RemoteModelValidatorDeps = {
     helpUrl: string | null,
     options?: {
       intendedApi?: "anthropic-messages" | "openai-completions";
+      revalidateSandboxIdentity?: (operation: string) => void;
     },
   ) => Promise<ValidationResult>;
   validateAnthropicSelectionWithRetryMessage: (
@@ -180,6 +289,7 @@ type RemoteModelValidatorDeps = {
     credentialEnv: string,
     retryMessage: string,
     helpUrl: string | null,
+    revalidateSandboxIdentity?: (operation: string) => void,
   ) => Promise<ValidationResult>;
   validateOpenAiLikeSelection: (
     label: string,
@@ -255,14 +365,18 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
             "  ⚠ Reasoning mode validates Chat Completions only; tools and streaming are unverified.",
           );
         }
-        const validation = await deps.validateCustomOpenAiLikeSelection(
+        const validationArgs = [
           remoteConfig.label,
           state.endpointUrl || deps.OPENAI_ENDPOINT_URL,
           selectedModel,
           selectedCredentialEnv,
           remoteConfig.helpUrl,
           state.inferenceCapabilityCache,
-        );
+        ] as const;
+        const guard = credentialMutationGuardFor(state);
+        const validation = await (guard
+          ? deps.validateCustomOpenAiLikeSelection(...validationArgs, guard)
+          : deps.validateCustomOpenAiLikeSelection(...validationArgs));
         if (validation.ok) {
           if (validation.pinnedAddresses)
             state.endpointPinnedAddresses = validation.pinnedAddresses;
@@ -309,7 +423,7 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
           selectedModel,
           selectedCredentialEnv,
           remoteConfig.helpUrl,
-          { intendedApi },
+          withCredentialMutationGuard(state, { intendedApi }),
         );
         if (validation.ok) {
           if (validation.pinnedAddresses)
@@ -329,14 +443,18 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
 
       const retryMessage = "Please choose a provider/model again.";
       if (selected.key === "anthropic") {
-        const validation = await deps.validateAnthropicSelectionWithRetryMessage(
+        const validationArgs = [
           remoteConfig.label,
           state.endpointUrl || deps.ANTHROPIC_ENDPOINT_URL,
           selectedModel,
           selectedCredentialEnv,
           retryMessage,
           remoteConfig.helpUrl,
-        );
+        ] as const;
+        const guard = credentialMutationGuardFor(state);
+        const validation = await (guard
+          ? deps.validateAnthropicSelectionWithRetryMessage(...validationArgs, guard)
+          : deps.validateAnthropicSelectionWithRetryMessage(...validationArgs));
         if (validation.ok) {
           state.preferredInferenceApi = validation.api;
           return "selected";
@@ -354,14 +472,17 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
         selectedCredentialEnv,
         retryMessage,
         remoteConfig.helpUrl,
-        {
+        withCredentialMutationGuard(state, {
+          provider: state.provider,
+          ...(remoteConfig.defaultModel ? { providerDefaultModel: remoteConfig.defaultModel } : {}),
+          useNvidiaEndpointProbePayload: usesNvidiaEndpointProbePayload(state.provider),
           requireResponsesToolCalling: deps.shouldRequireResponsesToolCalling(state.provider),
           skipResponsesProbe: deps.shouldSkipResponsesProbe(state.provider),
           authMode: deps.getProbeAuthMode(state.provider),
           extraHeaders:
             deps.getProbeExtraHeaders?.(state.provider) ?? getProbeExtraHeaders(state.provider),
           capabilityCache: state.inferenceCapabilityCache,
-        },
+        }),
       );
       if (validation.ok) {
         state.preferredInferenceApi = validation.api;

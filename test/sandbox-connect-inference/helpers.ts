@@ -6,7 +6,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect } from "vitest";
-import { nonWslPlatformNodeOptions } from "../helpers/platform-override-node-options";
+import {
+  LAUNCH_READINESS_FIXTURE_POLICY,
+  LAUNCH_READINESS_PAIRING_QUALIFICATION_OUTPUT,
+  launchReadinessRegistryFixture,
+} from "../helpers/launch-readiness-fixture";
+import { syntheticForwardNodeOptions } from "../helpers/platform-override-node-options";
 import { execTimeout } from "../helpers/timeouts";
 
 /**
@@ -36,6 +41,7 @@ export type SetupFixtureOptions = {
   inferenceSetStatus?: number;
   writeOllamaProxyState?: boolean;
   gatewaySupervisorRecovery?: boolean;
+  launchReadinessRegistry?: boolean;
 };
 
 const fixtureForwardListeners = new Map<string, ChildProcess>();
@@ -133,7 +139,12 @@ function writeRegistryState(
     path.join(registryDir, "sandboxes.json"),
     JSON.stringify({
       defaultSandbox: sandboxName,
-      sandboxes: { [sandboxName]: sandboxEntry },
+      sandboxes: {
+        [sandboxName]: {
+          ...(options.launchReadinessRegistry ? launchReadinessRegistryFixture() : {}),
+          ...sandboxEntry,
+        },
+      },
     }),
     { mode: 0o600 },
   );
@@ -171,7 +182,7 @@ function initStateFile(stateFile: string, options: SetupFixtureOptions) {
       curlCalls: [],
       curlEnvs: [],
       inferenceProbeExitStatuses: options.inferenceProbeExitStatuses ?? [],
-      inferenceProbeResponses: options.inferenceProbeResponses ?? ["OK 200"],
+      inferenceProbeResponses: options.inferenceProbeResponses ?? ["OK 200", "OK 200"],
       inferenceGetCalls: [],
       inferenceSetCalls: [],
       sandboxConnectCalls: [],
@@ -214,7 +225,11 @@ if (args[0] === "gateway" && args[1] === "info") {
   process.exit(0);
 }
 
-if (args[0] === "sandbox" && args[1] === "get" && args[2] === ${JSON.stringify(sandboxName)}) {
+if (
+  args[0] === "sandbox" &&
+  args[1] === "get" &&
+  args[args.length - 1] === ${JSON.stringify(sandboxName)}
+) {
   process.stdout.write("Sandbox:\\n\\n  \\x1b[2mId:\\x1b[0m abc\\n  Name: ${sandboxName}\\n  Phase: Ready\\n");
   process.exit(0);
 }
@@ -231,6 +246,10 @@ if (args[0] === "sandbox" && args[1] === "exec") {
   const command = [args.join(" "), input].filter(Boolean).join("\\n");
   if (!command.includes("inference.local/v1/models")) {
     fs.writeFileSync(stateFile, JSON.stringify(state));
+    if (input.includes("NEMOCLAW_OPENCLAW_STATE_DIR_B64=")) {
+      process.stdout.write(${JSON.stringify(`${LAUNCH_READINESS_PAIRING_QUALIFICATION_OUTPUT}\n`)});
+      process.exit(0);
+    }
     // Test hook (#4263 / CodeRabbit): when the connect-time auto-pair
     // approval pass is specifically targeted, simulate the failure
     // path the production code must tolerate. The approval program is carried
@@ -283,6 +302,11 @@ if (args[0] === "inference" && args[1] === "get") {
   process.exit(0);
 }
 
+if (args[0] === "policy" && args[1] === "get") {
+  process.stdout.write(${JSON.stringify(LAUNCH_READINESS_FIXTURE_POLICY)});
+  process.exit(0);
+}
+
 if (args[0] === "inference" && args[1] === "set") {
   state.inferenceSetCalls.push(args.slice(2));
   fs.writeFileSync(stateFile, JSON.stringify(state));
@@ -294,7 +318,6 @@ if (args[0] === "logs") {
 }
 
 if (args[0] === "forward" && args[1] === "list") {
-  process.stdout.write("${sandboxName} 127.0.0.1 ${dashboardPort} 12345 running\\n");
   process.exit(0);
 }
 
@@ -490,10 +513,8 @@ export function setupFixture(
   const curlPath = path.join(homeLocalBin, "curl");
   const psPath = path.join(homeLocalBin, "ps");
   const sandboxName = String(sandboxEntry.name);
-  // The OpenShell stub advertises this forward as running. Back that claim
-  // with a real listener so probe-only forward ownership checks behave the
-  // same on Linux and macOS, not according to whether a host happens to have
-  // the historical default port open.
+  // Model a reachable direct ForwardTcp service. Direct services do not create
+  // entries in the legacy `openshell forward list` registry.
   const dashboardPort = startFixtureForwardListener(tmpDir);
 
   fs.mkdirSync(homeLocalBin, { recursive: true });
@@ -566,7 +587,7 @@ export function runConnect(
       encoding: "utf-8",
       env: {
         HOME: tmpDir,
-        NODE_OPTIONS: nonWslPlatformNodeOptions(tmpDir, ""),
+        NODE_OPTIONS: syntheticForwardNodeOptions(tmpDir, ""),
         PATH: `${path.join(tmpDir, ".local", "bin")}:/usr/bin:/bin`,
         NEMOCLAW_DISABLE_GATEWAY_DRIFT_PREFLIGHT: "1",
         NEMOCLAW_NO_CONNECT_HINT: "1",

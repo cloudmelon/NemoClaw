@@ -4,6 +4,9 @@
 import type { AgentMcpAdapter } from "../../agent/defs";
 import { shellQuote } from "../../core/shell-quote";
 
+/** Quote one argument for an MCP bridge-owned shell command. */
+export const quoteMcpBridgeShellArg = shellQuote;
+
 /**
  * Process-control variables that must not reach a credential-bearing child
  * diagnostic. Trusted proxy and CA variables remain available; OpenShell
@@ -30,7 +33,6 @@ export const MCP_RUNTIME_SANITIZED_ENV_VARS = [
   "OPENCLAW_GATEWAY_PORT",
   "OPENCLAW_GATEWAY_TOKEN",
   "OPENCLAW_ALLOW_INSECURE_PRIVATE_WS",
-  "NEMOCLAW_OPENCLAW_ALLOW_INSECURE_PRIVATE_WS",
   "PYTHONHOME",
   "PYTHONINSPECT",
   "PYTHONPATH",
@@ -54,7 +56,7 @@ export function wrapMcpRuntimeCommand(
 ): string {
   const quotedCommand = command.map(shellQuote).join(" ");
   switch (adapter) {
-    case "mcporter": {
+    case "openclaw-config": {
       const runner =
         'const { spawnSync } = require("node:child_process"); const result = spawnSync(process.argv[1], process.argv.slice(2), { stdio: "inherit" }); process.exit(result.status ?? 1);';
       return `nemoclaw-start node -e ${shellQuote(runner)} ${quotedCommand}`;

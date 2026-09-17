@@ -141,7 +141,7 @@ describe("createProviderReviewDeps", () => {
       },
       {
         runOpenshell: () => ({ status: 0 }),
-        upsertProvider: () => ({ ok: true }),
+        upsertProvider: async () => ({ ok: true }),
         verifyInferenceRoute: vi.fn(),
         verifyOnboardInferenceSmoke: vi.fn(),
         isNonInteractive: () => true,
@@ -154,7 +154,6 @@ describe("createProviderReviewDeps", () => {
         validateLocalProvider: () => ({ ok: true }),
         getLocalProviderBaseUrl: () => "http://host.openshell.internal:11435/v1",
         applyLocalInferenceRoute: async () => false,
-        getOllamaWarmupCommand: () => ["ollama", "run", "qwen3.5:9b"],
         run: vi.fn() as never,
         shouldFrontOllamaWithProxy: () => true,
         ensureOllamaAuthProxy,
@@ -163,6 +162,9 @@ describe("createProviderReviewDeps", () => {
         persistAndProbeOllamaProxy,
         localInference: {
           validateOllamaModelWithToolsOverride: () => ({ ok: true }),
+          validateSandboxFacingOllamaModel: () => ({ ok: true }),
+          runOllamaWarmup: () => {},
+          persistResolvedOllamaHost: () => () => {},
         },
         OLLAMA_PROXY_CREDENTIAL_ENV: "NEMOCLAW_OLLAMA_PROXY_TOKEN",
       },
